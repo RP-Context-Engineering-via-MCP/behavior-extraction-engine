@@ -1,0 +1,18 @@
+-- Create default partition for new users
+CREATE TABLE public.behaviors_default
+  PARTITION OF public.behaviors
+  DEFAULT;
+
+-- Create index on embedding for similarity search
+CREATE INDEX IF NOT EXISTS behaviors_embedding_hnsw
+ON behaviors
+USING hnsw (embedding vector_cosine_ops);
+
+
+-- Create index for behavior lookup
+CREATE INDEX behaviors_text_idx
+  ON public.behaviors (behavior_text);
+
+-- Create index for credibility filtering
+CREATE INDEX behaviors_credibility_idx
+  ON public.behaviors (credibility DESC);

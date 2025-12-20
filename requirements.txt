@@ -1,0 +1,23 @@
+# Web Framework
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# OpenAI / Azure OpenAI
+openai==1.57.4
+
+# Database & Vector Support
+psycopg[binary]==3.2.3
+pgvector==0.3.6
+supabase==2.11.0
+
+# Data Validation
+pydantic==2.10.4
+
+# Environment Variables
+python-dotenv==1.0.1
+
+# HTTP Client (dependency for openai/supabase)
+httpx==0.28.1
+
+# Utility
+typing-extensions==4.12.2
