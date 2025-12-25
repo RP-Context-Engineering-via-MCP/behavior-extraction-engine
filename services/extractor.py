@@ -7,7 +7,7 @@ from typing import Dict, Any, List
 from models.behavior import ExtractionResult, BehaviorSegment, ExtractedBehavior, StoredBehavior
 from services.openAiClient import extract_behavior, embed_text
 from services.credibilityCalculator import calculate_initial_credibility, should_store_behavior
-from services.behaviorRepository import insert_behavior
+from services.behaviorRepository import insert_behavior, insert_prompt_segment
 from datetime import datetime
 from config.configurations import DEFAULT_DECAY_RATE,SAMPLE_USERID
 
@@ -126,6 +126,8 @@ def store_behavior(
         stored_behaviors = []
 
         for segment in extraction_result.segments:
+             segment_id = None
+
              for behavior in segment.behaviors:
                 #   calculate initial credibility
                 initial_credibility = calculate_initial_credibility(
@@ -142,6 +144,19 @@ def store_behavior(
                         f"'{behavior.description}' (credibility={initial_credibility})"
                     )
                     continue
+
+                if segment_id is None:
+                    segment_result = insert_prompt_segment(
+                        segment_text=segment.text,
+                        user_id=user_id
+                    )
+                    if segment_result.success:
+                        segment_id = segment_result.segment_id
+                    else:
+                        logger.error(
+                            f"Failed to insert prompt segment into database: {segment_result.error}"
+                        )
+                        continue
 
                 # generate embedding for behavior text
                 try:
@@ -161,7 +176,7 @@ def store_behavior(
                     decay_rate=DEFAULT_DECAY_RATE,  # 0.015 from config
                     embedding=embedding_vector,
                     # prompt_history_ids will be populated later when we handle segment storage
-                    prompt_history_ids=[],
+                    prompt_history_ids=[segment_id],
                     # session_id will be passed from API layer later
                     session_id="default"
                 )

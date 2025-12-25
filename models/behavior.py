@@ -139,3 +139,45 @@ class BehaviorResponse(BaseModel):
     message: str
     behavior_id: Optional[str] = None
     data: Optional[dict] = None
+
+
+class ExtractRequest(BaseModel):
+    prompt: str = Field(
+        ...,
+        description="User's natural language prompt"
+    )
+    session_id: str = Field(
+        default="default",
+        description="session id for session specific behavior grouping "
+    )
+
+    @field_validator('prompt')
+    def validate_prompt(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Prompt cannot be empty or whitespace only")
+        return v.strip()
+    
+    @field_validator('session_id')
+    def validate_session_id(cls, v):
+        sanitized = v.strip()
+        if not sanitized:
+            raise ValueError("Session ID cannot be empty")
+        # Allow only alphanumeric, hyphens, underscores
+        if not all(c.isalnum() or c in ['-', '_'] for c in sanitized):
+            raise ValueError("Session ID can only contain alphanumeric characters, hyphens, and underscores")
+        return sanitized
+    
+class PromptSegment(BaseModel):
+    """Represents a segment of user prompt to be stored"""
+    user_id: str = Field(..., description="User who provided this segment")
+    segment_text: str = Field(..., description="The actual segment text from prompt")
+    created_at: int = Field(
+        default_factory=lambda: int(time.time()),
+        description="Timestamp when segment was saved"
+    )
+
+class SegmentInsertResult(BaseModel):
+    """Result of inserting a prompt segment"""
+    success: bool
+    segment_id: Optional[str] = None
+    error: Optional[str] = None

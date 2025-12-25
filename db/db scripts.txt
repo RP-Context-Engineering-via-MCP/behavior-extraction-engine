@@ -1,3 +1,5 @@
+--one time extention to enable vector extention in database
+CREATE EXTENSION IF NOT EXISTS vector;
 -- Create default partition for new users
 CREATE TABLE public.behaviors_default
   PARTITION OF public.behaviors

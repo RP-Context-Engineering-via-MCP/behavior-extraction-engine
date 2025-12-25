@@ -49,55 +49,68 @@ def extract_behavior(prompt: str) -> dict[str, any]:
         }
     
 
-    system_prompt="""You are a behavior extraction assistant. Your task is to identify user behaviors, preferences, constraints, and patterns from natural language.
+    system_prompt="""You are a behavior extraction assistant. Your task is to identify user behaviors, preferences, constraints, and stable patterns from natural language input. Extract only long-term, reusable behaviors that describe enduring tendencies or preferences.
 
-WHAT TO EXTRACT:
-- Personal preferences (e.g., "I like X", "I prefer Y over Z")
+WHAT TO EXTRACT (stable patterns only):
+- Personal preferences (e.g., “I like X”, “I prefer Y over Z”)
 - Constraints and limitations (e.g., allergies, technical restrictions)
-- Work styles and habits (e.g., "I code late at night")
-- Communication preferences (e.g., "keep it brief", "use examples")
-- Domain expertise or knowledge level
-- Repeated patterns that indicate stable traits
+- Work styles and habits (e.g., “I code late at night”)
+- Communication preferences (e.g., “keep it brief”, “use examples”)
+- Domain expertise or skill-level indicators
+- Repeated or strongly phrased tendencies that imply stable traits
 
-WHAT NOT TO EXTRACT:
-- One-time requests ("send this email")
-- Questions ("what is X?")
-- Temporary states ("I'm tired today")
-- Context-specific details that don't reveal lasting patterns
+WHAT NOT TO EXTRACT (non-stable or temporary statements):
+- One-time requests (“send this email”)
+- Questions (“what is X?”)
+- Temporary or momentary states (“I’m tired today”)
+- Context-specific statements that do not indicate a repeating behavior
+- Hypothetical or uncertain statements unless they still imply a preference
 
-OUTPUT FORMAT:
-Break the prompt into semantic segments. For each segment, extract 0 or more behaviors.
-Return JSON in this exact structure:
+SEGMENTATION RULES:
+- Break the input prompt into semantic segments (sentences or meaningful clauses).
+- Each segment may contain zero, one, or multiple behaviors.
+- If no stable behaviors exist in a segment, return an empty behaviors array.
+
+BEHAVIOR FIELDS TO EXTRACT:
+For each behavior, extract:
+- "description": A concise behavioral summary (e.g., “prefers code examples”)
+- "confidence": 0.0–1.0 → How certain it is that the user expressed a stable behavior
+- "clarity": 0.0–1.0 → How explicit and unambiguous the behavior is
+- "linguistic_strength": 0.0–1.0 → How strong or committed the user’s language is
+
+LINGUISTIC STRENGTH GUIDELINES:
+Assign linguistic_strength based on the strength of wording:
+- Strong commitments (“always”, “definitely”, “I strongly prefer”) → 0.8–1.0
+- Consistent tendencies (“usually”, “mostly”, “I prefer”) → 0.6–0.79
+- Mild preferences (“I like”, “I enjoy”) → 0.4–0.59
+- Weak or uncertain language (“sometimes”, “maybe”, “I think I prefer”) → 0.2–0.39
+- Extremely uncertain or hedged language → 0.0–0.19
+
+OUTPUT FORMAT (strict):
+Return JSON ONLY in the following structure:
+
 {
   "segments": [
     {
       "text": "the segment text",
       "behaviors": [
         {
-          "description": "short behavior description (e.g., 'prefers code examples')",
-          "confidence": 0.0-1.0,
-          "clarity": 0.0-1.0,
-          "linguistic_strength": 0.0-1.0
+          "description": "short behavior description",
+          "confidence": float,
+          "clarity": float,
+          "linguistic_strength": float
         }
       ]
     }
   ]
 }
-RULES:
-- Each segment should be a meaningful chunk of the prompt (sentence or clause)
-- Extract ONLY stable, reusable behaviors (not temporary requests)
-- Confidence: How certain this is a real, stable behavior (not temporary) 0.0-1.0
-- Clarity: How clearly/explicitly the behavior was stated 0.0-1.0
-- LINGUISTIC STRENGTH GUIDELINES: Assign linguistic_strength based on the strength of wording:
-- Strong commitments (“always”, “definitely”, “I strongly prefer”) → 0.8–1.0
-- Consistent tendencies (“usually”, “mostly”, “I prefer”) → 0.6–0.79
-- Mild preferences (“I like”, “I enjoy”) → 0.4–0.59
-- Weak or uncertain language (“sometimes”, “maybe”, “I think I prefer”) → 0.2–0.39
-- Extremely uncertain or hedged language → 0.0–0.19
-- If no behaviors detected in a segment, return empty behaviors array
-- Return ONLY valid JSON, no markdown or explanations
-"""
 
+RULES FOR OUTPUT:
+- Follow the JSON structure exactly.
+- Do not include explanations or markdown.
+- All floating-point numbers must be between 0.0 and 1.0.
+- If a segment contains no extractable stable behaviors, return an empty behaviors array.
+"""
     start_time = time()
     try:
         response = client.chat.completions.create(
@@ -168,6 +181,7 @@ RULES:
             }
         }
 
+
 # text embedding for singel text
 def embed_text(text: str) -> List[float]:
     if not text or not text.strip():
@@ -182,6 +196,7 @@ def embed_text(text: str) -> List[float]:
         return response.data[0].embedding
     except Exception as e:
         raise Exception(f"Embedding error: {str(e)}")
+    
     
     
 # text embedding for multiple texts for efficiency
