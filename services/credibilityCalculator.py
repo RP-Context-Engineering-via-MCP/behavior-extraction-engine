@@ -1,4 +1,5 @@
 import logging
+import math
 from typing import Dict, Any
 from config.configurations import (
     CREDIBILITY_WEIGHTS,
@@ -7,6 +8,10 @@ from config.configurations import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Reinforcement configuration
+BASE_BOOST = 0.05  # Maximum boost per reinforcement (5%)
+MIN_BOOST = 0.001  # Minimum meaningful boost
 
 
 def calculate_initial_credibility(
@@ -114,6 +119,104 @@ def get_decay_rate(behavior_text: str) -> float:
     # For now, return default decay rate
     # TODO: Implement smart decay based on behavior patterns
     return DEFAULT_DECAY_RATE
+
+
+def calculate_reinforcement_boost(
+    current_credibility: float,
+    current_reinforcement_count: int
+) -> float:
+    """
+    Calculate credibility boost using diminishing returns formula.
+    
+    The boost decreases as reinforcement_count increases, following the formula:
+    boost = BASE_BOOST × (1 / sqrt(reinforcement_count))
+    
+    This ensures:
+    - First reinforcement gives maximum boost (~0.05 or 5%)
+    - Subsequent reinforcements give progressively smaller boosts
+    - Behavior can't inflate to unreasonable credibility levels
+    - New behaviors can still compete with heavily reinforced ones
+    
+    Args:
+        current_credibility: Current credibility score (0.0-1.0)
+        current_reinforcement_count: Number of times already reinforced (≥1)
+        
+    Returns:
+        float: Boost amount to add to credibility (always positive, may be capped)
+        
+    Example:
+        >>> calculate_reinforcement_boost(0.75, 1)  # First reinforcement
+        0.05
+        >>> calculate_reinforcement_boost(0.75, 4)  # Fourth reinforcement
+        0.025
+        >>> calculate_reinforcement_boost(0.98, 10)  # High credibility, many reinforcements
+        0.0158  (but capped to reach 1.0)
+    """
+    # Validate inputs
+    if not 0.0 <= current_credibility <= 1.0:
+        logger.warning(f"Credibility {current_credibility} out of range [0,1], clamping")
+        current_credibility = max(0.0, min(1.0, current_credibility))
+    
+    if current_reinforcement_count < 1:
+        logger.warning(f"Invalid reinforcement_count {current_reinforcement_count}, using 1")
+        current_reinforcement_count = 1
+    
+    # Calculate diminishing boost using square root
+    # As count increases, sqrt increases slower, so 1/sqrt decreases
+    raw_boost = BASE_BOOST * (1.0 / math.sqrt(current_reinforcement_count))
+    
+    # Ensure boost is meaningful but not too small
+    if raw_boost < MIN_BOOST:
+        raw_boost = MIN_BOOST
+    
+    # Cap boost to not exceed maximum credibility (1.0)
+    max_possible_boost = 1.0 - current_credibility
+    actual_boost = min(raw_boost, max_possible_boost)
+    
+    # Ensure non-negative
+    actual_boost = max(0.0, actual_boost)
+    
+    logger.debug(
+        f"Reinforcement boost calculated: {actual_boost:.4f} "
+        f"(current_cred={current_credibility:.3f}, count={current_reinforcement_count}, "
+        f"raw_boost={raw_boost:.4f})"
+    )
+    
+    return round(actual_boost, 4)
+
+
+def apply_reinforcement_boost(
+    current_credibility: float,
+    current_reinforcement_count: int
+) -> float:
+    """
+    Apply reinforcement boost to credibility and return new value.
+    
+    Convenience function that combines calculate_reinforcement_boost()
+    with the addition operation.
+    
+    Args:
+        current_credibility: Current credibility score (0.0-1.0)
+        current_reinforcement_count: Number of times already reinforced (≥1)
+        
+    Returns:
+        float: New credibility after applying boost (0.0-1.0)
+        
+    Example:
+        >>> apply_reinforcement_boost(0.75, 1)
+        0.80
+        >>> apply_reinforcement_boost(0.95, 10)
+        0.9658
+    """
+    boost = calculate_reinforcement_boost(current_credibility, current_reinforcement_count)
+    new_credibility = min(1.0, current_credibility + boost)
+    
+    logger.info(
+        f"Credibility reinforced: {current_credibility:.3f} → {new_credibility:.3f} "
+        f"(+{boost:.4f}, count={current_reinforcement_count})"
+    )
+    
+    return round(new_credibility, 4)
 
 
 # Future functions to implement:
