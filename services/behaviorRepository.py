@@ -1,19 +1,45 @@
 from db.connection import get_db_connection, get_db_pool_connection
 from datetime import datetime
 from typing import List, Tuple, Optional
-from models.behavior import PromptSegment, SegmentInsertResult, SimilarityClassification, SimilarityResult, ReinforcementResult
+from models.behavior import (
+    PromptSegment, 
+    SegmentInsertResult, 
+    SimilarityClassification, 
+    SimilarityResult, 
+    ReinforcementResult,
+    ConflictType,
+    ResolutionStatus,
+    BehaviorState
+)
 from services.credibilityCalculator import calculate_reinforcement_boost
+from config.configurations import (
+    DUPLICATE_THRESHOLD,
+    SIMILAR_THRESHOLD,
+    CONFLICT_THRESHOLD_MIN,
+    CONFLICT_THRESHOLD_MAX
+)
 import time
+import uuid
 import logging
 logger = logging.getLogger(__name__)
 
-# Similarity thresholds for classification
-DUPLICATE_THRESHOLD = 0.05      # 0.00-0.05: Exact match
-SIMILAR_THRESHOLD = 0.15        # 0.05-0.15: Related variations
-CONFLICT_THRESHOLD_MIN = 0.15   # 0.15-0.40: Potential conflict
-CONFLICT_THRESHOLD_MAX = 0.40   # 0.40+: Unrelated
-
 def insert_behavior(payload: dict):
+    """
+    Insert a new behavior into the database.
+    
+    The payload should include behavior_state (defaults to 'ACTIVE' if not provided).
+    All new behaviors start in ACTIVE state unless explicitly specified otherwise.
+    
+    Args:
+        payload: Dictionary containing all behavior fields including:
+            - behavior_id, user_id, behavior_text, embedding
+            - credibility, extraction metrics, timestamps
+            - behavior_state (optional, defaults to 'ACTIVE')
+    """
+    # Ensure behavior_state is set (default to ACTIVE for new behaviors)
+    if 'behavior_state' not in payload:
+        payload['behavior_state'] = BehaviorState.ACTIVE.value
+    
     with get_db_pool_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -32,7 +58,8 @@ def insert_behavior(payload: dict):
                     created_at,
                     last_seen_at,
                     session_id,
-                    prompt_history_ids
+                    prompt_history_ids,
+                    behavior_state
                 )
                 VALUES (
                     %(behavior_id)s,
@@ -48,7 +75,8 @@ def insert_behavior(payload: dict):
                     %(created_at)s,
                     %(last_seen_at)s,
                     %(session_id)s,
-                    %(prompt_history_ids)s
+                    %(prompt_history_ids)s,
+                    %(behavior_state)s
                 )
                 """
             , payload
@@ -242,10 +270,12 @@ def classify_similarity(distance: float) -> SimilarityClassification:
     Classify the relationship between two behaviors based on embedding distance.
     
     Uses cosine distance where lower values indicate higher similarity:
-    - 0.00-0.05: DUPLICATE (exact match, different wording)
-    - 0.05-0.15: SIMILAR (related variations)
-    - 0.15-0.40: POTENTIAL_CONFLICT (might be opposing)
-    - 0.40+:     UNRELATED (different domains)
+    - 0.00-DUPLICATE_THRESHOLD: DUPLICATE (exact match, different wording)
+    - DUPLICATE_THRESHOLD-SIMILAR_THRESHOLD: SIMILAR (related variations)
+    - SIMILAR_THRESHOLD-CONFLICT_THRESHOLD_MAX: POTENTIAL_CONFLICT (might be opposing)
+    - CONFLICT_THRESHOLD_MAX+: UNRELATED (different domains)
+    
+    Note: SIMILAR_THRESHOLD should equal CONFLICT_THRESHOLD_MIN to avoid gaps
     
     Args:
         distance: Cosine distance between behavior embeddings (0.0-2.0)
@@ -376,3 +406,220 @@ def insert_behavior_batch(payloads: List[dict]):
                 )
         conn.commit()
     logger.info(f"Inserted batch of {len(payloads)} behaviors into database")
+
+
+def insert_conflict(
+    user_id: str,
+    behavior_id_1: str,
+    behavior_id_2: str,
+    conflict_type: ConflictType,
+    similarity_distance: float,
+    llm_analysis: Optional[str] = None
+) -> str:
+    """
+    Store a detected conflict between two behaviors in the database.
+    
+    This creates an audit trail of all conflict detections and their resolutions.
+    The conflict record tracks:
+    - Which behaviors conflict
+    - Type of conflict (resolvable vs needs user input)
+    - LLM's analysis and reasoning
+    - Resolution status and outcome
+    
+    Args:
+        user_id: User whose behaviors conflict
+        behavior_id_1: First behavior ID
+        behavior_id_2: Second behavior ID
+        conflict_type: RESOLVABLE or USER_DECISION_NEEDED
+        similarity_distance: Embedding distance between behaviors
+        llm_analysis: Optional LLM explanation of the conflict
+        
+    Returns:
+        conflict_id: UUID of the created conflict record
+        
+    Raises:
+        Exception: If database insertion fails
+        
+    Example:
+        >>> conflict_id = insert_conflict(
+        ...     "user123", "beh_abc", "beh_xyz",
+        ...     ConflictType.RESOLVABLE, 0.22,
+        ...     "Behaviors contradict in same domain"
+        ... )
+    """
+    try:
+        conflict_id = str(uuid.uuid4())
+        current_timestamp = int(time.time())
+        
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO behavior_conflicts (
+                        conflict_id,
+                        user_id,
+                        behavior_id_1,
+                        behavior_id_2,
+                        conflict_type,
+                        similarity_distance,
+                        llm_analysis,
+                        resolution_status,
+                        created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        conflict_id,
+                        user_id,
+                        behavior_id_1,
+                        behavior_id_2,
+                        conflict_type.value,
+                        similarity_distance,
+                        llm_analysis,
+                        ResolutionStatus.PENDING.value,
+                        current_timestamp
+                    )
+                )
+                conn.commit()
+        
+        logger.info(
+            f"Stored conflict {conflict_id}: {behavior_id_1} <-> {behavior_id_2} "
+            f"(distance: {similarity_distance:.3f}, type: {conflict_type.value})"
+        )
+        
+        return conflict_id
+        
+    except Exception as e:
+        logger.error(f"Failed to insert conflict: {str(e)}")
+        raise Exception(f"Database error storing conflict: {str(e)}")
+
+
+def update_behavior_state(
+    behavior_id: str,
+    user_id: str,
+    new_state: BehaviorState
+) -> bool:
+    """
+    Update the lifecycle state of a behavior.
+    
+    Behavior states track the lifecycle:
+    - NEW: Just created (within 24 hours)
+    - ACTIVE: Normal state, used for personalization
+    - SUPERSEDED: Replaced by newer conflicting behavior
+    - FLAGGED: Needs user resolution
+    - ARCHIVED: Credibility decayed below threshold
+    
+    Args:
+        behavior_id: Behavior to update
+        user_id: User ID (required for partitioned table)
+        new_state: Target state from BehaviorState enum
+        
+    Returns:
+        True if update succeeded, False otherwise
+        
+    Raises:
+        Exception: If database update fails
+        
+    Example:
+        >>> update_behavior_state("beh_abc123", "user_xyz", BehaviorState.SUPERSEDED)
+        True
+    """
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE behaviors
+                    SET behavior_state = %s
+                    WHERE behavior_id = %s AND user_id = %s
+                    """,
+                    (new_state.value, behavior_id, user_id)
+                )
+                
+                rows_affected = cur.rowcount
+                conn.commit()
+                
+                if rows_affected == 0:
+                    logger.warning(
+                        f"No behavior found to update: {behavior_id} for user {user_id}"
+                    )
+                    return False
+                
+                logger.info(
+                    f"Updated behavior {behavior_id} state to {new_state.value}"
+                )
+                return True
+                
+    except Exception as e:
+        logger.error(f"Failed to update behavior state: {str(e)}")
+        raise Exception(f"Database error updating behavior state: {str(e)}")
+
+
+def supersede_behavior(
+    old_behavior_id: str,
+    new_behavior_id: str,
+    user_id: str
+) -> bool:
+    """
+    Mark an old behavior as SUPERSEDED by a new one.
+    
+    This creates a link between the old and new behaviors, preserving history
+    while indicating which behavior is currently active. The old behavior:
+    - State changed to SUPERSEDED
+    - superseded_by_id set to new behavior ID
+    - No longer used for personalization
+    - Kept in database for historical analysis
+    
+    Args:
+        old_behavior_id: Behavior being superseded
+        new_behavior_id: Behavior that supersedes it
+        user_id: User ID (required for partitioned table)
+        
+    Returns:
+        True if update succeeded, False otherwise
+        
+    Raises:
+        Exception: If database update fails
+        
+    Example:
+        >>> supersede_behavior("beh_old123", "beh_new456", "user_xyz")
+        True
+    """
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                # Update old behavior to SUPERSEDED state and link to new one
+                cur.execute(
+                    """
+                    UPDATE behaviors
+                    SET 
+                        behavior_state = %s,
+                        superseded_by_id = %s
+                    WHERE behavior_id = %s AND user_id = %s
+                    """,
+                    (
+                        BehaviorState.SUPERSEDED.value,
+                        new_behavior_id,
+                        old_behavior_id,
+                        user_id
+                    )
+                )
+                
+                rows_affected = cur.rowcount
+                conn.commit()
+                
+                if rows_affected == 0:
+                    logger.warning(
+                        f"No behavior found to supersede: {old_behavior_id} for user {user_id}"
+                    )
+                    return False
+                
+                logger.info(
+                    f"Superseded behavior {old_behavior_id} with {new_behavior_id}"
+                )
+                return True
+                
+    except Exception as e:
+        logger.error(f"Failed to supersede behavior: {str(e)}")
+        raise Exception(f"Database error superseding behavior: {str(e)}")
+

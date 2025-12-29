@@ -196,6 +196,20 @@ class BehaviorConflict(BaseModel):
     )
 
 
+class ConflictAnalysisType(str, Enum):
+    """LLM's assessment of whether behaviors conflict"""
+    CONFLICT = "CONFLICT"                 # Behaviors contradict each other
+    COMPATIBLE = "COMPATIBLE"             # Behaviors can coexist
+    CONTEXT_DEPENDENT = "CONTEXT_DEPENDENT"  # Depends on context
+
+
+class ConflictAnalysisResult(BaseModel):
+    """Result from LLM conflict analysis"""
+    conflict_type: ConflictAnalysisType = Field(..., description="Type of relationship between behaviors")
+    explanation: str = Field(..., description="Detailed reasoning for the classification")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="LLM's confidence in this analysis")
+
+
 class UserConfirmationRequest(BaseModel):
     """Request for user to resolve an ambiguous conflict"""
     request_id: str = Field(

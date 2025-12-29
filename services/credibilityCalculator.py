@@ -4,13 +4,14 @@ from typing import Dict, Any
 from config.configurations import (
     CREDIBILITY_WEIGHTS,
     DEFAULT_DECAY_RATE,
-    CREDIBILITY_PRUNE_THRESHOLD
+    CREDIBILITY_PRUNE_THRESHOLD,
+    BASE_REINFORCEMENT_BOOST
 )
 
 logger = logging.getLogger(__name__)
 
-# Reinforcement configuration
-BASE_BOOST = 0.05  # Maximum boost per reinforcement (5%)
+# Reinforcement configuration (kept for backward compatibility)
+BASE_BOOST = BASE_REINFORCEMENT_BOOST  # From config
 MIN_BOOST = 0.001  # Minimum meaningful boost
 
 

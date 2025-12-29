@@ -9,6 +9,10 @@ from config.configurations import(
     GPT_MODEL,
     EMBED_MODEL,
 )
+from models.behavior import ConflictAnalysisResult, ConflictAnalysisType
+import logging
+
+logger = logging.getLogger(__name__)
 
 client = AzureOpenAI(
     api_key=AZURE_OPENAI_KEY,
@@ -223,5 +227,135 @@ def embed_batch(texts: List[str]) -> List[List[float]]:
     
     except Exception as e:
         raise Exception(f"Batch embedding error: {str(e)}")
+
+
+def analyze_conflict(
+    behavior_1_text: str,
+    behavior_2_text: str,
+    distance: float
+) -> ConflictAnalysisResult:
+    """
+    Use GPT-4 to analyze if two behaviors conflict or are compatible.
+    
+    This function is called when behaviors are semantically close (distance 0.15-0.40)
+    but it's unclear if they contradict each other or can coexist.
+    
+    Args:
+        behavior_1_text: First behavior description
+        behavior_2_text: Second behavior description
+        distance: Semantic distance between behaviors (0.15-0.40 typically)
         
+    Returns:
+        ConflictAnalysisResult with conflict_type, explanation, and confidence
+        
+    Raises:
+        Exception: If LLM call fails or response is invalid
+        
+    Example:
+        >>> analyze_conflict("prefers Python for backend", "prefers JavaScript for frontend", 0.22)
+        ConflictAnalysisResult(conflict_type=COMPATIBLE, explanation="Different contexts", confidence=0.95)
+    """
+    if not behavior_1_text or not behavior_2_text:
+        raise ValueError("Both behavior texts must be non-empty")
+    
+    system_prompt = """You are a behavior conflict analyzer. Your task is to determine if two user behaviors conflict, are compatible, or depend on context.
+
+CONFLICT: Behaviors directly contradict each other and cannot both be true simultaneously.
+Examples:
+- "prefers dark mode" vs "prefers light mode"
+- "prefers Python for programming" vs "prefers JavaScript for programming" (same domain, no context)
+- "vegetarian diet" vs "eats meat regularly"
+
+COMPATIBLE: Behaviors can coexist without contradiction.
+Examples:
+- "prefers Python for backend" vs "prefers JavaScript for frontend" (different contexts)
+- "likes morning workouts" vs "likes evening reading" (different activities)
+- "prefers concise code" vs "prefers detailed comments" (complementary)
+
+CONTEXT_DEPENDENT: Relationship depends on additional context not specified.
+Examples:
+- "prefers working alone" vs "enjoys team collaboration" (might be task-dependent)
+- "likes fast food" vs "health-conscious eater" (might be frequency-dependent)
+
+ANALYSIS GUIDELINES:
+1. Consider domain specificity (same domain = more likely to conflict)
+2. Consider temporal context (habits at different times can coexist)
+3. Consider intensity (strong preferences vs mild likes)
+4. Consider scope (general vs specific contexts)
+5. Default to COMPATIBLE if behaviors can coexist in any reasonable scenario
+
+OUTPUT FORMAT (strict JSON):
+{
+  "conflict_type": "CONFLICT" | "COMPATIBLE" | "CONTEXT_DEPENDENT",
+  "explanation": "2-3 sentence explanation of your reasoning",
+  "confidence": 0.0-1.0
+}
+
+Be conservative: only classify as CONFLICT if behaviors genuinely cannot both be true."""
+
+    user_prompt = f"""Analyze these two user behaviors:
+
+Behavior 1: "{behavior_1_text}"
+Behavior 2: "{behavior_2_text}"
+Semantic distance: {distance:.3f}
+
+Do these behaviors conflict, are they compatible, or is it context-dependent?"""
+
+    try:
+        response = client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.2,  # Low temperature for consistent analysis
+            max_tokens=300,
+            response_format={"type": "json_object"}
+        )
+        
+        content = response.choices[0].message.content
+        if not content:
+            raise Exception("Empty response from GPT-4")
+        
+        result = json.loads(content)
+        
+        # Validate required fields
+        if "conflict_type" not in result:
+            raise Exception("Missing 'conflict_type' in GPT response")
+        if "explanation" not in result:
+            raise Exception("Missing 'explanation' in GPT response")
+        if "confidence" not in result:
+            raise Exception("Missing 'confidence' in GPT response")
+        
+        # Parse and validate conflict type
+        conflict_type_str = result["conflict_type"].upper()
+        try:
+            conflict_type = ConflictAnalysisType(conflict_type_str)
+        except ValueError:
+            logger.warning(f"Invalid conflict_type '{conflict_type_str}', defaulting to CONTEXT_DEPENDENT")
+            conflict_type = ConflictAnalysisType.CONTEXT_DEPENDENT
+        
+        # Validate confidence is in range
+        confidence = float(result["confidence"])
+        if not (0.0 <= confidence <= 1.0):
+            logger.warning(f"Confidence {confidence} out of range, clamping to [0,1]")
+            confidence = max(0.0, min(1.0, confidence))
+        
+        logger.info(
+            f"Conflict analysis: '{behavior_1_text[:50]}...' vs '{behavior_2_text[:50]}...' "
+            f"-> {conflict_type.value} (confidence: {confidence:.2f})"
+        )
+        
+        return ConflictAnalysisResult(
+            conflict_type=conflict_type,
+            explanation=result["explanation"],
+            confidence=confidence
+        )
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse conflict analysis response: {str(e)}")
+        raise Exception(f"Invalid JSON response from conflict analyzer: {str(e)}")
+    except Exception as e:
+        logger.error(f"Conflict analysis failed: {str(e)}")
+        raise Exception(f"Conflict analysis error: {str(e)}")
         
