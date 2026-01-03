@@ -37,13 +37,27 @@ SAMPLE_USERID = os.getenv("SAMPLE_USERID", "user_12345")
 # ============================================================================
 # Phase 1 & Phase 2: Similarity and Conflict Detection Thresholds
 # ============================================================================
+# 
+# IMPORTANT (Canonical Behavior Refactor):
+# These thresholds are now RETRIEVAL HINTS ONLY, not decision boundaries.
+# 
+# With the new canonical behavior system, final decisions are made by:
+# - Intent + Target matching (structured fields)
+# - Context reasoning (general vs specific)  
+# - Polarity comparison (POSITIVE vs NEGATIVE)
+#
+# Embeddings are used ONLY for candidate retrieval, not classification.
+# Distance values help narrow the search space but do not determine 
+# whether behaviors are duplicates, related, or conflicting.
+# ============================================================================
 
-# Similarity distance thresholds for behavior classification
+# Similarity distance thresholds for RETRIEVAL (not classification)
 # Based on cosine distance between embeddings (0.0 = identical, 2.0 = opposite)
-DUPLICATE_THRESHOLD = 0.12       # 0.00-0.05: Exact match, reinforce existing
-SIMILAR_THRESHOLD = 0.20         # 0.05-0.15: Related variations, insert both
-CONFLICT_THRESHOLD_MIN = 0.20    # 0.15-0.40: Potential conflict, needs LLM analysis
-CONFLICT_THRESHOLD_MAX = 0.55    # 0.40+: Unrelated behaviors
+# Can be relaxed since structured matching handles precision
+DUPLICATE_THRESHOLD = 0.25       # Retrieval hint for likely duplicates (was 0.12)
+SIMILAR_THRESHOLD = 0.35         # Retrieval hint for related behaviors (was 0.20)
+CONFLICT_THRESHOLD_MIN = 0.35    # Retrieval hint for potential conflicts (was 0.20)
+CONFLICT_THRESHOLD_MAX = 0.70    # Retrieval cutoff for unrelated behaviors (was 0.55)
 
 # Phase 2: Conflict resolution threshold
 # When credibility difference exceeds this, auto-resolve (higher credibility wins)
@@ -58,3 +72,5 @@ BASE_REINFORCEMENT_BOOST = 0.05
 # Phase 3: User confirmation expiration (in seconds)
 CONFIRMATION_EXPIRATION_DAYS = 7
 CONFIRMATION_EXPIRATION_SECONDS = CONFIRMATION_EXPIRATION_DAYS * 24 * 60 * 60  # 604800 seconds
+
+SEMANTIC_RELEVANCE_THRESHOLD = 0.5

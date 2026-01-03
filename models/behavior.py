@@ -39,6 +39,20 @@ class ExtractedBehavior(BaseModel):
         default_factory=lambda: datetime.now(datetime.timezone.utc).isoformat(),
         description="Timestamp of extraction in UTC")
     
+    # Canonical fields for structured reasoning
+    intent: Optional[Literal["PREFERENCE", "CONSTRAINT", "HABIT", "SKILL", "COMMUNICATION"]] = Field(
+        None,
+        description="Behavioral intent category")
+    target: Optional[str] = Field(
+        None,
+        description="Primary object of behavior (concise noun)")
+    context: Optional[str] = Field(
+        None,
+        description="Scope where behavior applies (IDE, frontend, morning, etc.)")
+    polarity: Optional[Literal["POSITIVE", "NEGATIVE"]] = Field(
+        None,
+        description="Behavioral direction (likes vs dislikes)")
+    
 
 
 class ExtractionResult(BaseModel):
@@ -125,6 +139,23 @@ class StoredBehavior(BaseModel):
         None,
         description="Vector embedding of behavior_text for semantic search"
     )
+    # Canonical behavior fields (added with canonical behavior refactor)
+    intent: Optional[Literal["PREFERENCE", "CONSTRAINT", "HABIT", "SKILL", "COMMUNICATION"]] = Field(
+        None,
+        description="Behavioral intent (PREFERENCE, CONSTRAINT, HABIT, SKILL, COMMUNICATION)"
+    )
+    target: Optional[str] = Field(
+        None,
+        description="Concise target noun (dark mode, python, etc.)"
+    )
+    context: Optional[str] = Field(
+        None,
+        description="Context scope (general, IDE, frontend, morning, etc.)"
+    )
+    polarity: Optional[Literal["POSITIVE", "NEGATIVE"]] = Field(
+        None,
+        description="Polarity (POSITIVE, NEGATIVE)"
+    )
 
     @field_validator('embedding')
     def validate_embedding_dimension(cls, v):
@@ -170,6 +201,11 @@ class SimilarityResult(BaseModel):
     credibility: float = Field(..., ge=0.0, le=1.0, description="Current credibility of found behavior")
     last_seen_at: int = Field(..., description="Timestamp when behavior was last reinforced")
     reinforcement_count: int = Field(..., ge=1, description="Number of times behavior reinforced")
+    # Canonical behavior fields (added with canonical behavior refactor)
+    intent: Optional[Literal["PREFERENCE", "CONSTRAINT", "HABIT", "SKILL", "COMMUNICATION"]] = Field(None, description="Behavioral intent (PREFERENCE, CONSTRAINT, HABIT, SKILL, COMMUNICATION)")
+    target: Optional[str] = Field(None, description="Concise target noun")
+    context: Optional[str] = Field(None, description="Context scope (IDE, frontend, etc.)")
+    polarity: Optional[Literal["POSITIVE", "NEGATIVE"]] = Field(None, description="Polarity (POSITIVE, NEGATIVE)")
 
 
 class BehaviorConflict(BaseModel):
@@ -314,3 +350,18 @@ class BehaviorQuery(BaseModel):
         description="Maximum number of results to return"
     )
 
+class CanonicalBehavior(BaseModel):
+    """Normalized representation used for reasoning, not storage."""
+    intent: Literal[
+    "PREFERENCE",
+    "CONSTRAINT",
+    "HABIT",
+    "SKILL",
+    "COMMUNICATION"
+    ]
+    target: str = Field(..., min_length=1)
+    context: Optional[str] = Field(
+    default="general",
+    description="Scope like IDE, frontend, night, general")
+    polarity: Literal["POSITIVE", "NEGATIVE"]
+    strength: float = Field(ge=0.0, le=1.0)

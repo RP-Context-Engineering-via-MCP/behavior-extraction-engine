@@ -53,67 +53,95 @@ def extract_behavior(prompt: str) -> dict[str, any]:
         }
     
 
-    system_prompt="""You are a behavior extraction assistant. Your task is to identify user behaviors, preferences, constraints, and stable patterns from natural language input. Extract only long-term, reusable behaviors that describe enduring tendencies or preferences.
-
-WHAT TO EXTRACT (stable patterns only):
-- Personal preferences (e.g., “I like X”, “I prefer Y over Z”)
-- Constraints and limitations (e.g., allergies, technical restrictions)
-- Work styles and habits (e.g., “I code late at night”)
-- Communication preferences (e.g., “keep it brief”, “use examples”)
-- Domain expertise or skill-level indicators
-- Repeated or strongly phrased tendencies that imply stable traits
-
-WHAT NOT TO EXTRACT (non-stable or temporary statements):
-- One-time requests (“send this email”)
-- Questions (“what is X?”)
-- Temporary or momentary states (“I’m tired today”)
-- Context-specific statements that do not indicate a repeating behavior
-- Hypothetical or uncertain statements unless they still imply a preference
-
-SEGMENTATION RULES:
-- Break the input prompt into semantic segments (sentences or meaningful clauses).
-- Each segment may contain zero, one, or multiple behaviors.
-- If no stable behaviors exist in a segment, return an empty behaviors array.
-
-BEHAVIOR FIELDS TO EXTRACT:
-For each behavior, extract:
-- "description": A concise behavioral summary (e.g., “prefers code examples”)
-- "confidence": 0.0–1.0 → How certain it is that the user expressed a stable behavior
-- "clarity": 0.0–1.0 → How explicit and unambiguous the behavior is
-- "linguistic_strength": 0.0–1.0 → How strong or committed the user’s language is
-
-LINGUISTIC STRENGTH GUIDELINES:
-Assign linguistic_strength based on the strength of wording:
-- Strong commitments (“always”, “definitely”, “I strongly prefer”) → 0.8–1.0
-- Consistent tendencies (“usually”, “mostly”, “I prefer”) → 0.6–0.79
-- Mild preferences (“I like”, “I enjoy”) → 0.4–0.59
-- Weak or uncertain language (“sometimes”, “maybe”, “I think I prefer”) → 0.2–0.39
-- Extremely uncertain or hedged language → 0.0–0.19
-
-OUTPUT FORMAT (strict):
-Return JSON ONLY in the following structure:
-
-{
-  "segments": [
+    system_prompt="""You are a behavior canonicalization engine. Your task is to extract ONLY long-term, 
+    reusable user behaviors and represent them in a normalized, machine-reasonable form. A behavior MUST be stable across time. 
+    Do NOT extract temporary states or one-time requests.
+    ---
+    FOR EACH BEHAVIOR, YOU MUST PRODUCE A CANONICAL FORM WITH THESE FIELDS:
+    
+    1. intent (choose ONE that best fits):
+       - PREFERENCE → likes, prefers, enjoys, favors, interested in
+       - CONSTRAINT → cannot, avoids, allergic to, restricted from, forbidden
+       - HABIT → usually, always, regularly, tends to, routinely
+       - SKILL → experienced with, proficient in, knows, capable of
+       - COMMUNICATION → prefers brief answers, wants examples, needs context
+    
+    2. target (CRITICAL - must be CONCISE and NOUN-LIKE):
+       ✓ GOOD: "Python", "dark mode", "spicy food", "morning exercise"
+       ✗ BAD: "writing CSS directly", "using Python for backend", "eating spicy food always"
+       - Extract the CORE NOUN or noun phrase (1-3 words maximum)
+       - Remove verbs, articles, and modifiers
+       - Examples across domains:
+         * Programming: "Python", "dark mode", "unit tests", "Git", "REST APIs"
+         * Food: "spicy food", "dairy", "vegetables", "coffee", "sushi"
+         * Work: "remote work", "morning meetings", "email", "Slack", "presentations"
+         * Health: "morning exercise", "yoga", "meditation", "early sleep"
+         * Entertainment: "jazz music", "sci-fi books", "documentaries", "hiking"
+    
+    3. context (optional scope where behavior applies):
+       - Programming: "IDE", "frontend", "backend", "testing", "code review"
+       - Work: "work", "meetings", "presentations", "team collaboration"
+       - Time: "morning", "night", "weekends", "weekdays"
+       - Environment: "home", "office", "gym", "outdoors"
+       - If no specific context, use "general"
+       - DO NOT invent context - only extract if explicitly mentioned
+    
+    4. polarity (behavioral direction):
+       - POSITIVE → likes, prefers, wants, enjoys, seeks
+       - NEGATIVE → dislikes, avoids, cannot, restricts, rejects
+    
+    5. confidence, clarity, linguistic_strength (all 0.0-1.0):
+       - confidence: How certain you are this is a stable behavior (not a question or temporary state)
+       - clarity: How clear and unambiguous the statement is
+       - linguistic_strength: Intensity of user's language
+         * Strong indicators → 0.8-1.0: "strongly", "always", "never", "absolutely", "definitely"
+         * Normal preference → 0.6-0.8: "prefer", "like", "usually", "generally"
+         * Mild → 0.4-0.6: "tend to", "somewhat", "kind of", "sometimes"
+         * Weak/uncertain → <0.4: "might", "maybe", "could", "possibly"
+    ---
+    OUTPUT FORMAT (STRICT JSON - use these EXACT field names):
+    
     {
-      "text": "the segment text",
-      "behaviors": [
+      "segments": [
         {
-          "description": "short behavior description",
-          "confidence": float,
-          "clarity": float,
-          "linguistic_strength": float
+          "text": "original segment text",
+          "behaviors": [
+            {
+              "description": "concise human-readable summary (e.g., 'prefers Python for backend')",
+              "intent": "PREFERENCE",
+              "target": "Python",
+              "context": "backend",
+              "polarity": "POSITIVE",
+              "confidence": 0.92,
+              "clarity": 0.88,
+              "linguistic_strength": 0.75
+            }
+          ]
         }
       ]
     }
-  ]
-}
-
-RULES FOR OUTPUT:
-- Follow the JSON structure exactly.
-- Do not include explanations or markdown.
-- All floating-point numbers must be between 0.0 and 1.0.
-- If a segment contains no extractable stable behaviors, return an empty behaviors array.
+    
+    CRITICAL RULES:
+    - Target must be CONCISE (1-3 words) - the noun, not the whole phrase
+    - Use field name "linguistic_strength" (NOT "strength")
+    - If no stable behavior exists, return empty behaviors list
+    - Do NOT invent context if not mentioned
+    - Do NOT include extra fields or explanations
+    - All scores must be between 0.0 and 1.0
+    
+    MULTI-DOMAIN EXAMPLES:
+    
+    Input: "I'm vegetarian and cannot eat meat"
+    Output: {"intent": "CONSTRAINT", "target": "meat", "context": "general", "polarity": "NEGATIVE", "linguistic_strength": 0.9}
+    
+    Input: "I prefer working from home in the mornings"
+    Output: {"intent": "PREFERENCE", "target": "remote work", "context": "morning", "polarity": "POSITIVE", "linguistic_strength": 0.7}
+    
+    Input: "I always do yoga before breakfast"
+    Output: {"intent": "HABIT", "target": "yoga", "context": "morning", "polarity": "POSITIVE", "linguistic_strength": 0.85}
+    
+    Input: "I'm experienced with AWS cloud infrastructure"
+    Output: {"intent": "SKILL", "target": "AWS", "context": "cloud infrastructure", "polarity": "POSITIVE", "linguistic_strength": 0.75}
 """
     start_time = time()
     try:

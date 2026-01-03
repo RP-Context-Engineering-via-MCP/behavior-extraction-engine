@@ -59,7 +59,11 @@ def insert_behavior(payload: dict):
                     last_seen_at,
                     session_id,
                     prompt_history_ids,
-                    behavior_state
+                    behavior_state,
+                    intent,
+                    target,
+                    context,
+                    polarity
                 )
                 VALUES (
                     %(behavior_id)s,
@@ -76,7 +80,11 @@ def insert_behavior(payload: dict):
                     %(last_seen_at)s,
                     %(session_id)s,
                     %(prompt_history_ids)s,
-                    %(behavior_state)s
+                    %(behavior_state)s,
+                    %(intent)s,
+                    %(target)s,
+                    %(context)s,
+                    %(polarity)s
                 )
                 """
             , payload
@@ -269,25 +277,27 @@ def classify_similarity(distance: float) -> SimilarityClassification:
     """
     Classify the relationship between two behaviors based on embedding distance.
     
-    Uses cosine distance where lower values indicate higher similarity:
-    - 0.00-DUPLICATE_THRESHOLD: DUPLICATE (exact match, different wording)
-    - DUPLICATE_THRESHOLD-SIMILAR_THRESHOLD: SIMILAR (related variations)
-    - SIMILAR_THRESHOLD-CONFLICT_THRESHOLD_MAX: POTENTIAL_CONFLICT (might be opposing)
-    - CONFLICT_THRESHOLD_MAX+: UNRELATED (different domains)
+    ⚠️  DEPRECATED FOR DECISION LOGIC - USE FOR LOGGING/DEBUGGING ONLY ⚠️
     
-    Note: SIMILAR_THRESHOLD should equal CONFLICT_THRESHOLD_MIN to avoid gaps
+    With the canonical behavior refactor, this function is NO LONGER used for 
+    making decisions about duplicate detection, conflict resolution, or behavior 
+    storage. Those decisions are now made by:
+    - Intent + Target matching (structured fields)
+    - Context reasoning (contexts_match function)
+    - Polarity comparison
+    
+    Uses cosine distance where lower values indicate higher similarity:
+    - 0.00-DUPLICATE_THRESHOLD: DUPLICATE (retrieval hint)
+    - DUPLICATE_THRESHOLD-SIMILAR_THRESHOLD: SIMILAR (retrieval hint)
+    - SIMILAR_THRESHOLD-CONFLICT_THRESHOLD_MAX: POTENTIAL_CONFLICT (retrieval hint)
+    - CONFLICT_THRESHOLD_MAX+: UNRELATED (retrieval cutoff)
     
     Args:
         distance: Cosine distance between behavior embeddings (0.0-2.0)
         
     Returns:
-        SimilarityClassification enum value
-        
-    Example:
-        >>> classify_similarity(0.03)
-        SimilarityClassification.DUPLICATE
-        >>> classify_similarity(0.25)
-        SimilarityClassification.POTENTIAL_CONFLICT
+        SimilarityClassification enum value (for logging only)
+
     """
     if distance < DUPLICATE_THRESHOLD:
         return SimilarityClassification.DUPLICATE
@@ -299,6 +309,79 @@ def classify_similarity(distance: float) -> SimilarityClassification:
         return SimilarityClassification.UNRELATED
 
 
+def get_user_behaviors(user_id: str, include_states: List[str] = None) -> List[dict]:
+    """
+    Get all behaviors for a user
+    
+    Args:
+        user_id: User identifier
+        include_states: List of behavior states to include (defaults to ['ACTIVE', 'NEW'])
+        
+    Returns:
+        List of behavior dictionaries with all fields
+    """
+    if include_states is None:
+        include_states = ['ACTIVE', 'NEW']
+    
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 
+                        behavior_id,
+                        user_id,
+                        behavior_text,
+                        credibility,
+                        clarity_score,
+                        extraction_confidence,
+                        linguistic_strength,
+                        reinforcement_count,
+                        last_seen_at,
+                        created_at,
+                        behavior_state,
+                        intent,
+                        target,
+                        context,
+                        polarity
+                    FROM behaviors
+                    WHERE user_id = %s
+                    AND behavior_state = ANY(%s)
+                    ORDER BY created_at DESC;
+                    """,
+                    (user_id, include_states)
+                )
+                
+                results = cur.fetchall()
+                
+                behaviors = []
+                for row in results:
+                    behaviors.append({
+                        'behavior_id': row[0],
+                        'user_id': row[1],
+                        'behavior_text': row[2],
+                        'credibility': float(row[3]),
+                        'clarity_score': float(row[4]) if row[4] else None,
+                        'extraction_confidence': float(row[5]) if row[5] else None,
+                        'linguistic_strength': float(row[6]) if row[6] else None,
+                        'reinforcement_count': int(row[7]),
+                        'last_seen_at': int(row[8]),
+                        'created_at': int(row[9]),
+                        'behavior_state': row[10],
+                        'intent': row[11],
+                        'target': row[12],
+                        'context': row[13],
+                        'polarity': row[14]
+                    })
+                
+                logger.debug(f"Found {len(behaviors)} behaviors for user {user_id}")
+                return behaviors
+                
+    except Exception as e:
+        logger.error(f"Failed to get user behaviors: {str(e)}")
+        return []
+
+
 def search_similar_behaviors(
         user_id: str, 
         query_embedding: List[float], 
@@ -306,12 +389,6 @@ def search_similar_behaviors(
 ) -> List[SimilarityResult]:
     """
     Find behaviors similar to query embedding using cosine similarity.
-    
-    Args:
-        user_id: User identifier
-        query_embedding: Vector embedding (3072 dimensions) as list of floats
-        limit: Maximum number of results to return
-        
     Returns:
         List of SimilarityResult objects with classification and metadata
         Sorted by similarity (lowest distance first)
@@ -327,10 +404,14 @@ def search_similar_behaviors(
                         embedding <=> %s::vector AS distance,
                         credibility,
                         last_seen_at,
-                        reinforcement_count
+                        reinforcement_count,
+                        intent,
+                        target,
+                        context,
+                        polarity
                     FROM behaviors
                     WHERE user_id = %s
-                    AND behavior_state IN ('ACTIVE', 'NEW')
+                    AND behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED')
                     ORDER BY distance
                     LIMIT %s;
                     """,
@@ -342,7 +423,7 @@ def search_similar_behaviors(
                 # Convert to SimilarityResult objects with classification
                 similarity_results = []
                 for row in results:
-                    behavior_id, behavior_text, distance, credibility, last_seen_at, reinforcement_count = row
+                    behavior_id, behavior_text, distance, credibility, last_seen_at, reinforcement_count, intent, target, context, polarity = row
                     
                     similarity_results.append(SimilarityResult(
                         behavior_id=behavior_id,
@@ -351,7 +432,11 @@ def search_similar_behaviors(
                         classification=classify_similarity(float(distance)),
                         credibility=float(credibility),
                         last_seen_at=int(last_seen_at),
-                        reinforcement_count=int(reinforcement_count)
+                        reinforcement_count=int(reinforcement_count),
+                        intent=intent,
+                        target=target,
+                        context=context if context else "general",
+                        polarity=polarity
                     ))
                 
                 logger.debug(f"Found {len(similarity_results)} similar behaviors for user {user_id}")
