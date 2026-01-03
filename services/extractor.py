@@ -13,7 +13,10 @@ from models.behavior import (
     ConflictAnalysisType,
     ConflictType,
     BehaviorState,
-    CanonicalBehavior
+    CanonicalBehavior,
+    BehaviorFlowAction,
+    BehaviorFlowInfo,
+    DetailedExtractionResult
 )
 from services.openAiClient import extract_behavior, embed_text, analyze_conflict
 from services.credibilityCalculator import calculate_initial_credibility, should_store_behavior
@@ -839,6 +842,562 @@ def store_behavior(
 
     logger.info(f"store_behavior complete: {len(stored_behaviors)} behaviors stored")
     return stored_behaviors
+
+
+def store_behavior_with_tracking(
+    extraction_result: ExtractionResult,
+    user_id: str = SAMPLE_USERID
+) -> DetailedExtractionResult:
+    """
+    Store extracted behaviors with detailed flow tracking for UI display.
+    This wraps store_behavior and tracks what happens to each behavior.
+    """
+    if not extraction_result.success:
+        return DetailedExtractionResult(
+            extraction_result=extraction_result,
+            flow_info=[],
+            total_extracted=0,
+            total_stored=0,
+            total_reinforced=0,
+            total_conflicts=0,
+            total_pruned=0
+        )
+    
+    flow_tracking: List[BehaviorFlowInfo] = []
+    stored_behaviors: List[StoredBehavior] = []
+    
+    total_extracted = 0
+    total_stored = 0
+    total_reinforced = 0
+    total_conflicts = 0
+    total_pruned = 0
+    
+    for segment in extraction_result.segments:
+        segment_id: Optional[str] = None
+        
+        for behavior in segment.behaviors:
+            total_extracted += 1
+            logger.info(f"--- Processing behavior: '{behavior.description}' ---")
+            
+            # 1️⃣ Credibility calculation & pruning
+            initial_credibility = calculate_initial_credibility(
+                confidence=behavior.confidence,
+                clarity=behavior.clarity,
+                linguistic_strength=behavior.linguistic_strength,
+                behavior_text=behavior.description
+            )
+            
+            if not should_store_behavior(initial_credibility):
+                logger.info(f"PRUNE: '{behavior.description}' (credibility={initial_credibility:.3f})")
+                flow_tracking.append(BehaviorFlowInfo(
+                    behavior_description=behavior.description,
+                    action=BehaviorFlowAction.PRUNED,
+                    credibility=initial_credibility,
+                    canonical={
+                        "intent": behavior.intent,
+                        "target": behavior.target,
+                        "context": behavior.context,
+                        "polarity": behavior.polarity
+                    } if behavior.intent else None,
+                    details=f"Credibility score ({initial_credibility:.3f}) below threshold"
+                ))
+                total_pruned += 1
+                continue
+            
+            # 2️⃣ Ensure prompt segment exists
+            if segment_id is None:
+                segment_result = insert_prompt_segment(
+                    segment_text=segment.text,
+                    user_id=user_id
+                )
+                if not segment_result.success:
+                    logger.error(f"Failed to insert prompt segment: {segment_result.error}")
+                    continue
+                segment_id = segment_result.segment_id
+            
+            # 3️⃣ Canonical behavior creation
+            canonical = create_canonical_behavior(behavior)
+            if canonical is None:
+                logger.warning(f"SKIP: Missing canonical fields for '{behavior.description}'")
+                flow_tracking.append(BehaviorFlowInfo(
+                    behavior_description=behavior.description,
+                    action=BehaviorFlowAction.PRUNED,
+                    credibility=initial_credibility,
+                    canonical=None,
+                    details="Missing required canonical fields (intent, target, or polarity)"
+                ))
+                total_pruned += 1
+                continue
+            
+            logger.info(
+                f"CANONICAL: intent={canonical.intent}, target={canonical.target}, "
+                f"context={canonical.context}, polarity={canonical.polarity}"
+            )
+            
+            # 4️⃣ Embed FULL behavior text
+            try:
+                embedding_vector = embed_text(behavior.description)
+            except Exception as e:
+                logger.error(f"Embedding failed for '{behavior.description}': {e}")
+                flow_tracking.append(BehaviorFlowInfo(
+                    behavior_description=behavior.description,
+                    action=BehaviorFlowAction.PRUNED,
+                    credibility=initial_credibility,
+                    canonical={
+                        "intent": canonical.intent,
+                        "target": canonical.target,
+                        "context": canonical.context,
+                        "polarity": canonical.polarity
+                    },
+                    details=f"Embedding generation failed: {str(e)}"
+                ))
+                total_pruned += 1
+                continue
+            
+            # 5️⃣ Retrieve candidate behaviors
+            try:
+                candidates = search_similar_behaviors(
+                    user_id=user_id,
+                    query_embedding=embedding_vector,
+                    limit=5
+                )
+                logger.info(f"Retrieved {len(candidates)} candidate(s)")
+            except Exception as e:
+                logger.error(f"Failed to search similar behaviors: {e}")
+                candidates = []
+            
+            decision_taken = False
+            flow_info = None
+            
+            # 6️⃣ Semantic gate + canonical decision loop
+            for existing in candidates:
+                # HARD SEMANTIC GATE
+                if existing.distance > SEMANTIC_RELEVANCE_THRESHOLD:
+                    logger.info(
+                        f"Skipping candidate {existing.behavior_id} "
+                        f"(distance={existing.distance:.3f}) — semantically unrelated"
+                    )
+                    continue
+                
+                logger.debug(
+                    f"Checking candidate {existing.behavior_id}: intent={existing.intent}, "
+                    f"target={existing.target}, distance={existing.distance:.3f}"
+                )
+                
+                # Process candidate and track what happens
+                decision_taken, flow_info = _process_candidate_with_tracking(
+                    existing=existing,
+                    canonical=canonical,
+                    user_id=user_id,
+                    behavior_description=behavior.description,
+                    initial_credibility=initial_credibility,
+                    clarity=behavior.clarity,
+                    confidence=behavior.confidence,
+                    linguistic_strength=behavior.linguistic_strength,
+                    embedding_vector=embedding_vector,
+                    segment_id=segment_id,
+                    stored_behaviors=stored_behaviors
+                )
+                
+                if decision_taken:
+                    if flow_info:
+                        flow_tracking.append(flow_info)
+                        if flow_info.action == BehaviorFlowAction.DUPLICATE_REINFORCED:
+                            total_reinforced += 1
+                        elif flow_info.action in [
+                            BehaviorFlowAction.CONFLICT_DETECTED,
+                            BehaviorFlowAction.CONFLICT_AUTO_RESOLVED
+                        ]:
+                            total_conflicts += 1
+                            if flow_info.stored_behavior_id:
+                                total_stored += 1
+                        elif flow_info.action == BehaviorFlowAction.SUPERSEDED_EXISTING:
+                            total_stored += 1
+                    break
+            
+            # 7️⃣ FALLBACK → INSERT NEW BEHAVIOR
+            if not decision_taken:
+                logger.info("NO MATCH → inserting new behavior")
+                
+                stored = _create_stored_behavior(
+                    user_id=user_id,
+                    behavior_description=behavior.description,
+                    initial_credibility=initial_credibility,
+                    clarity=behavior.clarity,
+                    confidence=behavior.confidence,
+                    linguistic_strength=behavior.linguistic_strength,
+                    embedding_vector=embedding_vector,
+                    segment_id=segment_id,
+                    canonical=canonical
+                )
+                
+                try:
+                    insert_behavior(stored.model_dump())
+                    stored_behaviors.append(stored)
+                    total_stored += 1
+                    
+                    flow_tracking.append(BehaviorFlowInfo(
+                        behavior_description=behavior.description,
+                        action=BehaviorFlowAction.NEW_BEHAVIOR,
+                        credibility=initial_credibility,
+                        canonical={
+                            "intent": canonical.intent,
+                            "target": canonical.target,
+                            "context": canonical.context,
+                            "polarity": canonical.polarity
+                        },
+                        stored_behavior_id=stored.behavior_id,
+                        details="No matching behavior found, created new entry"
+                    ))
+                except Exception as e:
+                    logger.error(f"Failed to insert new behavior: {e}")
+                    flow_tracking.append(BehaviorFlowInfo(
+                        behavior_description=behavior.description,
+                        action=BehaviorFlowAction.PRUNED,
+                        credibility=initial_credibility,
+                        canonical={
+                            "intent": canonical.intent,
+                            "target": canonical.target,
+                            "context": canonical.context,
+                            "polarity": canonical.polarity
+                        },
+                        details=f"Failed to insert into database: {str(e)}"
+                    ))
+                    total_pruned += 1
+    
+    logger.info(
+        f"store_behavior_with_tracking complete: {total_stored} stored, "
+        f"{total_reinforced} reinforced, {total_conflicts} conflicts, {total_pruned} pruned"
+    )
+    
+    return DetailedExtractionResult(
+        extraction_result=extraction_result,
+        flow_info=flow_tracking,
+        total_extracted=total_extracted,
+        total_stored=total_stored,
+        total_reinforced=total_reinforced,
+        total_conflicts=total_conflicts,
+        total_pruned=total_pruned
+    )
+
+
+def _process_candidate_with_tracking(
+    existing,
+    canonical: CanonicalBehavior,
+    user_id: str,
+    behavior_description: str,
+    initial_credibility: float,
+    clarity: float,
+    confidence: float,
+    linguistic_strength: float,
+    embedding_vector: List[float],
+    segment_id: str,
+    stored_behaviors: List[StoredBehavior]
+) -> tuple[bool, Optional[BehaviorFlowInfo]]:
+    """
+    Process a single candidate behavior with flow tracking.
+    Returns (decision_taken, flow_info)
+    """
+    # Intent filter
+    if existing.intent != canonical.intent:
+        return (False, None)
+    
+    logger.info(f"INTENT MATCH with behavior {existing.behavior_id}")
+    
+    # Context relationship
+    same_context, context_relation = contexts_match(
+        existing.context or "general",
+        canonical.context
+    )
+    
+    canonical_dict = {
+        "intent": canonical.intent,
+        "target": canonical.target,
+        "context": canonical.context,
+        "polarity": canonical.polarity
+    }
+    
+    # CASE 1: SAME TARGET
+    if existing.target == canonical.target:
+        # Polarity conflict
+        if existing.polarity != canonical.polarity:
+            resolution_type, explanation = try_auto_resolve_conflict(
+                existing_credibility=existing.credibility,
+                new_credibility=initial_credibility
+            )
+            
+            if resolution_type == "SUPERSEDE_EXISTING":
+                stored = _create_stored_behavior(
+                    user_id=user_id,
+                    behavior_description=behavior_description,
+                    initial_credibility=initial_credibility,
+                    clarity=clarity,
+                    confidence=confidence,
+                    linguistic_strength=linguistic_strength,
+                    embedding_vector=embedding_vector,
+                    segment_id=segment_id,
+                    canonical=canonical
+                )
+                _supersede_existing_behavior(
+                    existing_behavior_id=existing.behavior_id,
+                    user_id=user_id,
+                    stored=stored
+                )
+                stored_behaviors.append(stored)
+                
+                flow_info = BehaviorFlowInfo(
+                    behavior_description=behavior_description,
+                    action=BehaviorFlowAction.SUPERSEDED_EXISTING,
+                    credibility=initial_credibility,
+                    canonical=canonical_dict,
+                    matched_behavior_id=existing.behavior_id,
+                    matched_behavior_text=existing.behavior_text,
+                    distance=existing.distance,
+                    conflict_info={
+                        "conflict_type": "POLARITY_CONFLICT",
+                        "existing_polarity": existing.polarity,
+                        "new_polarity": canonical.polarity,
+                        "resolution": resolution_type,
+                        "explanation": explanation
+                    },
+                    stored_behavior_id=stored.behavior_id,
+                    details=f"Superseded existing behavior due to higher credibility ({initial_credibility:.3f} > {existing.credibility:.3f})"
+                )
+                return (True, flow_info)
+            
+            elif resolution_type == "IGNORE_NEW":
+                flow_info = BehaviorFlowInfo(
+                    behavior_description=behavior_description,
+                    action=BehaviorFlowAction.IGNORED_NEW,
+                    credibility=initial_credibility,
+                    canonical=canonical_dict,
+                    matched_behavior_id=existing.behavior_id,
+                    matched_behavior_text=existing.behavior_text,
+                    distance=existing.distance,
+                    conflict_info={
+                        "conflict_type": "POLARITY_CONFLICT",
+                        "existing_polarity": existing.polarity,
+                        "new_polarity": canonical.polarity,
+                        "resolution": resolution_type,
+                        "explanation": explanation
+                    },
+                    details=f"Ignored new behavior, existing has higher credibility ({existing.credibility:.3f} > {initial_credibility:.3f})"
+                )
+                return (True, flow_info)
+            
+            elif resolution_type == "NEEDS_LLM":
+                conflict_analysis = analyze_conflict(
+                    behavior_1_text=existing.behavior_text,
+                    behavior_2_text=behavior_description,
+                    distance=existing.distance
+                )
+                
+                stored = _create_stored_behavior(
+                    user_id=user_id,
+                    behavior_description=behavior_description,
+                    initial_credibility=initial_credibility,
+                    clarity=clarity,
+                    confidence=confidence,
+                    linguistic_strength=linguistic_strength,
+                    embedding_vector=embedding_vector,
+                    segment_id=segment_id,
+                    canonical=canonical
+                )
+                
+                _flag_and_create_conflict(
+                    existing_behavior_id=existing.behavior_id,
+                    user_id=user_id,
+                    stored=stored,
+                    similarity_distance=existing.distance,
+                    llm_explanation=conflict_analysis.explanation
+                )
+                stored_behaviors.append(stored)
+                
+                flow_info = BehaviorFlowInfo(
+                    behavior_description=behavior_description,
+                    action=BehaviorFlowAction.CONFLICT_DETECTED,
+                    credibility=initial_credibility,
+                    canonical=canonical_dict,
+                    matched_behavior_id=existing.behavior_id,
+                    matched_behavior_text=existing.behavior_text,
+                    distance=existing.distance,
+                    conflict_info={
+                        "conflict_type": "POLARITY_CONFLICT",
+                        "existing_polarity": existing.polarity,
+                        "new_polarity": canonical.polarity,
+                        "resolution": "USER_DECISION_NEEDED",
+                        "llm_analysis": conflict_analysis.explanation,
+                        "llm_confidence": conflict_analysis.confidence
+                    },
+                    stored_behavior_id=stored.behavior_id,
+                    details="Conflict flagged for user decision (both behaviors have similar credibility)"
+                )
+                return (True, flow_info)
+        
+        # Same polarity → duplicate if context matches
+        if same_context:
+            logger.info(f"DUPLICATE ({context_relation}) → reinforcing {existing.behavior_id}")
+            reinforce_behavior(
+                behavior_id=existing.behavior_id,
+                user_id=user_id,
+                segment_id=segment_id
+            )
+            
+            flow_info = BehaviorFlowInfo(
+                behavior_description=behavior_description,
+                action=BehaviorFlowAction.DUPLICATE_REINFORCED,
+                credibility=initial_credibility,
+                canonical=canonical_dict,
+                matched_behavior_id=existing.behavior_id,
+                matched_behavior_text=existing.behavior_text,
+                distance=existing.distance,
+                details=f"Reinforced existing behavior (context match: {context_relation})"
+            )
+            return (True, flow_info)
+        
+        # Same target, different context
+        logger.info("RELATED (same target, different context) → keep both")
+        return (False, None)
+    
+    # CASE 2: DIFFERENT TARGET + SAME CONTEXT
+    if existing.target != canonical.target and same_context:
+        try:
+            conflict_analysis = analyze_conflict(
+                behavior_1_text=existing.behavior_text,
+                behavior_2_text=behavior_description,
+                distance=existing.distance
+            )
+        except Exception as e:
+            logger.error(f"Conflict analysis failed: {e}. Treating as COMPATIBLE.")
+            return (False, None)
+        
+        if conflict_analysis.conflict_type == ConflictAnalysisType.COMPATIBLE:
+            logger.info("LLM: compatible → insert new")
+            return (False, None)
+        
+        stored = _create_stored_behavior(
+            user_id=user_id,
+            behavior_description=behavior_description,
+            initial_credibility=initial_credibility,
+            clarity=clarity,
+            confidence=confidence,
+            linguistic_strength=linguistic_strength,
+            embedding_vector=embedding_vector,
+            segment_id=segment_id,
+            canonical=canonical
+        )
+        
+        if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
+            _flag_and_create_conflict(
+                existing_behavior_id=existing.behavior_id,
+                user_id=user_id,
+                stored=stored,
+                similarity_distance=existing.distance,
+                llm_explanation=conflict_analysis.explanation
+            )
+            stored_behaviors.append(stored)
+            
+            flow_info = BehaviorFlowInfo(
+                behavior_description=behavior_description,
+                action=BehaviorFlowAction.CONFLICT_DETECTED,
+                credibility=initial_credibility,
+                canonical=canonical_dict,
+                matched_behavior_id=existing.behavior_id,
+                matched_behavior_text=existing.behavior_text,
+                distance=existing.distance,
+                conflict_info={
+                    "conflict_type": "CONTEXT_DEPENDENT",
+                    "llm_analysis": conflict_analysis.explanation,
+                    "llm_confidence": conflict_analysis.confidence
+                },
+                stored_behavior_id=stored.behavior_id,
+                details="Context-dependent conflict detected, both behaviors flagged"
+            )
+            return (True, flow_info)
+        
+        if conflict_analysis.conflict_type == ConflictAnalysisType.CONFLICT:
+            resolution_type, explanation = try_auto_resolve_conflict(
+                existing_credibility=existing.credibility,
+                new_credibility=initial_credibility
+            )
+            
+            if resolution_type == "SUPERSEDE_EXISTING":
+                _supersede_existing_behavior(
+                    existing_behavior_id=existing.behavior_id,
+                    user_id=user_id,
+                    stored=stored
+                )
+                stored_behaviors.append(stored)
+                
+                flow_info = BehaviorFlowInfo(
+                    behavior_description=behavior_description,
+                    action=BehaviorFlowAction.SUPERSEDED_EXISTING,
+                    credibility=initial_credibility,
+                    canonical=canonical_dict,
+                    matched_behavior_id=existing.behavior_id,
+                    matched_behavior_text=existing.behavior_text,
+                    distance=existing.distance,
+                    conflict_info={
+                        "conflict_type": "DIFFERENT_TARGET_CONFLICT",
+                        "resolution": resolution_type,
+                        "explanation": explanation,
+                        "llm_analysis": conflict_analysis.explanation
+                    },
+                    stored_behavior_id=stored.behavior_id,
+                    details="Superseded existing behavior due to higher credibility"
+                )
+                return (True, flow_info)
+            
+            elif resolution_type == "IGNORE_NEW":
+                flow_info = BehaviorFlowInfo(
+                    behavior_description=behavior_description,
+                    action=BehaviorFlowAction.IGNORED_NEW,
+                    credibility=initial_credibility,
+                    canonical=canonical_dict,
+                    matched_behavior_id=existing.behavior_id,
+                    matched_behavior_text=existing.behavior_text,
+                    distance=existing.distance,
+                    conflict_info={
+                        "conflict_type": "DIFFERENT_TARGET_CONFLICT",
+                        "resolution": resolution_type,
+                        "explanation": explanation
+                    },
+                    details="Ignored new behavior, existing has higher credibility"
+                )
+                return (True, flow_info)
+            
+            elif resolution_type == "NEEDS_LLM":
+                _flag_and_create_conflict(
+                    existing_behavior_id=existing.behavior_id,
+                    user_id=user_id,
+                    stored=stored,
+                    similarity_distance=existing.distance,
+                    llm_explanation=conflict_analysis.explanation
+                )
+                stored_behaviors.append(stored)
+                
+                flow_info = BehaviorFlowInfo(
+                    behavior_description=behavior_description,
+                    action=BehaviorFlowAction.CONFLICT_DETECTED,
+                    credibility=initial_credibility,
+                    canonical=canonical_dict,
+                    matched_behavior_id=existing.behavior_id,
+                    matched_behavior_text=existing.behavior_text,
+                    distance=existing.distance,
+                    conflict_info={
+                        "conflict_type": "DIFFERENT_TARGET_CONFLICT",
+                        "resolution": "USER_DECISION_NEEDED",
+                        "llm_analysis": conflict_analysis.explanation,
+                        "llm_confidence": conflict_analysis.confidence
+                    },
+                    stored_behavior_id=stored.behavior_id,
+                    details="Conflict flagged for user decision"
+                )
+                return (True, flow_info)
+    
+    # CASE 3: DIFFERENT TARGET + DIFFERENT CONTEXT
+    logger.info("COMPATIBLE: same intent, different target & context")
+    return (False, None)
 
 
 

@@ -365,3 +365,40 @@ class CanonicalBehavior(BaseModel):
     description="Scope like IDE, frontend, night, general")
     polarity: Literal["POSITIVE", "NEGATIVE"]
     strength: float = Field(ge=0.0, le=1.0)
+
+
+class BehaviorFlowAction(str, Enum):
+    """Actions taken during behavior processing"""
+    NEW_BEHAVIOR = "NEW_BEHAVIOR"
+    DUPLICATE_REINFORCED = "DUPLICATE_REINFORCED"
+    CONFLICT_DETECTED = "CONFLICT_DETECTED"
+    CONFLICT_AUTO_RESOLVED = "CONFLICT_AUTO_RESOLVED"
+    SUPERSEDED_EXISTING = "SUPERSEDED_EXISTING"
+    IGNORED_NEW = "IGNORED_NEW"
+    COMPATIBLE = "COMPATIBLE"
+    PRUNED = "PRUNED"
+
+
+class BehaviorFlowInfo(BaseModel):
+    """Detailed information about what happened to a behavior during processing"""
+    behavior_description: str = Field(..., description="Original behavior description")
+    action: BehaviorFlowAction = Field(..., description="Action taken for this behavior")
+    credibility: float = Field(..., description="Calculated credibility score")
+    canonical: Optional[dict] = Field(None, description="Canonical fields (intent, target, context, polarity)")
+    matched_behavior_id: Optional[str] = Field(None, description="ID of matched existing behavior (if any)")
+    matched_behavior_text: Optional[str] = Field(None, description="Text of matched existing behavior")
+    distance: Optional[float] = Field(None, description="Semantic distance to matched behavior")
+    conflict_info: Optional[dict] = Field(None, description="Conflict details if conflict detected")
+    stored_behavior_id: Optional[str] = Field(None, description="ID of stored behavior (if saved)")
+    details: Optional[str] = Field(None, description="Additional details about the action taken")
+
+
+class DetailedExtractionResult(BaseModel):
+    """Enhanced extraction result with flow tracking"""
+    extraction_result: ExtractionResult = Field(..., description="Original extraction result")
+    flow_info: List[BehaviorFlowInfo] = Field(default_factory=list, description="Detailed flow for each behavior")
+    total_extracted: int = Field(default=0, description="Total behaviors extracted")
+    total_stored: int = Field(default=0, description="Total behaviors stored")
+    total_reinforced: int = Field(default=0, description="Total behaviors reinforced")
+    total_conflicts: int = Field(default=0, description="Total conflicts detected")
+    total_pruned: int = Field(default=0, description="Total behaviors pruned")

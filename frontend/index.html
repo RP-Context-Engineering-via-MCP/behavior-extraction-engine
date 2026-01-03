@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Behavior Extraction Demo</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>🧠 Behavior Extraction System</h1>
+            <p class="subtitle">Research Demo - Behavior Detection and Management</p>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Input Section -->
+            <section class="input-section">
+                <h2>Enter Your Prompt</h2>
+                <div class="input-group">
+                    <label for="sessionId">Session ID:</label>
+                    <input 
+                        type="text" 
+                        id="sessionId" 
+                        placeholder="e.g., user_123 or default" 
+                        value="demo_user"
+                    />
+                </div>
+                <div class="input-group">
+                    <label for="promptInput">User Prompt:</label>
+                    <textarea 
+                        id="promptInput" 
+                        rows="6" 
+                        placeholder="Enter your natural language prompt here...&#10;&#10;Example: I prefer dark mode in my IDE. I like using Python for backend development. I don't like verbose code."
+                    ></textarea>
+                </div>
+                <button id="extractBtn" class="btn-primary">
+                    <span class="btn-text">Extract Behaviors</span>
+                    <span class="loader" style="display: none;"></span>
+                </button>
+            </section>
+
+            <!-- Results Section -->
+            <section class="results-section" id="resultsSection" style="display: none;">
+                <!-- Summary Cards -->
+                <div class="summary-cards" id="summaryCards">
+                    <!-- Dynamically populated -->
+                </div>
+
+                <!-- Behavior Flow Details -->
+                <div class="behavior-flow" id="behaviorFlow">
+                    <h2>Behavior Processing Flow</h2>
+                    <div class="flow-container" id="flowContainer">
+                        <!-- Dynamically populated -->
+                    </div>
+                </div>
+
+                <!-- View All Behaviors Button -->
+                <div class="action-buttons">
+                    <button id="viewBehaviorsBtn" class="btn-secondary">
+                        View All Stored Behaviors
+                    </button>
+                    <button id="viewConflictsBtn" class="btn-secondary">
+                        View All Conflicts
+                    </button>
+                </div>
+            </section>
+
+            <!-- Error Section -->
+            <section class="error-section" id="errorSection" style="display: none;">
+                <div class="error-card">
+                    <h3>⚠️ Error</h3>
+                    <p id="errorMessage"></p>
+                </div>
+            </section>
+        </main>
+
+        <!-- Modal for All Behaviors -->
+        <div id="behaviorsModal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2>All Stored Behaviors</h2>
+                    <span class="close" id="closeBehaviorsModal">&times;</span>
+                </div>
+                <div class="modal-body" id="behaviorsModalBody">
+                    <!-- Dynamically populated -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Modal for Conflicts -->
+        <div id="conflictsModal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2>All Conflicts</h2>
+                    <span class="close" id="closeConflictsModal">&times;</span>
+                </div>
+                <div class="modal-body" id="conflictsModalBody">
+                    <!-- Dynamically populated -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

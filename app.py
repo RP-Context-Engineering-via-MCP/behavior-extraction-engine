@@ -1,7 +1,9 @@
 from fastapi import FastAPI, status
 from fastapi.responses import JSONResponse
-from services.extractor import run_behavior_extraction, store_behavior
-from services.behaviorRepository import insert_behavior, search_similar_behaviors
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from services.extractor import run_behavior_extraction, store_behavior, store_behavior_with_tracking
+from services.behaviorRepository import insert_behavior, search_similar_behaviors, get_behaviors_by_user, get_user_conflicts
 from models.behavior import ExtractRequest
 from db.connection import close_db_pool, init_db_pool
 from contextlib import asynccontextmanager
@@ -41,6 +43,18 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Configure CORS for frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify exact origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount frontend static files
+app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
     
 @app.post(
     "/extract",
@@ -186,6 +200,189 @@ def extract_behaviors(request: ExtractRequest):
 def health_check():
     """Health check endpoint for monitoring."""
     return {"status": "healthy", "service": "behavior_extraction"}
+
+
+@app.post(
+    "/extract-detailed",
+    summary="Extract behaviors with detailed flow tracking",
+    description="Analyzes a natural language prompt and extracts behaviors with detailed information about what happened to each behavior (duplicate, conflict, new, etc.)",
+    response_description="Detailed extraction result with flow tracking for UI display"
+)
+def extract_behaviors_detailed(request: ExtractRequest):
+    """
+    Enhanced extraction endpoint that returns detailed flow information for each behavior.
+    This is specifically designed for the frontend UI to show the processing path.
+    """
+    try:
+        logger.info(f"Received detailed extraction request for session: {request.session_id}")
+
+        # Run extraction
+        extraction_result = run_behavior_extraction(request.prompt)
+
+        if not extraction_result.success:
+            logger.error(f"Extraction failed: {extraction_result.error}")
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={
+                    "success": False,
+                    "data": None,
+                    "error": extraction_result.error or "Extraction failed"
+                }
+            )
+        
+        # Store with detailed tracking
+        try:
+            detailed_result = store_behavior_with_tracking(
+                extraction_result,
+                user_id=request.session_id
+            )
+
+            logger.info(
+                f"Processing complete: {detailed_result.total_stored} stored, "
+                f"{detailed_result.total_reinforced} reinforced, "
+                f"{detailed_result.total_conflicts} conflicts, "
+                f"{detailed_result.total_pruned} pruned"
+            )
+        except Exception as e:
+            logger.error(f"Failed to store behaviors: {str(e)}")
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={
+                    "success": False,
+                    "data": None,
+                    "error": f"Storage error: {str(e)}"
+                }
+            )
+        
+        # Format flow info for frontend
+        flow_info_formatted = []
+        for flow in detailed_result.flow_info:
+            flow_dict = {
+                "behavior_description": flow.behavior_description,
+                "action": flow.action.value,
+                "credibility": round(flow.credibility, 3),
+                "canonical": flow.canonical,
+                "matched_behavior_id": flow.matched_behavior_id,
+                "matched_behavior_text": flow.matched_behavior_text,
+                "distance": round(flow.distance, 4) if flow.distance is not None else None,
+                "conflict_info": flow.conflict_info,
+                "stored_behavior_id": flow.stored_behavior_id,
+                "details": flow.details
+            }
+            flow_info_formatted.append(flow_dict)
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "data": {
+                    "extraction": {
+                        "extraction_time_ms": extraction_result.extraction_time,
+                        "total_segments": len(extraction_result.segments),
+                    },
+                    "processing": {
+                        "total_extracted": detailed_result.total_extracted,
+                        "total_stored": detailed_result.total_stored,
+                        "total_reinforced": detailed_result.total_reinforced,
+                        "total_conflicts": detailed_result.total_conflicts,
+                        "total_pruned": detailed_result.total_pruned
+                    },
+                    "flow_info": flow_info_formatted,
+                    "session_id": request.session_id
+                },
+                "error": None
+            }
+        )
+    except ValueError as e:
+        logger.warning(f"Validation error: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "success": False,
+                "data": None,
+                "error": f"Validation error: {str(e)}"
+            }
+        )
+    except Exception as e:
+        logger.exception("Unexpected error during detailed extraction")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "success": False,
+                "data": None,
+                "error": f"Internal server error: {str(e)}"
+            }
+        )
+
+
+@app.get(
+    "/behaviors/{user_id}",
+    summary="Get all behaviors for a user",
+    description="Retrieve all stored behaviors for a specific user",
+    response_description="List of behaviors with all details"
+)
+def get_user_behaviors(user_id: str):
+    """Get all behaviors for a specific user."""
+    try:
+        behaviors = get_behaviors_by_user(user_id)
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "data": {
+                    "user_id": user_id,
+                    "total_behaviors": len(behaviors),
+                    "behaviors": behaviors
+                },
+                "error": None
+            }
+        )
+    except Exception as e:
+        logger.exception(f"Error retrieving behaviors for user {user_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "success": False,
+                "data": None,
+                "error": f"Failed to retrieve behaviors: {str(e)}"
+            }
+        )
+
+
+@app.get(
+    "/conflicts/{user_id}",
+    summary="Get all conflicts for a user",
+    description="Retrieve all detected conflicts for a specific user",
+    response_description="List of conflicts with behavior details"
+)
+def get_user_conflicts_endpoint(user_id: str):
+    """Get all conflicts for a specific user."""
+    try:
+        conflicts = get_user_conflicts(user_id)
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "data": {
+                    "user_id": user_id,
+                    "total_conflicts": len(conflicts),
+                    "conflicts": conflicts
+                },
+                "error": None
+            }
+        )
+    except Exception as e:
+        logger.exception(f"Error retrieving conflicts for user {user_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "success": False,
+                "data": None,
+                "error": f"Failed to retrieve conflicts: {str(e)}"
+            }
+        )
 
 @app.post(
     "/similarity",
