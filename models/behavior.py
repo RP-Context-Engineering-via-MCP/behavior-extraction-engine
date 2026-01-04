@@ -197,7 +197,6 @@ class SimilarityResult(BaseModel):
     behavior_id: str = Field(..., description="ID of the similar behavior found")
     behavior_text: str = Field(..., description="Text of the similar behavior")
     distance: float = Field(..., ge=0.0, description="Cosine distance (lower = more similar)")
-    classification: SimilarityClassification = Field(..., description="Classified relationship type")
     credibility: float = Field(..., ge=0.0, le=1.0, description="Current credibility of found behavior")
     last_seen_at: int = Field(..., description="Timestamp when behavior was last reinforced")
     reinforcement_count: int = Field(..., ge=1, description="Number of times behavior reinforced")

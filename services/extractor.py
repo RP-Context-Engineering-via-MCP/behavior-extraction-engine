@@ -34,7 +34,68 @@ from config.configurations import (
 )
 
 import logging
+from enum import Enum
+from dataclasses import dataclass
+
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# INTENT CONFLICT RULES
+# ==============================================================================
+# Defines which intents can potentially conflict with each other
+# CONSTRAINT is special: it can conflict with ANY intent
+# ==============================================================================
+
+INTENT_CONFLICT_MATRIX = {
+    "PREFERENCE": {"PREFERENCE", "CONSTRAINT"},
+    "SKILL": {"SKILL", "CONSTRAINT"},
+    "HABIT": {"HABIT", "CONSTRAINT"},
+    "CONSTRAINT": {"PREFERENCE", "SKILL", "HABIT", "CONSTRAINT", "COMMUNICATION"},  # Conflicts with everything
+    "COMMUNICATION": {"COMMUNICATION", "CONSTRAINT"},
+}
+
+
+def can_intents_conflict(intent1: str, intent2: str) -> bool:
+    """
+    Determine if two intents can potentially conflict.
+    
+    Rules:
+    - CONSTRAINT can conflict with ANY intent
+    - Other intents only conflict with same intent type
+    
+    Args:
+        intent1: First intent (from existing behavior)
+        intent2: Second intent (from new behavior)
+        
+    Returns:
+        True if the intents can conflict, False otherwise
+    """
+    if intent1 is None or intent2 is None:
+        return False
+    
+    # Check if intent2 is in the conflict set for intent1
+    conflict_set = INTENT_CONFLICT_MATRIX.get(intent1, set())
+    return intent2 in conflict_set
+
+
+class RelationType(str, Enum):
+    """Types of relationships between behaviors"""
+    DUPLICATE = "DUPLICATE"           # Same intent, target, polarity, context → reinforce
+    POLARITY_CONFLICT = "POLARITY_CONFLICT"  # Same intent, target, different polarity
+    POTENTIAL_CONFLICT = "POTENTIAL_CONFLICT"  # Same intent, different target, same context
+    CROSS_INTENT_CONFLICT = "CROSS_INTENT_CONFLICT"  # CONSTRAINT vs other intent
+    RELATED = "RELATED"               # Same intent & target, different context
+    COMPATIBLE = "COMPATIBLE"         # No conflict, can coexist
+
+
+@dataclass
+class BehaviorRelation:
+    """Represents a relationship between new behavior and existing behavior"""
+    existing_behavior: any  # The existing behavior from DB
+    relation_type: RelationType
+    context_relation: str  # DUPLICATE, GENERALIZATION, SPECIALIZATION, DIFFERENT
+
 
 def run_behavior_extraction(prompt: str) -> ExtractionResult:
     """
@@ -574,8 +635,173 @@ def _handle_potential_conflict(
     return (False, False)
 
 
-def _process_candidate_behavior(
+def classify_relationship(
     existing,
+    canonical: CanonicalBehavior
+) -> Optional[BehaviorRelation]:
+    """
+    Classify the relationship between an existing behavior and new canonical behavior.
+    
+    Uses intent conflict matrix to determine if behaviors can conflict.
+    CONSTRAINT behaviors can conflict with ANY other intent.
+    
+    Args:
+        existing: Existing behavior from database
+        canonical: New behavior's canonical form
+        
+    Returns:
+        BehaviorRelation if related, None if unrelated
+    """
+    # Check if intents can conflict using the conflict matrix
+    intents_can_conflict = can_intents_conflict(existing.intent, canonical.intent)
+    same_intent = existing.intent == canonical.intent
+    
+    # Get context relationship
+    same_context, context_relation = contexts_match(
+        existing.context or "general",
+        canonical.context
+    )
+    
+    same_target = existing.target == canonical.target
+    same_polarity = existing.polarity == canonical.polarity
+    
+    # ==================================================================
+    # CASE 1: SAME INTENT relationships (original logic preserved)
+    # ==================================================================
+    if same_intent:
+        # SAME TARGET
+        if same_target:
+            if not same_polarity:
+                return BehaviorRelation(
+                    existing_behavior=existing,
+                    relation_type=RelationType.POLARITY_CONFLICT,
+                    context_relation=context_relation
+                )
+            # Same polarity + same context = DUPLICATE
+            if same_context:
+                return BehaviorRelation(
+                    existing_behavior=existing,
+                    relation_type=RelationType.DUPLICATE,
+                    context_relation=context_relation
+                )
+            # Same polarity + different context = RELATED
+            return BehaviorRelation(
+                existing_behavior=existing,
+                relation_type=RelationType.RELATED,
+                context_relation=context_relation
+            )
+        
+        # DIFFERENT TARGET + SAME CONTEXT = POTENTIAL CONFLICT
+        if not same_target and same_context:
+            return BehaviorRelation(
+                existing_behavior=existing,
+                relation_type=RelationType.POTENTIAL_CONFLICT,
+                context_relation=context_relation
+            )
+        
+        # DIFFERENT TARGET + DIFFERENT CONTEXT = COMPATIBLE
+        return BehaviorRelation(
+            existing_behavior=existing,
+            relation_type=RelationType.COMPATIBLE,
+            context_relation=context_relation
+        )
+    
+    # ==================================================================
+    # CASE 2: CROSS-INTENT CONFLICTS (new logic for CONSTRAINT)
+    # ==================================================================
+    if intents_can_conflict and not same_intent:
+        # Only check for conflict if there's semantic + target overlap
+        # This prevents false conflicts between unrelated CONSTRAINT behaviors
+        
+        # If same target with opposite polarity → CROSS_INTENT_CONFLICT
+        if same_target and not same_polarity:
+            logger.info(
+                f"CROSS-INTENT CONFLICT detected: "
+                f"{existing.intent} vs {canonical.intent} on target '{canonical.target}'"
+            )
+            return BehaviorRelation(
+                existing_behavior=existing,
+                relation_type=RelationType.CROSS_INTENT_CONFLICT,
+                context_relation=context_relation
+            )
+        
+        # If same target with same polarity in same context → could be reinforcing
+        if same_target and same_polarity and same_context:
+            # A CONSTRAINT supporting a PREFERENCE is not a conflict
+            logger.info(
+                f"CROSS-INTENT SUPPORT detected: "
+                f"{existing.intent} and {canonical.intent} agree on target '{canonical.target}'"
+            )
+            return BehaviorRelation(
+                existing_behavior=existing,
+                relation_type=RelationType.COMPATIBLE,
+                context_relation=context_relation
+            )
+    
+    # No meaningful relationship
+    return None
+
+
+def _collect_all_relationships(
+    candidates: List,
+    canonical: CanonicalBehavior,
+    semantic_threshold: float
+) -> List[BehaviorRelation]:
+    """
+    Collect all relationships between new behavior and existing candidates.
+    
+    This replaces the single-match approach with comprehensive relationship detection.
+    
+    Args:
+        candidates: List of candidate behaviors from semantic search
+        canonical: New behavior's canonical form
+        semantic_threshold: Maximum distance for semantic relevance
+        
+    Returns:
+        List of all detected relationships, sorted by priority
+    """
+    relationships: List[BehaviorRelation] = []
+    
+    for existing in candidates:
+        # HARD SEMANTIC GATE
+        if existing.distance > semantic_threshold:
+            logger.debug(
+                f"Skipping candidate {existing.behavior_id} "
+                f"(distance={existing.distance:.3f}) — semantically unrelated"
+            )
+            continue
+        
+        logger.debug(
+            f"Classifying candidate {existing.behavior_id}: "
+            f"intent={existing.intent}, target={existing.target}, "
+            f"context={existing.context}, polarity={existing.polarity}, "
+            f"distance={existing.distance:.3f}"
+        )
+        
+        relation = classify_relationship(existing, canonical)
+        if relation is not None:
+            logger.info(
+                f"Found {relation.relation_type.value} relationship with "
+                f"{existing.behavior_id}"
+            )
+            relationships.append(relation)
+    
+    # Sort by priority: DUPLICATE > POLARITY_CONFLICT > CROSS_INTENT > POTENTIAL > RELATED > COMPATIBLE
+    priority_order = {
+        RelationType.DUPLICATE: 0,
+        RelationType.POLARITY_CONFLICT: 1,
+        RelationType.CROSS_INTENT_CONFLICT: 2,
+        RelationType.POTENTIAL_CONFLICT: 3,
+        RelationType.RELATED: 4,
+        RelationType.COMPATIBLE: 5,
+    }
+    relationships.sort(key=lambda r: priority_order.get(r.relation_type, 99))
+    
+    return relationships
+
+
+def _process_relationships(
+    relationships: List[BehaviorRelation],
     canonical: CanonicalBehavior,
     user_id: str,
     behavior_description: str,
@@ -586,30 +812,106 @@ def _process_candidate_behavior(
     embedding_vector: List[float],
     segment_id: str,
     stored_behaviors: List[StoredBehavior]
-) -> tuple[bool, bool]:
+) -> bool:
     """
-    Process a single candidate behavior against the new behavior.
+    Process all collected relationships and take appropriate actions.
     
+    Priority handling:
+    1. DUPLICATE → Reinforce and return (definitive action)
+    2. POLARITY_CONFLICT → Handle conflict (may supersede, ignore, or flag)
+    3. CROSS_INTENT_CONFLICT → Handle cross-intent conflict
+    4. POTENTIAL_CONFLICT → Collect all, then handle
+    5. RELATED/COMPATIBLE → No action needed
+    
+    Args:
+        relationships: List of detected relationships
+        canonical: New behavior's canonical form
+        user_id: User ID
+        behavior_description: Description of new behavior
+        initial_credibility: Calculated credibility of new behavior
+        clarity, confidence, linguistic_strength: Behavior scores
+        embedding_vector: Embedding of new behavior
+        segment_id: Segment ID
+        stored_behaviors: List to append stored behaviors to
+        
     Returns:
-        Tuple of (decision_taken, should_continue_to_next_candidate)
+        True if a definitive action was taken (don't insert new behavior)
+        False if new behavior should be inserted
     """
-    # Intent filter
-    if existing.intent != canonical.intent:
-        return (False, True)
-
-    logger.info(f"INTENT MATCH with behavior {existing.behavior_id}")
-
-    # Context relationship
-    same_context, context_relation = contexts_match(
-        existing.context or "general",
-        canonical.context
-    )
-
-    # CASE 1: SAME TARGET
-    if existing.target == canonical.target:
-        # Polarity conflict
-        if existing.polarity != canonical.polarity:
-            decision_taken, should_break = _handle_polarity_conflict(
+    if not relationships:
+        return False
+    
+    # Separate by type for comprehensive handling
+    duplicates = [r for r in relationships if r.relation_type == RelationType.DUPLICATE]
+    polarity_conflicts = [r for r in relationships if r.relation_type == RelationType.POLARITY_CONFLICT]
+    cross_intent_conflicts = [r for r in relationships if r.relation_type == RelationType.CROSS_INTENT_CONFLICT]
+    potential_conflicts = [r for r in relationships if r.relation_type == RelationType.POTENTIAL_CONFLICT]
+    
+    # ==================================================================
+    # STEP 1: Handle DUPLICATES (highest priority - reinforce all)
+    # ==================================================================
+    if duplicates:
+        for dup in duplicates:
+            existing = dup.existing_behavior
+            logger.info(
+                f"DUPLICATE ({dup.context_relation}) → reinforcing {existing.behavior_id}"
+            )
+            reinforce_behavior(
+                behavior_id=existing.behavior_id,
+                user_id=user_id,
+                segment_id=segment_id
+            )
+        # Duplicates found → don't insert new behavior
+        return True
+    
+    # ==================================================================
+    # STEP 2: Handle POLARITY CONFLICTS
+    # ==================================================================
+    if polarity_conflicts:
+        # For polarity conflicts, we need to handle each one
+        # If new behavior supersedes one, it might conflict with others
+        all_conflicts_resolved = True
+        
+        for conflict in polarity_conflicts:
+            existing = conflict.existing_behavior
+            decision_taken, _ = _handle_polarity_conflict(
+                existing=existing,
+                user_id=user_id,
+                behavior_description=behavior_description,
+                initial_credibility=initial_credibility,
+                clarity=clarity,
+                confidence=confidence,
+                linguistic_strength=linguistic_strength,
+                embedding_vector=embedding_vector,
+                segment_id=segment_id,
+                canonical=canonical,
+                stored_behaviors=stored_behaviors
+            )
+            if not decision_taken:
+                all_conflicts_resolved = False
+        
+        if all_conflicts_resolved:
+            return True
+    
+    # ==================================================================
+    # STEP 3: Handle CROSS-INTENT CONFLICTS (e.g., CONSTRAINT vs PREFERENCE)
+    # ==================================================================
+    if cross_intent_conflicts:
+        logger.warning(
+            f"Processing {len(cross_intent_conflicts)} cross-intent conflict(s)"
+        )
+        
+        for conflict in cross_intent_conflicts:
+            existing = conflict.existing_behavior
+            
+            # Cross-intent conflicts are treated similarly to polarity conflicts
+            # but with additional logging for visibility
+            logger.warning(
+                f"CROSS-INTENT CONFLICT: {existing.intent} ('{existing.behavior_text}') "
+                f"vs {canonical.intent} ('{behavior_description}')"
+            )
+            
+            decision_taken, _ = _handle_polarity_conflict(
                 existing=existing,
                 user_id=user_id,
                 behavior_description=behavior_description,
@@ -623,46 +925,36 @@ def _process_candidate_behavior(
                 stored_behaviors=stored_behaviors
             )
             if decision_taken:
-                return (True, False)
-            if should_break:
-                return (False, False)
-
-        # Same polarity → duplicate if context matches
-        if same_context:
-            logger.info(f"DUPLICATE ({context_relation}) → reinforcing {existing.behavior_id}")
-            reinforce_behavior(
-                behavior_id=existing.behavior_id,
-                user_id=user_id,
-                segment_id=segment_id
-            )
-            return (True, False)
-
-        logger.info("RELATED (same target, different context) → keep both")
-        return (False, True)
-
-    # CASE 2: DIFFERENT TARGET + SAME CONTEXT
-    if existing.target != canonical.target and same_context:
-        decision_taken, should_break = _handle_potential_conflict(
-            existing=existing,
-            user_id=user_id,
-            behavior_description=behavior_description,
-            initial_credibility=initial_credibility,
-            clarity=clarity,
-            confidence=confidence,
-            linguistic_strength=linguistic_strength,
-            embedding_vector=embedding_vector,
-            segment_id=segment_id,
-            canonical=canonical,
-            stored_behaviors=stored_behaviors
+                return True
+    
+    # ==================================================================
+    # STEP 4: Handle POTENTIAL CONFLICTS (LLM-based analysis)
+    # ==================================================================
+    if potential_conflicts:
+        logger.info(
+            f"Processing {len(potential_conflicts)} potential conflict(s)"
         )
-        if decision_taken:
-            return (True, False)
-        if should_break:
-            return (False, False)
-
-    # CASE 3: DIFFERENT TARGET + DIFFERENT CONTEXT
-    logger.info("COMPATIBLE: same intent, different target & context")
-    return (False, True)
+        
+        for conflict in potential_conflicts:
+            existing = conflict.existing_behavior
+            decision_taken, _ = _handle_potential_conflict(
+                existing=existing,
+                user_id=user_id,
+                behavior_description=behavior_description,
+                initial_credibility=initial_credibility,
+                clarity=clarity,
+                confidence=confidence,
+                linguistic_strength=linguistic_strength,
+                embedding_vector=embedding_vector,
+                segment_id=segment_id,
+                canonical=canonical,
+                stored_behaviors=stored_behaviors
+            )
+            if decision_taken:
+                return True
+    
+    # No definitive action taken → new behavior should be inserted
+    return False
 
 
 def store_behavior(
@@ -721,7 +1013,9 @@ def store_behavior(
                         f"Failed to insert prompt segment: {segment_result.error}"
                     )
                     continue
+                # Capture the segment_id from the result
                 segment_id = segment_result.segment_id
+                logger.info(f"Prompt segment created: {segment_id}")
 
             # ==============================================================
             # 3️⃣ Canonical behavior creation
@@ -769,49 +1063,41 @@ def store_behavior(
                 logger.error(f"Failed to search similar behaviors: {e}")
                 candidates = []
 
-            decision_taken = False
+            # ==============================================================
+            # 6️⃣ MULTI-RELATIONSHIP DETECTION
+            # Collect ALL relationships before taking action
+            # ==============================================================
+            relationships = _collect_all_relationships(
+                candidates=candidates,
+                canonical=canonical,
+                semantic_threshold=SEMANTIC_RELEVANCE_THRESHOLD
+            )
+            
+            logger.info(
+                f"Found {len(relationships)} relationship(s) for '{behavior.description}': "
+                f"{[r.relation_type.value for r in relationships]}"
+            )
 
             # ==============================================================
-            # 6️⃣ Semantic gate + canonical decision loop
+            # 7️⃣ PROCESS ALL RELATIONSHIPS
+            # Priority: DUPLICATE > POLARITY_CONFLICT > CROSS_INTENT > POTENTIAL
             # ==============================================================
-            for existing in candidates:
-                # HARD SEMANTIC GATE
-                if existing.distance > SEMANTIC_RELEVANCE_THRESHOLD:
-                    logger.info(
-                        f"Skipping candidate {existing.behavior_id} "
-                        f"(distance={existing.distance:.3f}) — semantically unrelated"
-                    )
-                    continue
-
-                logger.debug(
-                    f"Checking candidate {existing.behavior_id}: "
-                    f"intent={existing.intent}, target={existing.target}, "
-                    f"context={existing.context}, polarity={existing.polarity}, "
-                    f"distance={existing.distance:.3f}"
-                )
-
-                # Process this candidate
-                decision_taken, should_continue = _process_candidate_behavior(
-                    existing=existing,
-                    canonical=canonical,
-                    user_id=user_id,
-                    behavior_description=behavior.description,
-                    initial_credibility=initial_credibility,
-                    clarity=behavior.clarity,
-                    confidence=behavior.confidence,
-                    linguistic_strength=behavior.linguistic_strength,
-                    embedding_vector=embedding_vector,
-                    segment_id=segment_id,
-                    stored_behaviors=stored_behaviors
-                )
-
-                if decision_taken:
-                    break
-                if not should_continue:
-                    break
+            decision_taken = _process_relationships(
+                relationships=relationships,
+                canonical=canonical,
+                user_id=user_id,
+                behavior_description=behavior.description,
+                initial_credibility=initial_credibility,
+                clarity=behavior.clarity,
+                confidence=behavior.confidence,
+                linguistic_strength=behavior.linguistic_strength,
+                embedding_vector=embedding_vector,
+                segment_id=segment_id,
+                stored_behaviors=stored_behaviors
+            )
 
             # ==============================================================
-            # 7️⃣ FALLBACK → INSERT NEW BEHAVIOR
+            # 8️⃣ FALLBACK → INSERT NEW BEHAVIOR
             # ==============================================================
             if decision_taken:
                 logger.info("DECISION TAKEN → skipping insertion")
