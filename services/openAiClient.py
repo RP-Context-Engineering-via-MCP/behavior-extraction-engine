@@ -59,27 +59,59 @@ def extract_behavior(prompt: str) -> dict[str, any]:
     ---
     FOR EACH BEHAVIOR, YOU MUST PRODUCE A CANONICAL FORM WITH THESE FIELDS:
     
-    1. intent (choose ONE that best fits):
-       - PREFERENCE → likes, prefers, enjoys, favors, interested in
-       - CONSTRAINT → cannot, avoids, allergic to, restricted from, forbidden
-       - HABIT → usually, always, regularly, tends to, routinely
-       - SKILL → experienced with, proficient in, knows, capable of
-       - COMMUNICATION → prefers brief answers, wants examples, needs context
+    1. intent (choose ONE that best fits - ordered by precedence):
+       - CONSTRAINT → Hard rules: cannot, must not, avoids, allergic to, restricted from, forbidden, never
+         ⚠️ CONSTRAINT behaviors are HARD RULES that can override other intent types!
+         Examples: "never use eval()", "cannot eat gluten", "must not work weekends"
+       - PREFERENCE → Soft desires: likes, prefers, enjoys, favors, interested in
+       - HABIT → Frequency patterns: usually, always, regularly, tends to, routinely
+       - SKILL → Capabilities: experienced with, proficient in, knows, capable of, expert in
+       - COMMUNICATION → Interaction style: prefers brief answers, wants examples, needs context
     
-    2. target (CRITICAL - must be CONCISE and NOUN-LIKE):
+    2. target (CRITICAL - must be CONCISE, NOUN-LIKE, and CANONICALLY NAMED):
        ✓ GOOD: "Python", "dark mode", "spicy food", "morning exercise"
        ✗ BAD: "writing CSS directly", "using Python for backend", "eating spicy food always"
+       
+       CANONICALIZATION RULES (VERY IMPORTANT):
+       - Always use the FULL, STANDARD, MOST WIDELY RECOGNIZED name
+       - NEVER use abbreviations, acronyms, or shorthand for the target
+       - Convert all variations to the canonical form:
+         
+         Programming Languages & Technologies:
+         * JS, js → "JavaScript"
+         * TS, ts → "TypeScript"  
+         * PY, py → "Python"
+         * C# → "C Sharp"
+         * CPP, cpp, C++ → "C Plus Plus"
+         * RB, rb → "Ruby"
+         * Go, golang → "Go"
+         * K8s, k8 → "Kubernetes"
+         * DB, db → "database"
+         * SQL, sql → "SQL"
+         * NoSQL, nosql → "NoSQL"
+         * API, api → "API"
+         * REST, rest → "REST API"
+         * GraphQL, gql → "GraphQL"
+         * HTML, html → "HTML"
+         * CSS, css → "CSS"
+         * SCSS, scss → "SCSS"
+         
+         General:
+         * TDD, tdd → "test-driven development"
+         * OOP, oop → "object-oriented programming"
+         * FP, fp → "functional programming"
+         * CI/CD, cicd → "CI/CD"
+         * PR, pr (code context) → "pull request"
+         * WFH, wfh → "remote work"
+         * AM, am → "morning"
+         * PM, pm → "afternoon"
+       
        - Extract the CORE NOUN or noun phrase (1-3 words maximum)
        - Remove verbs, articles, and modifiers
-       - Examples across domains:
-         * Programming: "Python", "dark mode", "unit tests", "Git", "REST APIs"
-         * Food: "spicy food", "dairy", "vegetables", "coffee", "sushi"
-         * Work: "remote work", "morning meetings", "email", "Slack", "presentations"
-         * Health: "morning exercise", "yoga", "meditation", "early sleep"
-         * Entertainment: "jazz music", "sci-fi books", "documentaries", "hiking"
+       - Use lowercase for common nouns, proper case for proper nouns
     
     3. context (optional scope where behavior applies):
-       - Programming: "IDE", "frontend", "backend", "testing", "code review"
+       - Programming: "IDE", "frontend", "backend", "testing", "code review", "debugging"
        - Work: "work", "meetings", "presentations", "team collaboration"
        - Time: "morning", "night", "weekends", "weekdays"
        - Environment: "home", "office", "gym", "outdoors"
@@ -87,17 +119,19 @@ def extract_behavior(prompt: str) -> dict[str, any]:
        - DO NOT invent context - only extract if explicitly mentioned
     
     4. polarity (behavioral direction):
-       - POSITIVE → likes, prefers, wants, enjoys, seeks
-       - NEGATIVE → dislikes, avoids, cannot, restricts, rejects
+       - POSITIVE → likes, prefers, wants, enjoys, seeks, uses, enables
+       - NEGATIVE → dislikes, avoids, cannot, restricts, rejects, disables, never
     
     5. confidence, clarity, linguistic_strength (all 0.0-1.0):
        - confidence: How certain you are this is a stable behavior (not a question or temporary state)
        - clarity: How clear and unambiguous the statement is
        - linguistic_strength: Intensity of user's language
-         * Strong indicators → 0.8-1.0: "strongly", "always", "never", "absolutely", "definitely"
+         * Strong indicators → 0.8-1.0: "strongly", "always", "never", "absolutely", "definitely", "must", "cannot"
          * Normal preference → 0.6-0.8: "prefer", "like", "usually", "generally"
          * Mild → 0.4-0.6: "tend to", "somewhat", "kind of", "sometimes"
          * Weak/uncertain → <0.4: "might", "maybe", "could", "possibly"
+         
+         ⚠️ CONSTRAINT intent should typically have high linguistic_strength (0.8+)
     ---
     OUTPUT FORMAT (STRICT JSON - use these EXACT field names):
     
@@ -123,11 +157,22 @@ def extract_behavior(prompt: str) -> dict[str, any]:
     
     CRITICAL RULES:
     - Target must be CONCISE (1-3 words) - the noun, not the whole phrase
+    - Target must use CANONICAL/FULL form - NEVER abbreviations (JavaScript not JS)
     - Use field name "linguistic_strength" (NOT "strength")
     - If no stable behavior exists, return empty behaviors list
     - Do NOT invent context if not mentioned
     - Do NOT include extra fields or explanations
     - All scores must be between 0.0 and 1.0
+    - CONSTRAINT behaviors represent hard rules and should have high linguistic_strength
+    
+    ⚠️ COMPARATIVE STATEMENTS: For "X over Y" or "X instead of Y" statements:
+    - Extract ONLY the PREFERRED option (X) with POSITIVE polarity
+    - Do NOT extract the rejected option (Y) as a separate behavior
+    - Examples:
+      * "I prefer TypeScript over JavaScript" → Extract ONLY TypeScript POSITIVE
+      * "I like Angular instead of React" → Extract ONLY Angular POSITIVE
+      * "I don't like React, prefer Angular" → Extract ONLY Angular POSITIVE
+    - This prevents creating multiple conflicting behaviors from a single preference statement
     
     MULTI-DOMAIN EXAMPLES:
     
@@ -142,6 +187,26 @@ def extract_behavior(prompt: str) -> dict[str, any]:
     
     Input: "I'm experienced with AWS cloud infrastructure"
     Output: {"intent": "SKILL", "target": "AWS", "context": "cloud infrastructure", "polarity": "POSITIVE", "linguistic_strength": 0.75}
+    
+    Input: "I like JS for frontend development"
+    Output: {"intent": "PREFERENCE", "target": "JavaScript", "context": "frontend", "polarity": "POSITIVE", "linguistic_strength": 0.65}
+    ⚠️ Note: "JS" was normalized to "JavaScript"
+    
+    Input: "Never use eval() in production code"
+    Output: {"intent": "CONSTRAINT", "target": "eval function", "context": "production", "polarity": "NEGATIVE", "linguistic_strength": 0.95}
+    ⚠️ Note: "Never" indicates CONSTRAINT with high linguistic_strength
+    
+    Input: "I prefer TypeScript over JavaScript for frontend"
+    Output: {"intent": "PREFERENCE", "target": "TypeScript", "context": "frontend", "polarity": "POSITIVE", "linguistic_strength": 0.7}
+    ⚠️ Note: Comparative statement - only extract the PREFERRED option (TypeScript), not the rejected one
+    
+    Input: "I like Angular instead of React"
+    Output: {"intent": "PREFERENCE", "target": "Angular", "context": "general", "polarity": "POSITIVE", "linguistic_strength": 0.65}
+    ⚠️ Note: Extract only the preferred choice (Angular)
+    
+    Input: "Maybe I should try using JavaScript for backend"
+    Output: {"intent": "PREFERENCE", "target": "JavaScript", "context": "backend", "polarity": "POSITIVE", "confidence": 0.35, "clarity": 0.4, "linguistic_strength": 0.3}
+    ⚠️ Note: Weak/uncertain statement - still extract but with low scores to reflect uncertainty
 """
     start_time = time()
     try:
@@ -288,29 +353,49 @@ def analyze_conflict(
     
     system_prompt = """You are a behavior conflict analyzer. Your task is to determine if two user behaviors conflict, are compatible, or depend on context.
 
+INTENT TYPES AND THEIR CONFLICT RULES:
+- CONSTRAINT: Hard rules (cannot, never, must not) - can conflict with ANY other intent type
+- PREFERENCE: Soft desires (likes, prefers) - typically only conflicts with other PREFERENCE on same target
+- HABIT: Frequency patterns (usually, always) - conflicts with other HABIT on same activity
+- SKILL: Capabilities - rarely conflicts
+- COMMUNICATION: Interaction style - conflicts with other COMMUNICATION styles
+
+⚠️ CRITICAL: CONSTRAINT behaviors are HARD RULES. A CONSTRAINT can override a PREFERENCE!
+Example: "never use eval()" (CONSTRAINT) conflicts with "prefers using eval for dynamic code" (PREFERENCE)
+
 CONFLICT: Behaviors directly contradict each other and cannot both be true simultaneously.
-Examples:
-- "prefers dark mode" vs "prefers light mode"
-- "prefers Python for programming" vs "prefers JavaScript for programming" (same domain, no context)
-- "vegetarian diet" vs "eats meat regularly"
+⚠️ BE DECISIVE: If behaviors are in the SAME DOMAIN and SAME/SIMILAR CONTEXT with competing preferences, classify as CONFLICT.
+
+Examples of CONFLICT:
+- "prefers dark mode" vs "prefers light mode" (same target, opposite preference) → CONFLICT
+- "prefers TypeScript for frontend" vs "prefers JavaScript for frontend" (same domain, same context, competing tools) → CONFLICT
+- "prefers Python for backend" vs "prefers Ruby for backend" (same domain, same context, competing languages) → CONFLICT
+- "never uses Python" (CONSTRAINT) vs "prefers Python for scripting" (PREFERENCE) → CONFLICT (cross-intent)
+- "cannot eat gluten" vs "enjoys bread" → CONFLICT
+- "vegetarian diet" vs "eats meat regularly" → CONFLICT
 
 COMPATIBLE: Behaviors can coexist without contradiction.
 Examples:
-- "prefers Python for backend" vs "prefers JavaScript for frontend" (different contexts)
-- "likes morning workouts" vs "likes evening reading" (different activities)
-- "prefers concise code" vs "prefers detailed comments" (complementary)
+- "prefers Python for backend" vs "prefers JavaScript for frontend" (DIFFERENT contexts: backend vs frontend) → COMPATIBLE
+- "prefers Python for backend" vs "prefers Python for data analysis" (SAME target, DIFFERENT contexts) → COMPATIBLE
+- "likes morning workouts" vs "likes evening reading" (different activities, different times) → COMPATIBLE
+- "prefers concise code" vs "prefers detailed comments" (complementary practices) → COMPATIBLE
+- "skilled in Python" vs "prefers Python" (same direction, different intents, no conflict) → COMPATIBLE
+- "prefers pair programming for complex features" vs "enjoys mentoring junior developers" (related but different practices) → COMPATIBLE
 
-CONTEXT_DEPENDENT: Relationship depends on additional context not specified.
+CONTEXT_DEPENDENT: Use this SPARINGLY - only when truly ambiguous.
 Examples:
-- "prefers working alone" vs "enjoys team collaboration" (might be task-dependent)
-- "likes fast food" vs "health-conscious eater" (might be frequency-dependent)
+- "prefers working alone" vs "enjoys team collaboration" (might be task-dependent) → CONTEXT_DEPENDENT
+- "likes fast food" vs "health-conscious eater" (might be frequency-dependent) → CONTEXT_DEPENDENT
 
-ANALYSIS GUIDELINES:
-1. Consider domain specificity (same domain = more likely to conflict)
-2. Consider temporal context (habits at different times can coexist)
-3. Consider intensity (strong preferences vs mild likes)
-4. Consider scope (general vs specific contexts)
-5. Default to COMPATIBLE if behaviors can coexist in any reasonable scenario
+ANALYSIS GUIDELINES (STRICT):
+1. Check intent types first - CONSTRAINT vs other intent is more likely to CONFLICT
+2. Same domain + Same context + Competing preferences = CONFLICT (be decisive!)
+3. Same domain + Different contexts (e.g., backend vs frontend) = COMPATIBLE
+4. Temporal contexts are usually compatible (morning vs evening)
+5. Context specialization matters: "Python for backend" vs "Python for data analysis" = COMPATIBLE (different use cases)
+6. DO NOT use CONTEXT_DEPENDENT for clear domain conflicts - default to CONFLICT for same-domain competing preferences
+7. Only use CONTEXT_DEPENDENT when the relationship is genuinely ambiguous and depends on unstated factors
 
 OUTPUT FORMAT (strict JSON):
 {
@@ -319,7 +404,12 @@ OUTPUT FORMAT (strict JSON):
   "confidence": 0.0-1.0
 }
 
-Be conservative: only classify as CONFLICT if behaviors genuinely cannot both be true."""
+DECISION RULES:
+- Same domain + Same context + Competing preferences → CONFLICT (don't overthink it!)
+- Different contexts OR different domains → COMPATIBLE
+- CONSTRAINT vs any other intent on same target → CONFLICT
+- Only use CONTEXT_DEPENDENT if truly ambiguous (rare!)
+- When in doubt between CONFLICT and CONTEXT_DEPENDENT for competing preferences → Choose CONFLICT"""
 
     user_prompt = f"""Analyze these two user behaviors:
 

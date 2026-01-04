@@ -429,7 +429,6 @@ def search_similar_behaviors(
                         behavior_id=behavior_id,
                         behavior_text=behavior_text,
                         distance=float(distance),
-                        classification=classify_similarity(float(distance)),
                         credibility=float(credibility),
                         last_seen_at=int(last_seen_at),
                         reinforcement_count=int(reinforcement_count),
