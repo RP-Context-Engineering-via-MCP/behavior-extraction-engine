@@ -364,9 +364,9 @@ def _supersede_existing_behavior(
     """Insert new behavior as ACTIVE and supersede the existing one."""
     insert_behavior(stored.model_dump())
     supersede_behavior(
-        behavior_id=existing_behavior_id,
-        user_id=user_id,
-        superseded_by_id=stored.behavior_id
+        old_behavior_id=existing_behavior_id,
+        new_behavior_id=stored.behavior_id,
+        user_id=user_id
     )
 
 
