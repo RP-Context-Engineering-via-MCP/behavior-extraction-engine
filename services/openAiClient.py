@@ -65,10 +65,7 @@ def extract_behavior(prompt: str) -> dict[str, any]:
          Examples: "never use eval()", "cannot eat gluten", "must not work weekends"
        - PREFERENCE → Soft desires: likes, prefers, enjoys, favors, interested in
        - HABIT → Frequency patterns: usually, always, regularly, tends to, routinely
-       - SKILL → Capabilities (both possession AND lack of):
-         * POSITIVE polarity: experienced with, proficient in, knows, capable of, expert in, can do, plays
-         * NEGATIVE polarity: not proficient in, doesn't know, lacks experience with, can't do, doesn't play
-         ⚠️ SKILL with NEGATIVE polarity indicates LACK of capability (still extract it!)
+       - SKILL → Capabilities: experienced with, proficient in, knows, capable of, expert in
        - COMMUNICATION → Interaction style: prefers brief answers, wants examples, needs context
     
     2. target (CRITICAL - must be CONCISE, NOUN-LIKE, and CANONICALLY NAMED):
@@ -190,13 +187,6 @@ def extract_behavior(prompt: str) -> dict[str, any]:
     
     Input: "I'm experienced with AWS cloud infrastructure"
     Output: {"intent": "SKILL", "target": "AWS", "context": "cloud infrastructure", "polarity": "POSITIVE", "linguistic_strength": 0.75}
-    
-    Input: "I don't play piano"
-    Output: {"intent": "SKILL", "target": "piano", "context": "general", "polarity": "NEGATIVE", "linguistic_strength": 0.7}
-    ⚠️ Note: Lack of skill is still a SKILL behavior (with NEGATIVE polarity) - extract it!
-    
-    Input: "I'm not proficient in TypeScript"
-    Output: {"intent": "SKILL", "target": "TypeScript", "context": "general", "polarity": "NEGATIVE", "linguistic_strength": 0.65}
     
     Input: "I like JS for frontend development"
     Output: {"intent": "PREFERENCE", "target": "JavaScript", "context": "frontend", "polarity": "POSITIVE", "linguistic_strength": 0.65}
