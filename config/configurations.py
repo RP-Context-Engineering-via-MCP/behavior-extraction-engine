@@ -28,41 +28,24 @@ CREDIBILITY_WEIGHTS = {
 
 # Minimum credibility threshold for storing behaviors in database
 # Behaviors below this threshold are filtered out as low quality
-CREDIBILITY_PRUNE_THRESHOLD = 0.5
+CREDIBILITY_PRUNE_THRESHOLD = 0.4
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 SAMPLE_USERID = os.getenv("SAMPLE_USERID", "user_12345")
 
-# ============================================================================
-# Phase 1 & Phase 2: Similarity and Conflict Detection Thresholds
-# ============================================================================
-# 
-# IMPORTANT (Canonical Behavior Refactor):
-# These thresholds are now RETRIEVAL HINTS ONLY, not decision boundaries.
-# 
-# With the new canonical behavior system, final decisions are made by:
-# - Intent + Target matching (structured fields)
-# - Context reasoning (general vs specific)  
-# - Polarity comparison (POSITIVE vs NEGATIVE)
-#
-# Embeddings are used ONLY for candidate retrieval, not classification.
-# Distance values help narrow the search space but do not determine 
-# whether behaviors are duplicates, related, or conflicting.
-# ============================================================================
-
 # Similarity distance thresholds for RETRIEVAL (not classification)
 # Based on cosine distance between embeddings (0.0 = identical, 2.0 = opposite)
 # Can be relaxed since structured matching handles precision
-DUPLICATE_THRESHOLD = 0.25       # Retrieval hint for likely duplicates (was 0.12)
-SIMILAR_THRESHOLD = 0.35         # Retrieval hint for related behaviors (was 0.20)
-CONFLICT_THRESHOLD_MIN = 0.35    # Retrieval hint for potential conflicts (was 0.20)
-CONFLICT_THRESHOLD_MAX = 0.70    # Retrieval cutoff for unrelated behaviors (was 0.55)
+# DUPLICATE_THRESHOLD = 0.25       # Retrieval hint for likely duplicates (was 0.12)
+# SIMILAR_THRESHOLD = 0.35         # Retrieval hint for related behaviors (was 0.20)
+# CONFLICT_THRESHOLD_MIN = 0.35    # Retrieval hint for potential conflicts (was 0.20)
+# CONFLICT_THRESHOLD_MAX = 0.70    # Retrieval cutoff for unrelated behaviors (was 0.55)
 
 # Phase 2: Conflict resolution threshold
 # When credibility difference exceeds this, auto-resolve (higher credibility wins)
 # When below this, flag for user decision (Phase 3)
-CREDIBILITY_DIFFERENCE_THRESHOLD = 0.3
+# CREDIBILITY_DIFFERENCE_THRESHOLD = 0.3
 
 # Phase 1: Reinforcement boost calculation
 # Formula: BASE_REINFORCEMENT_BOOST / sqrt(reinforcement_count)

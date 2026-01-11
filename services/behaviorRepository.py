@@ -12,12 +12,6 @@ from models.behavior import (
     BehaviorState
 )
 from services.credibilityCalculator import calculate_reinforcement_boost
-from config.configurations import (
-    DUPLICATE_THRESHOLD,
-    SIMILAR_THRESHOLD,
-    CONFLICT_THRESHOLD_MIN,
-    CONFLICT_THRESHOLD_MAX
-)
 import time
 import uuid
 import logging
@@ -273,40 +267,40 @@ def reinforce_behavior(
         )
 
 
-def classify_similarity(distance: float) -> SimilarityClassification:
-    """
-    Classify the relationship between two behaviors based on embedding distance.
+# def classify_similarity(distance: float) -> SimilarityClassification:
+#     """
+#     Classify the relationship between two behaviors based on embedding distance.
     
-    ⚠️  DEPRECATED FOR DECISION LOGIC - USE FOR LOGGING/DEBUGGING ONLY ⚠️
+#     ⚠️  DEPRECATED FOR DECISION LOGIC - USE FOR LOGGING/DEBUGGING ONLY ⚠️
     
-    With the canonical behavior refactor, this function is NO LONGER used for 
-    making decisions about duplicate detection, conflict resolution, or behavior 
-    storage. Those decisions are now made by:
-    - Intent + Target matching (structured fields)
-    - Context reasoning (contexts_match function)
-    - Polarity comparison
+#     With the canonical behavior refactor, this function is NO LONGER used for 
+#     making decisions about duplicate detection, conflict resolution, or behavior 
+#     storage. Those decisions are now made by:
+#     - Intent + Target matching (structured fields)
+#     - Context reasoning (contexts_match function)
+#     - Polarity comparison
     
-    Uses cosine distance where lower values indicate higher similarity:
-    - 0.00-DUPLICATE_THRESHOLD: DUPLICATE (retrieval hint)
-    - DUPLICATE_THRESHOLD-SIMILAR_THRESHOLD: SIMILAR (retrieval hint)
-    - SIMILAR_THRESHOLD-CONFLICT_THRESHOLD_MAX: POTENTIAL_CONFLICT (retrieval hint)
-    - CONFLICT_THRESHOLD_MAX+: UNRELATED (retrieval cutoff)
+#     Uses cosine distance where lower values indicate higher similarity:
+#     - 0.00-DUPLICATE_THRESHOLD: DUPLICATE (retrieval hint)
+#     - DUPLICATE_THRESHOLD-SIMILAR_THRESHOLD: SIMILAR (retrieval hint)
+#     - SIMILAR_THRESHOLD-CONFLICT_THRESHOLD_MAX: POTENTIAL_CONFLICT (retrieval hint)
+#     - CONFLICT_THRESHOLD_MAX+: UNRELATED (retrieval cutoff)
     
-    Args:
-        distance: Cosine distance between behavior embeddings (0.0-2.0)
+#     Args:
+#         distance: Cosine distance between behavior embeddings (0.0-2.0)
         
-    Returns:
-        SimilarityClassification enum value (for logging only)
+#     Returns:
+#         SimilarityClassification enum value (for logging only)
 
-    """
-    if distance < DUPLICATE_THRESHOLD:
-        return SimilarityClassification.DUPLICATE
-    elif distance < SIMILAR_THRESHOLD:
-        return SimilarityClassification.SIMILAR
-    elif distance < CONFLICT_THRESHOLD_MAX:
-        return SimilarityClassification.POTENTIAL_CONFLICT
-    else:
-        return SimilarityClassification.UNRELATED
+#     """
+#     if distance < DUPLICATE_THRESHOLD:
+#         return SimilarityClassification.DUPLICATE
+#     elif distance < SIMILAR_THRESHOLD:
+#         return SimilarityClassification.SIMILAR
+#     elif distance < CONFLICT_THRESHOLD_MAX:
+#         return SimilarityClassification.POTENTIAL_CONFLICT
+#     else:
+#         return SimilarityClassification.UNRELATED
 
 
 def get_user_behaviors(user_id: str, include_states: List[str] = None) -> List[dict]:
