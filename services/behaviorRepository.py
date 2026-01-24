@@ -12,12 +12,6 @@ from models.behavior import (
     BehaviorState
 )
 from services.credibilityCalculator import calculate_reinforcement_boost
-from config.configurations import (
-    DUPLICATE_THRESHOLD,
-    SIMILAR_THRESHOLD,
-    CONFLICT_THRESHOLD_MIN,
-    CONFLICT_THRESHOLD_MAX
-)
 import time
 import uuid
 import logging
@@ -273,40 +267,40 @@ def reinforce_behavior(
         )
 
 
-def classify_similarity(distance: float) -> SimilarityClassification:
-    """
-    Classify the relationship between two behaviors based on embedding distance.
+# def classify_similarity(distance: float) -> SimilarityClassification:
+#     """
+#     Classify the relationship between two behaviors based on embedding distance.
     
-    ⚠️  DEPRECATED FOR DECISION LOGIC - USE FOR LOGGING/DEBUGGING ONLY ⚠️
+#     ⚠️  DEPRECATED FOR DECISION LOGIC - USE FOR LOGGING/DEBUGGING ONLY ⚠️
     
-    With the canonical behavior refactor, this function is NO LONGER used for 
-    making decisions about duplicate detection, conflict resolution, or behavior 
-    storage. Those decisions are now made by:
-    - Intent + Target matching (structured fields)
-    - Context reasoning (contexts_match function)
-    - Polarity comparison
+#     With the canonical behavior refactor, this function is NO LONGER used for 
+#     making decisions about duplicate detection, conflict resolution, or behavior 
+#     storage. Those decisions are now made by:
+#     - Intent + Target matching (structured fields)
+#     - Context reasoning (contexts_match function)
+#     - Polarity comparison
     
-    Uses cosine distance where lower values indicate higher similarity:
-    - 0.00-DUPLICATE_THRESHOLD: DUPLICATE (retrieval hint)
-    - DUPLICATE_THRESHOLD-SIMILAR_THRESHOLD: SIMILAR (retrieval hint)
-    - SIMILAR_THRESHOLD-CONFLICT_THRESHOLD_MAX: POTENTIAL_CONFLICT (retrieval hint)
-    - CONFLICT_THRESHOLD_MAX+: UNRELATED (retrieval cutoff)
+#     Uses cosine distance where lower values indicate higher similarity:
+#     - 0.00-DUPLICATE_THRESHOLD: DUPLICATE (retrieval hint)
+#     - DUPLICATE_THRESHOLD-SIMILAR_THRESHOLD: SIMILAR (retrieval hint)
+#     - SIMILAR_THRESHOLD-CONFLICT_THRESHOLD_MAX: POTENTIAL_CONFLICT (retrieval hint)
+#     - CONFLICT_THRESHOLD_MAX+: UNRELATED (retrieval cutoff)
     
-    Args:
-        distance: Cosine distance between behavior embeddings (0.0-2.0)
+#     Args:
+#         distance: Cosine distance between behavior embeddings (0.0-2.0)
         
-    Returns:
-        SimilarityClassification enum value (for logging only)
+#     Returns:
+#         SimilarityClassification enum value (for logging only)
 
-    """
-    if distance < DUPLICATE_THRESHOLD:
-        return SimilarityClassification.DUPLICATE
-    elif distance < SIMILAR_THRESHOLD:
-        return SimilarityClassification.SIMILAR
-    elif distance < CONFLICT_THRESHOLD_MAX:
-        return SimilarityClassification.POTENTIAL_CONFLICT
-    else:
-        return SimilarityClassification.UNRELATED
+#     """
+#     if distance < DUPLICATE_THRESHOLD:
+#         return SimilarityClassification.DUPLICATE
+#     elif distance < SIMILAR_THRESHOLD:
+#         return SimilarityClassification.SIMILAR
+#     elif distance < CONFLICT_THRESHOLD_MAX:
+#         return SimilarityClassification.POTENTIAL_CONFLICT
+#     else:
+#         return SimilarityClassification.UNRELATED
 
 
 def get_user_behaviors(user_id: str, include_states: List[str] = None) -> List[dict]:
@@ -706,4 +700,146 @@ def supersede_behavior(
     except Exception as e:
         logger.error(f"Failed to supersede behavior: {str(e)}")
         raise Exception(f"Database error superseding behavior: {str(e)}")
+
+
+def get_behaviors_by_user(user_id: str) -> List[dict]:
+    """
+    Get all behaviors for a specific user.
+    
+    Args:
+        user_id: The user identifier
+        
+    Returns:
+        List of behavior dictionaries with all fields
+    """
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 
+                        behavior_id,
+                        user_id,
+                        behavior_text,
+                        credibility,
+                        reinforcement_count,
+                        decay_rate,
+                        created_at,
+                        last_seen_at,
+                        prompt_history_ids,
+                        clarity_score,
+                        extraction_confidence,
+                        linguistic_strength,
+                        session_id,
+                        behavior_state,
+                        intent,
+                        target,
+                        context,
+                        polarity
+                    FROM behaviors
+                    WHERE user_id = %s
+                    ORDER BY last_seen_at DESC
+                    """,
+                    (user_id,)
+                )
+                
+                behaviors = []
+                for row in cur.fetchall():
+                    behaviors.append({
+                        "behavior_id": row[0],
+                        "user_id": row[1],
+                        "behavior_text": row[2],
+                        "credibility": row[3],
+                        "reinforcement_count": row[4],
+                        "decay_rate": row[5],
+                        "created_at": row[6],
+                        "last_seen_at": row[7],
+                        "prompt_history_ids": row[8],
+                        "clarity_score": row[9],
+                        "extraction_confidence": row[10],
+                        "linguistic_strength": row[11],
+                        "session_id": row[12],
+                        "behavior_state": row[13],
+                        "intent": row[14],
+                        "target": row[15],
+                        "context": row[16],
+                        "polarity": row[17]
+                    })
+                
+                return behaviors
+                
+    except Exception as e:
+        logger.error(f"Failed to get behaviors for user {user_id}: {str(e)}")
+        raise Exception(f"Database error retrieving behaviors: {str(e)}")
+
+
+def get_user_conflicts(user_id: str) -> List[dict]:
+    """
+    Get all conflicts for a specific user.
+    
+    Args:
+        user_id: The user identifier
+        
+    Returns:
+        List of conflict dictionaries with behavior details
+    """
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 
+                        c.conflict_id,
+                        c.user_id,
+                        c.behavior_id_1,
+                        c.behavior_id_2,
+                        c.conflict_type,
+                        c.similarity_distance,
+                        c.llm_analysis,
+                        c.resolution_status,
+                        c.resolved_at,
+                        c.resolution_choice,
+                        c.created_at,
+                        b1.behavior_text as behavior_1_text,
+                        b2.behavior_text as behavior_2_text,
+                        b1.credibility as behavior_1_credibility,
+                        b2.credibility as behavior_2_credibility,
+                        b1.behavior_state as behavior_1_state,
+                        b2.behavior_state as behavior_2_state
+                    FROM behavior_conflicts c
+                    LEFT JOIN behaviors b1 ON c.behavior_id_1 = b1.behavior_id
+                    LEFT JOIN behaviors b2 ON c.behavior_id_2 = b2.behavior_id
+                    WHERE c.user_id = %s
+                    ORDER BY c.created_at DESC
+                    """,
+                    (user_id,)
+                )
+                
+                conflicts = []
+                for row in cur.fetchall():
+                    conflicts.append({
+                        "conflict_id": str(row[0]) if row[0] else None,  # Convert UUID to string
+                        "user_id": row[1],
+                        "behavior_id_1": row[2],
+                        "behavior_id_2": row[3],
+                        "conflict_type": row[4],
+                        "similarity_distance": row[5],
+                        "llm_analysis": row[6],
+                        "resolution_status": row[7],
+                        "resolved_at": row[8],
+                        "resolution_choice": row[9],
+                        "created_at": row[10],
+                        "behavior_1_text": row[11],
+                        "behavior_2_text": row[12],
+                        "behavior_1_credibility": row[13],
+                        "behavior_2_credibility": row[14],
+                        "behavior_1_state": row[15],
+                        "behavior_2_state": row[16]
+                    })
+                
+                return conflicts
+                
+    except Exception as e:
+        logger.error(f"Failed to get conflicts for user {user_id}: {str(e)}")
+        raise Exception(f"Database error retrieving conflicts: {str(e)}")
 

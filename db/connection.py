@@ -39,15 +39,33 @@ def init_db_pool():
         DATABASE_URL,
         min_size=2,
         max_size=10,
+        open=True,
+        timeout=30,
+        max_idle=600,  # 10 minutes idle timeout
+        max_lifetime=3600,  # 1 hour max lifetime
+        check=ConnectionPool.check_connection,  # Enable connection health checks
         configure=lambda conn: register_vector(conn)
     )
+    logger.info("Database connection pool initialized with health checks")
 
 def get_db_pool_connection():
+    """
+    Get a connection from the pool.
+    Returns a context manager that should be used with 'with' statement.
+    
+    Usage:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(...)
+    """
     global _pool
     if _pool is None:
         with _pool_lock:
             if _pool is None:
                 init_db_pool()
+    
+    # Return the connection context manager directly
+    # The pool's connection() method returns a context manager
     return _pool.connection()
 
 def close_db_pool():
