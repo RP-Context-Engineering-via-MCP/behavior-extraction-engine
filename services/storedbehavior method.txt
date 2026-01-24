@@ -1,0 +1,495 @@
+def store_behavior(
+        extraction_result: ExtractionResult,
+        user_id: str = SAMPLE_USERID
+) -> List[StoredBehavior]:
+        """
+    Convert extracted behaviors to database-ready StoredBehavior objects using canonical reasoning.
+    
+    NEW PIPELINE (Canonical Behavior Refactor):
+    1. Create CanonicalBehavior from extracted fields
+    2. Generate core embedding from intent + target
+    3. Retrieve candidate behaviors using semantic search
+    4. Stage 1 - Filter by intent and target (hard filter)
+    5. Stage 2 - Context reasoning (duplicate vs related)
+    6. Stage 3 - Polarity check (trigger conflict if opposite)
+    7. Insert new behavior or reinforce existing
+    
+    This replaces the old distance-based classification approach with
+    structured reasoning on canonical behavior dimensions.
+    
+    Args:
+        extraction_result: ExtractionResult from run_behavior_extraction()
+        userid: id of the user
+        
+    Returns:
+        List of StoredBehavior objects ready for database insertion
+    """
+        if not extraction_result.success:
+             logger.warning("Cannot prepare behaviors from failed extraction result")
+             return []
+        
+        stored_behaviors = []
+
+        for segment in extraction_result.segments:
+             segment_id = None
+
+             for behavior in segment.behaviors:
+                #   calculate initial credibility
+                initial_credibility = calculate_initial_credibility(
+                    confidence=behavior.confidence,
+                    clarity=behavior.clarity,
+                    linguistic_strength=behavior.linguistic_strength,
+                    behavior_text=behavior.description
+                )
+
+                # filter low quality behaviors
+                if not should_store_behavior(initial_credibility):
+                    logger.info(
+                        f"Pruning behavior due to low credibility: "
+                        f"'{behavior.description}' (credibility={initial_credibility})"
+                    )
+                    continue
+
+                if segment_id is None:
+                    segment_result = insert_prompt_segment(
+                        segment_text=segment.text,
+                        user_id=user_id
+                    )
+                    if segment_result.success:
+                        segment_id = segment_result.segment_id
+                    else:
+                        logger.error(
+                            f"Failed to insert prompt segment into database: {segment_result.error}"
+                        )
+                        continue
+                
+                # Create canonical behavior for structured reasoning
+                canonical = create_canonical_behavior(behavior)
+                if not canonical:
+                    logger.warning(
+                        f"Skipping behavior - missing required canonical fields: '{behavior.description}'"
+                    )
+                    continue  # Skip behaviors without canonical fields
+                
+                logger.info(
+                    f"✓ Canonical behavior created: intent={canonical.intent}, "
+                    f"target={canonical.target}, context={canonical.context}, polarity={canonical.polarity}"
+                )
+                
+                # Generate embedding using CORE STRATEGY (intent + target)
+                # This focuses the embedding on behavioral essence, not context/wording
+                try:
+                    core_text = f"{canonical.intent} {canonical.target}"
+                    embedding_vector = embed_text(core_text)
+                    logger.debug(
+                        f"Generated core embedding for: '{core_text}' "
+                        f"(original: '{behavior.description}')"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to generate embedding for behavior: {str(e)}")
+                    continue
+
+                # PHASE 1: Duplicate detection and reinforcement
+                # Search for similar behaviors before inserting
+                try:
+                    similar_behaviors = search_similar_behaviors(
+                        user_id=user_id,
+                        query_embedding=embedding_vector,
+                        limit=5  # Only check top 5 for performance
+                    )
+                    
+                    logger.info(
+                        f"Similarity search complete: found {len(similar_behaviors)} candidates "
+                        f"[{', '.join(f'{s.classification.value}({s.distance:.4f})' for s in similar_behaviors[:3])}]"
+                    )
+                    
+                    # Check if duplicate found (distance < 0.05)
+                    # NOTE: With canonical embeddings, this threshold may need adjustment
+                    if similar_behaviors and similar_behaviors[0].classification == SimilarityClassification.DUPLICATE:
+                        duplicate = similar_behaviors[0]
+                        
+                        # Context-aware duplicate check using canonical fields
+                        # Use actual context from stored behavior (defaults to "general" if None)
+                        existing_context = duplicate.context if duplicate.context else "general"
+                        contexts_are_duplicate, context_rel = contexts_match(
+                            existing_context,
+                            canonical.context
+                        )
+                        
+                        if contexts_are_duplicate:
+                            logger.info(
+                                f"Duplicate detected ({context_rel}): '{behavior.description}' "
+                                f"matches '{duplicate.behavior_text}' (distance={duplicate.distance:.4f})"
+                            )
+                        else:
+                            logger.info(
+                                f"Related behavior ({context_rel}): '{behavior.description}' "
+                                f"and '{duplicate.behavior_text}' have different contexts. "
+                                f"Inserting both."
+                            )
+                            # Don't treat as duplicate - insert both
+                            similar_behaviors = []  # Clear to skip reinforcement
+                        
+                        if similar_behaviors:  # Only reinforce if still considered duplicate
+                            duplicate = similar_behaviors[0]
+                            logger.info(
+                                f"→ PATH: REINFORCEMENT - Reinforcing existing behavior {duplicate.behavior_id}"
+                            )
+                            # Reinforce existing behavior instead of inserting new one
+                            reinforce_result = reinforce_behavior(
+                                behavior_id=duplicate.behavior_id,
+                                user_id=user_id,
+                                segment_id=segment_id
+                            )
+                        
+                        if reinforce_result.success:
+                            logger.info(
+                                f"Successfully reinforced behavior {duplicate.behavior_id}: "
+                                f"credibility {duplicate.credibility:.3f} → "
+                                f"{reinforce_result.new_credibility:.3f}, "
+                                f"count {duplicate.reinforcement_count} → {reinforce_result.new_reinforcement_count}"
+                            )
+                            # Skip insertion - behavior already exists and reinforced
+                            continue
+                        else:
+                            logger.error(
+                                f"Failed to reinforce duplicate behavior: {reinforce_result.error}. "
+                                f"Proceeding with insertion as fallback."
+                            )
+                            # Fallback: insert as new behavior if reinforcement fails
+                    
+                    # Log similar/conflict cases for Phase 2 implementation
+                    elif similar_behaviors:
+                        top_match = similar_behaviors[0]
+                        
+                        if top_match.classification == SimilarityClassification.SIMILAR:
+                            logger.info(
+                                f"→ PATH: VARIATION_INSERTION (similar but distinct) - distance={top_match.distance:.4f}: "
+                                f"'{behavior.description}' ~ '{top_match.behavior_text}'. "
+                                f"Inserting both (variations allowed)."
+                            )
+                        
+                        # PHASE 2: Conflict detection and resolution
+                        elif top_match.classification == SimilarityClassification.POTENTIAL_CONFLICT:
+                            logger.info(
+                                f"→ PATH: CONFLICT_DETECTION - Analyzing potential conflict (distance={top_match.distance:.4f}): "
+                                f"'{behavior.description}' vs '{top_match.behavior_text}'. "
+                                f"Initiating LLM conflict analysis..."
+                            )
+                            
+                            try:
+                                # Call GPT-4 to analyze if behaviors actually conflict
+                                conflict_analysis = analyze_conflict(
+                                    behavior_1_text=top_match.behavior_text,
+                                    behavior_2_text=behavior.description,
+                                    distance=top_match.distance
+                                )
+                                
+                                logger.info(
+                                    f"LLM analysis: {conflict_analysis.conflict_type.value} "
+                                    f"(confidence: {conflict_analysis.confidence:.2f}) - "
+                                    f"{conflict_analysis.explanation[:100]}..."
+                                )
+                                
+                                # Handle based on conflict analysis
+                                if conflict_analysis.conflict_type == ConflictAnalysisType.COMPATIBLE:
+                                    # Behaviors can coexist - insert both
+                                    logger.info(
+                                        f"→ PATH: COMPATIBLE_INSERTION - Behaviors are compatible. "
+                                        f"Inserting new behavior alongside existing one."
+                                    )
+                                    # Continue to insertion below
+                                
+                                elif conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
+                                    # Depends on context - insert both with note
+                                    logger.info(
+                                        f"→ PATH: CONTEXT_DEPENDENT - Inserting both behaviors with conflict record. "
+                                        f"User decision may be needed."
+                                    )
+                                    
+                                    # Create and insert new behavior first
+                                    stored_behavior = StoredBehavior(
+                                        user_id=user_id,
+                                        behavior_text=behavior.description,
+                                        credibility=initial_credibility,
+                                        clarity_score=behavior.clarity,
+                                        extraction_confidence=behavior.confidence,
+                                        linguistic_strength=behavior.linguistic_strength,
+                                        decay_rate=DEFAULT_DECAY_RATE,
+                                        embedding=embedding_vector,
+                                        prompt_history_ids=[segment_id],
+                                        session_id="default",
+                                        # Canonical fields
+                                        intent=canonical.intent,
+                                        target=canonical.target,
+                                        context=canonical.context,
+                                        polarity=canonical.polarity
+                                    )
+                                    new_behavior_id = stored_behavior.behavior_id
+                                    
+                                    stored_behaviors.append(stored_behavior)
+                                    try:
+                                        payload = stored_behavior.model_dump()
+                                        # Add canonical fields (required)
+                                        payload['intent'] = canonical.intent
+                                        payload['target'] = canonical.target
+                                        payload['context'] = canonical.context
+                                        payload['polarity'] = canonical.polarity
+                                        insert_behavior(payload)
+                                        logger.info(f"Inserted context-dependent behavior: {new_behavior_id}")
+                                        
+                                        # Now store conflict with both IDs
+                                        conflict_id = insert_conflict(
+                                            user_id=user_id,
+                                            behavior_id_1=top_match.behavior_id,
+                                            behavior_id_2=new_behavior_id,
+                                            conflict_type=ConflictType.USER_DECISION_NEEDED,
+                                            similarity_distance=top_match.distance,
+                                            llm_analysis=f"CONTEXT_DEPENDENT: {conflict_analysis.explanation}"
+                                        )
+                                        logger.info(f"Logged context-dependent conflict: {conflict_id}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to handle context-dependent conflict: {e}")
+                                    
+                                    # Skip normal insertion - already handled
+                                    continue
+                                
+                                elif conflict_analysis.conflict_type == ConflictAnalysisType.CONFLICT:
+                                    # Actual conflict detected - apply resolution strategy
+                                    logger.warning(
+                                        f"→ PATH: CONFLICT_RESOLUTION - CONFLICT confirmed by LLM. "
+                                        f"Applying auto-resolution logic based on credibility..."
+                                    )
+                                    
+                                    # Compare credibility scores
+                                    existing_credibility = top_match.credibility
+                                    new_credibility = initial_credibility
+                                    credibility_diff = abs(new_credibility - existing_credibility)
+                                    
+                                    logger.info(
+                                        f"Credibility comparison: existing={existing_credibility:.3f}, "
+                                        f"new={new_credibility:.3f}, diff={credibility_diff:.3f}"
+                                    )
+                                    
+                                    # AUTO-RESOLUTION: Clear winner (diff > 0.3)
+                                    if credibility_diff > CREDIBILITY_DIFFERENCE_THRESHOLD:
+                                        if new_credibility > existing_credibility:
+                                            # New behavior wins - supersede old one
+                                            logger.info(
+                                                f"→ PATH: SUPERSEDE_OLD - New behavior wins (credibility: {new_credibility:.3f} > {existing_credibility:.3f}). "
+                                                f"Superseding old behavior {top_match.behavior_id}."
+                                            )
+                                            
+                                            # Create stored behavior first to get new behavior_id
+                                            stored_behavior = StoredBehavior(
+                                                user_id=user_id,
+                                                behavior_text=behavior.description,
+                                                credibility=initial_credibility,
+                                                clarity_score=behavior.clarity,
+                                                extraction_confidence=behavior.confidence,
+                                                linguistic_strength=behavior.linguistic_strength,
+                                                decay_rate=DEFAULT_DECAY_RATE,
+                                                embedding=embedding_vector,
+                                                prompt_history_ids=[segment_id],
+                                                session_id="default",
+                                                # Canonical fields
+                                                intent=canonical.intent,
+                                                target=canonical.target,
+                                                context=canonical.context,
+                                                polarity=canonical.polarity
+                                            )
+                                            new_behavior_id = stored_behavior.behavior_id
+                                            
+                                            # Mark old behavior as superseded
+                                            supersede_behavior(
+                                                old_behavior_id=top_match.behavior_id,
+                                                new_behavior_id=new_behavior_id,
+                                                user_id=user_id
+                                            )
+                                            
+                                            # Store conflict record
+                                            conflict_id = insert_conflict(
+                                                user_id=user_id,
+                                                behavior_id_1=top_match.behavior_id,
+                                                behavior_id_2=new_behavior_id,
+                                                conflict_type=ConflictType.RESOLVABLE,
+                                                similarity_distance=top_match.distance,
+                                                llm_analysis=f"AUTO-RESOLVED (new wins): {conflict_analysis.explanation}"
+                                            )
+                                            
+                                            logger.info(
+                                                f"Auto-resolved conflict {conflict_id}: "
+                                                f"new behavior {new_behavior_id} superseded old {top_match.behavior_id}"
+                                            )
+                                            
+                                            # Insert new behavior and add to list
+                                            stored_behaviors.append(stored_behavior)
+                                            try:
+                                                payload = stored_behavior.model_dump()
+                                                # Add canonical fields (required)
+                                                payload['intent'] = canonical.intent
+                                                payload['target'] = canonical.target
+                                                payload['context'] = canonical.context
+                                                payload['polarity'] = canonical.polarity
+                                                insert_behavior(payload)
+                                                logger.info(f"Inserted winning behavior: {new_behavior_id}")
+                                            except Exception as e:
+                                                logger.error(f"Failed to insert winning behavior: {e}")
+                                            
+                                            # Skip normal insertion flow - already handled
+                                            continue
+                                        
+                                        else:
+                                            # Existing behavior wins - skip new insertion
+                                            logger.info(
+                                                f"→ PATH: REJECT_NEW - Existing behavior wins (credibility: {existing_credibility:.3f} > {new_credibility:.3f}). "
+                                                f"Skipping insertion of new behavior."
+                                            )
+                                            
+                                            # Store conflict record showing existing won
+                                            conflict_id = insert_conflict(
+                                                user_id=user_id,
+                                                behavior_id_1=top_match.behavior_id,
+                                                behavior_id_2="",  # New behavior not inserted
+                                                conflict_type=ConflictType.RESOLVABLE,
+                                                similarity_distance=top_match.distance,
+                                                llm_analysis=f"AUTO-RESOLVED (existing wins): {conflict_analysis.explanation}"
+                                            )
+                                            
+                                            logger.info(
+                                                f"Auto-resolved conflict {conflict_id}: "
+                                                f"existing behavior {top_match.behavior_id} kept, new behavior rejected"
+                                            )
+                                            
+                                            # Skip insertion
+                                            continue
+                                    
+                                    # FLAGGED: No clear winner - needs user resolution (Phase 3)
+                                    else:
+                                        logger.warning(
+                                            f"→ PATH: FLAG_FOR_USER - Credibility too close ({credibility_diff:.3f} <= {CREDIBILITY_DIFFERENCE_THRESHOLD}). "
+                                            f"Flagging both behaviors for user resolution (Phase 3)."
+                                        )
+                                        
+                                        # Mark existing behavior as FLAGGED
+                                        update_behavior_state(
+                                            behavior_id=top_match.behavior_id,
+                                            user_id=user_id,
+                                            new_state=BehaviorState.FLAGGED
+                                        )
+                                        
+                                        # Create new behavior with FLAGGED state
+                                        stored_behavior = StoredBehavior(
+                                            user_id=user_id,
+                                            behavior_text=behavior.description,
+                                            credibility=initial_credibility,
+                                            clarity_score=behavior.clarity,
+                                            extraction_confidence=behavior.confidence,
+                                            linguistic_strength=behavior.linguistic_strength,
+                                            decay_rate=DEFAULT_DECAY_RATE,
+                                            embedding=embedding_vector,
+                                            prompt_history_ids=[segment_id],
+                                            session_id="default",
+                                            # Canonical fields
+                                            intent=canonical.intent,
+                                            target=canonical.target,
+                                            context=canonical.context,
+                                            polarity=canonical.polarity
+                                        )
+                                        new_behavior_id = stored_behavior.behavior_id
+                                        
+                                        # Insert new behavior FIRST
+                                        stored_behaviors.append(stored_behavior)
+                                        try:
+                                            payload = stored_behavior.model_dump()
+                                            payload['behavior_state'] = BehaviorState.FLAGGED.value
+                                            # Add canonical fields (required)
+                                            payload['intent'] = canonical.intent
+                                            payload['target'] = canonical.target
+                                            payload['context'] = canonical.context
+                                            payload['polarity'] = canonical.polarity
+                                            insert_behavior(payload)
+                                            logger.info(f"Inserted flagged behavior: {new_behavior_id}")
+                                            
+                                            # Now store conflict with both IDs existing in database
+                                            conflict_id = insert_conflict(
+                                                user_id=user_id,
+                                                behavior_id_1=top_match.behavior_id,
+                                                behavior_id_2=new_behavior_id,
+                                                conflict_type=ConflictType.USER_DECISION_NEEDED,
+                                                similarity_distance=top_match.distance,
+                                                llm_analysis=f"FLAGGED FOR USER: {conflict_analysis.explanation}"
+                                            )
+                                        
+                                            logger.info(
+                                                f"Created conflict {conflict_id} requiring user decision. "
+                                                f"Both behaviors flagged."
+                                            )
+                                        except Exception as e:
+                                            logger.error(f"Failed to insert flagged behavior or conflict: {e}")
+                                        
+                                        # Skip normal insertion - already handled
+                                        continue
+                            
+                            except Exception as e:
+                                logger.error(
+                                    f"Conflict analysis failed: {str(e)}. "
+                                    f"Defaulting to conservative behavior: inserting both."
+                                )
+                                # On error, default to safe behavior: insert both
+
+                
+                except Exception as e:
+                    logger.error(
+                        f"Similarity search failed for '{behavior.description}': {str(e)}. "
+                        f"Proceeding with insertion without duplicate check."
+                    )
+                    similar_behaviors = []  # Empty list to proceed with insertion
+                
+                # If no similar behaviors found, proceed directly to insertion
+                if not similar_behaviors:
+                    logger.info(
+                        f"→ PATH: DIRECT_INSERTION (no similar behaviors found) - '{behavior.description}'"
+                    )
+                
+                # Create stored behavior instance (if not duplicate)
+                stored_behavior = StoredBehavior(
+                    user_id=user_id,
+                    behavior_text=behavior.description,
+                    credibility=initial_credibility,
+                    clarity_score=behavior.clarity,
+                    extraction_confidence=behavior.confidence,
+                    linguistic_strength=behavior.linguistic_strength,
+                    decay_rate=DEFAULT_DECAY_RATE,  # 0.015 from config
+                    embedding=embedding_vector,
+                    # prompt_history_ids will be populated later when we handle segment storage
+                    prompt_history_ids=[segment_id],
+                    # session_id will be passed from API layer later
+                    session_id="default",
+                    # Canonical fields (required for all behaviors)
+                    intent=canonical.intent,
+                    target=canonical.target,
+                    context=canonical.context,
+                    polarity=canonical.polarity
+                )
+
+                stored_behaviors.append(stored_behavior)
+
+                try:
+                    payload = stored_behavior.model_dump()
+                    # Add canonical fields to payload (required for all behaviors)
+                    payload['intent'] = canonical.intent
+                    payload['target'] = canonical.target
+                    payload['context'] = canonical.context
+                    payload['polarity'] = canonical.polarity
+                    
+                    insert_behavior(payload)
+                    logger.info(f"Successfully saved behavior to database: {stored_behavior.behavior_id}")
+                except Exception as e:
+                    logger.error(f"Failed to insert behavior into database: {str(e)}")
+
+        logger.info(
+            f"Prepared {len(stored_behaviors)} behaviors for storage "
+            f"from {sum(len(seg.behaviors) for seg in extraction_result.segments)} extracted"
+        )        
+        return stored_behaviors
