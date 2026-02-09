@@ -1,11 +1,12 @@
 import logging
 import math
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from config.configurations import (
     CREDIBILITY_WEIGHTS,
     DEFAULT_DECAY_RATE,
     CREDIBILITY_PRUNE_THRESHOLD,
-    BASE_REINFORCEMENT_BOOST
+    BASE_REINFORCEMENT_BOOST,
+    INTENT_DECAY_RATES
 )
 
 logger = logging.getLogger(__name__)
@@ -103,22 +104,40 @@ def should_store_behavior(credibility: float) -> bool:
     return should_store
 
 
-def get_decay_rate(behavior_text: str) -> float:
+def get_decay_rate(behavior_text: str = None, intent: Optional[str] = None) -> float:
     """
-    Get the decay rate for a behavior.
+    Get the decay rate for a behavior based on its intent.
     
-    Currently returns the default decay rate for all behaviors.
-    Future enhancement: Implement category-based or keyword-based
-    dynamic decay rates (e.g., medical constraints decay slower).
+    Different behavioral intents have different decay rates:
+    - HABIT (0.04): Habits can change quickly with new routines
+    - PREFERENCE (0.015): Preferences are moderately stable
+    - COMMUNICATION (0.015): Communication styles are moderately stable
+    - SKILL (0.005): Skills persist longer once learned
+    - CONSTRAINT (0.001): Constraints are most persistent (medical, etc.)
     
     Args:
-        behavior_text: The behavior description
+        behavior_text: The behavior description (kept for backward compatibility)
+        intent: The behavioral intent type (HABIT, PREFERENCE, SKILL, etc.)
         
     Returns:
         float: Decay rate per time unit
+        
+    Example:
+        >>> get_decay_rate(intent="SKILL")
+        0.005
+        >>> get_decay_rate(intent="HABIT")
+        0.04
     """
-    # For now, return default decay rate
-    # TODO: Implement smart decay based on behavior patterns
+    # If intent is provided, use intent-based decay rate
+    if intent and intent in INTENT_DECAY_RATES:
+        decay_rate = INTENT_DECAY_RATES[intent]
+        logger.debug(f"Using intent-based decay rate: {decay_rate} for intent '{intent}'")
+        return decay_rate
+    
+    # Fallback to default decay rate if intent not provided or not recognized
+    if intent:
+        logger.warning(f"Unknown intent '{intent}', using default decay rate {DEFAULT_DECAY_RATE}")
+    
     return DEFAULT_DECAY_RATE
 
 

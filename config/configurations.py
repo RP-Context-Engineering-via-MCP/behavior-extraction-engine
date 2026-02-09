@@ -16,6 +16,26 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 DEFAULT_DECAY_RATE = 0.015
 
+# Decay grace period
+# New behaviors do not decay for the first 7 days to allow stabilization
+DECAY_GRACE_PERIOD_DAYS = 7
+DECAY_GRACE_PERIOD_SECONDS = DECAY_GRACE_PERIOD_DAYS * 24 * 60 * 60  # 604800 seconds
+
+# Intent-based decay rates
+# Different behavioral intents decay at different rates based on their nature:
+# - HABIT: Decays faster (0.04) - habits can change quickly
+# - PREFERENCE: Medium decay (0.015) - preferences are moderately stable
+# - COMMUNICATION: Medium decay (0.015) - communication styles are moderately stable
+# - SKILL: Decays slowly (0.005) - skills persist longer
+# - CONSTRAINT: Decays very slowly (0.001) - constraints are most persistent
+INTENT_DECAY_RATES = {
+    "HABIT": 0.04,
+    "PREFERENCE": 0.015,
+    "COMMUNICATION": 0.015,
+    "SKILL": 0.005,
+    "CONSTRAINT": 0.001
+}
+
 # Credibility calculation weights
 # confidence: GPT's confidence in the extraction (0.0-1.0)
 # clarity: How unambiguous the behavior is (0.0-1.0)

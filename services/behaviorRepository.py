@@ -12,6 +12,7 @@ from models.behavior import (
     BehaviorState
 )
 from services.credibilityCalculator import calculate_reinforcement_boost
+from config.configurations import DECAY_GRACE_PERIOD_SECONDS
 import time
 import uuid
 import logging
@@ -51,6 +52,7 @@ def insert_behavior(payload: dict):
                     reinforcement_count,
                     created_at,
                     last_seen_at,
+                    last_decay_applied_at,
                     session_id,
                     prompt_history_ids,
                     behavior_state,
@@ -72,6 +74,7 @@ def insert_behavior(payload: dict):
                     %(reinforcement_count)s,
                     %(created_at)s,
                     %(last_seen_at)s,
+                    %(last_decay_applied_at)s,
                     %(session_id)s,
                     %(prompt_history_ids)s,
                     %(behavior_state)s,
@@ -216,6 +219,7 @@ def reinforce_behavior(
                     updated_history_ids.append(segment_id)
                 
                 # Step 4: Update behavior in database
+                # Reset last_decay_applied_at to current time when reinforced
                 cur.execute(
                     """
                     UPDATE behaviors
@@ -223,12 +227,14 @@ def reinforce_behavior(
                         credibility = %s,
                         reinforcement_count = %s,
                         last_seen_at = %s,
+                        last_decay_applied_at = %s,
                         prompt_history_ids = %s
                     WHERE behavior_id = %s AND user_id = %s;
                     """,
                     (
                         new_credibility,
                         new_count,
+                        current_timestamp,
                         current_timestamp,
                         updated_history_ids,
                         behavior_id,
@@ -266,41 +272,6 @@ def reinforce_behavior(
             error=str(e)
         )
 
-
-# def classify_similarity(distance: float) -> SimilarityClassification:
-#     """
-#     Classify the relationship between two behaviors based on embedding distance.
-    
-#     ⚠️  DEPRECATED FOR DECISION LOGIC - USE FOR LOGGING/DEBUGGING ONLY ⚠️
-    
-#     With the canonical behavior refactor, this function is NO LONGER used for 
-#     making decisions about duplicate detection, conflict resolution, or behavior 
-#     storage. Those decisions are now made by:
-#     - Intent + Target matching (structured fields)
-#     - Context reasoning (contexts_match function)
-#     - Polarity comparison
-    
-#     Uses cosine distance where lower values indicate higher similarity:
-#     - 0.00-DUPLICATE_THRESHOLD: DUPLICATE (retrieval hint)
-#     - DUPLICATE_THRESHOLD-SIMILAR_THRESHOLD: SIMILAR (retrieval hint)
-#     - SIMILAR_THRESHOLD-CONFLICT_THRESHOLD_MAX: POTENTIAL_CONFLICT (retrieval hint)
-#     - CONFLICT_THRESHOLD_MAX+: UNRELATED (retrieval cutoff)
-    
-#     Args:
-#         distance: Cosine distance between behavior embeddings (0.0-2.0)
-        
-#     Returns:
-#         SimilarityClassification enum value (for logging only)
-
-#     """
-#     if distance < DUPLICATE_THRESHOLD:
-#         return SimilarityClassification.DUPLICATE
-#     elif distance < SIMILAR_THRESHOLD:
-#         return SimilarityClassification.SIMILAR
-#     elif distance < CONFLICT_THRESHOLD_MAX:
-#         return SimilarityClassification.POTENTIAL_CONFLICT
-#     else:
-#         return SimilarityClassification.UNRELATED
 
 
 def get_user_behaviors(user_id: str, include_states: List[str] = None) -> List[dict]:
