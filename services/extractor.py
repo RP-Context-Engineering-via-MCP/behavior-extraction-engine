@@ -3,7 +3,7 @@ Behavior extraction orchestrator.
 Handles the workflow: raw prompt -> GPT extraction -> validated Pydantic models
 """
 
-from typing import Dict, Any, List, Optional
+from typing import List, Optional
 from models.behavior import (
     ExtractionResult, 
     BehaviorSegment, 
@@ -19,7 +19,7 @@ from models.behavior import (
     DetailedExtractionResult
 )
 from services.openAiClient import extract_behavior, embed_text, analyze_conflict
-from services.credibilityCalculator import calculate_initial_credibility, should_store_behavior
+from services.credibilityCalculator import calculate_initial_credibility, should_store_behavior, get_decay_rate
 from services.behaviorRepository import (
     insert_behavior, 
     insert_prompt_segment, 
@@ -27,13 +27,16 @@ from services.behaviorRepository import (
     reinforce_behavior,
     insert_conflict,
     supersede_behavior,
-    update_behavior_state
+    update_behavior_state,
+    update_behavior_access_time
 )
 from datetime import datetime
+import time
 from config.configurations import (
     DEFAULT_DECAY_RATE,
     SAMPLE_USERID,
-    SEMANTIC_RELEVANCE_THRESHOLD
+    SEMANTIC_RELEVANCE_THRESHOLD,
+    DECAY_GRACE_PERIOD_SECONDS
 )
 
 import logging
@@ -312,7 +315,20 @@ def _create_stored_behavior(
     segment_id: str,
     canonical: CanonicalBehavior
 ) -> StoredBehavior:
-    """Create a StoredBehavior object from extraction data."""
+    """Create a StoredBehavior object from extraction data with intent-based decay rate."""
+    # Get intent-specific decay rate based on behavioral intent
+    decay_rate = get_decay_rate(intent=canonical.intent)
+    
+    # Calculate timestamps
+    current_time = int(time.time())
+    # Set decay to start after grace period (7 days)
+    decay_starts_at = current_time + DECAY_GRACE_PERIOD_SECONDS
+    
+    logger.debug(
+        f"Creating behavior with intent '{canonical.intent}', decay_rate {decay_rate}, "
+        f"grace period ends at {datetime.fromtimestamp(decay_starts_at).isoformat()}"
+    )
+    
     return StoredBehavior(
         user_id=user_id,
         behavior_text=behavior_description,
@@ -320,8 +336,11 @@ def _create_stored_behavior(
         clarity_score=clarity,
         extraction_confidence=confidence,
         linguistic_strength=linguistic_strength,
-        decay_rate=DEFAULT_DECAY_RATE,
+        decay_rate=decay_rate,
         embedding=embedding_vector,
+        created_at=current_time,
+        last_seen_at=current_time,
+        last_decay_applied_at=decay_starts_at,
         prompt_history_ids=[segment_id],
         session_id="default",
         intent=canonical.intent,
@@ -510,6 +529,8 @@ def _handle_polarity_conflict(
             f"AUTO-RESOLVE: Ignoring new behavior "
             f"(credibility: {initial_credibility:.2f} < {existing.credibility:.2f})"
         )
+        # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+        update_behavior_access_time(existing.behavior_id, user_id)
         return (True, True)
 
     # Case C: Ambiguous credibilities → LLM analysis needed
@@ -620,6 +641,8 @@ def _handle_potential_conflict(
         # Case B: Existing behavior wins, ignore new
         elif resolution_type == "IGNORE_NEW":
             logger.info("AUTO-RESOLVE: Ignoring new behavior")
+            # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+            update_behavior_access_time(existing.behavior_id, user_id)
             return (True, True)
 
         # Case C: Ambiguous credibilities → flag for user decision
@@ -1452,6 +1475,9 @@ def _process_candidate_with_tracking(
                 return (True, flow_info)
             
             elif resolution_type == "IGNORE_NEW":
+                # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+                update_behavior_access_time(existing.behavior_id, user_id)
+                
                 flow_info = BehaviorFlowInfo(
                     behavior_description=behavior_description,
                     action=BehaviorFlowAction.IGNORED_NEW,
@@ -1635,6 +1661,9 @@ def _process_candidate_with_tracking(
                 return (True, flow_info)
             
             elif resolution_type == "IGNORE_NEW":
+                # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+                update_behavior_access_time(existing.behavior_id, user_id)
+                
                 flow_info = BehaviorFlowInfo(
                     behavior_description=behavior_description,
                     action=BehaviorFlowAction.IGNORED_NEW,

@@ -18,3 +18,5 @@ CREATE INDEX behaviors_text_idx
 -- Create index for credibility filtering
 CREATE INDEX behaviors_credibility_idx
   ON public.behaviors (credibility DESC);
+
+alter table behaviors add column last_accessed_at bigint

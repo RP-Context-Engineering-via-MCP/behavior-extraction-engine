@@ -112,6 +112,14 @@ class StoredBehavior(BaseModel):
         default_factory=lambda: int(time.time()),
         description="Timestamp when the behavior was last reinforced"
     )
+    last_decay_applied_at: Optional[int] = Field(
+        default=None,
+        description="Timestamp when decay was last applied or when it should start (created_at + grace period)"
+    )
+    last_accessed_at: Optional[int] = Field(
+        default=None,
+        description="Timestamp when behavior was last actively used (context enrichment, reinforcement, conflict resolution)"
+    )
     prompt_history_ids: List[str] = Field(
         default_factory=list,
         description="List of prompt IDs that have triggered this behavior"

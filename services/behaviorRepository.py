@@ -11,7 +11,8 @@ from models.behavior import (
     ResolutionStatus,
     BehaviorState
 )
-from services.credibilityCalculator import calculate_reinforcement_boost
+from services.credibilityCalculator import calculate_reinforcement_boost, apply_lazy_decay
+from config.configurations import DECAY_GRACE_PERIOD_SECONDS
 import time
 import uuid
 import logging
@@ -51,6 +52,8 @@ def insert_behavior(payload: dict):
                     reinforcement_count,
                     created_at,
                     last_seen_at,
+                    last_decay_applied_at,
+                    last_accessed_at,
                     session_id,
                     prompt_history_ids,
                     behavior_state,
@@ -72,6 +75,8 @@ def insert_behavior(payload: dict):
                     %(reinforcement_count)s,
                     %(created_at)s,
                     %(last_seen_at)s,
+                    %(last_decay_applied_at)s,
+                    %(last_accessed_at)s,
                     %(session_id)s,
                     %(prompt_history_ids)s,
                     %(behavior_state)s,
@@ -216,6 +221,8 @@ def reinforce_behavior(
                     updated_history_ids.append(segment_id)
                 
                 # Step 4: Update behavior in database
+                # Reset last_decay_applied_at to current time when reinforced
+                # Set last_accessed_at to mark this behavior as actively used
                 cur.execute(
                     """
                     UPDATE behaviors
@@ -223,12 +230,16 @@ def reinforce_behavior(
                         credibility = %s,
                         reinforcement_count = %s,
                         last_seen_at = %s,
+                        last_decay_applied_at = %s,
+                        last_accessed_at = %s,
                         prompt_history_ids = %s
                     WHERE behavior_id = %s AND user_id = %s;
                     """,
                     (
                         new_credibility,
                         new_count,
+                        current_timestamp,
+                        current_timestamp,
                         current_timestamp,
                         updated_history_ids,
                         behavior_id,
@@ -266,41 +277,6 @@ def reinforce_behavior(
             error=str(e)
         )
 
-
-# def classify_similarity(distance: float) -> SimilarityClassification:
-#     """
-#     Classify the relationship between two behaviors based on embedding distance.
-    
-#     ⚠️  DEPRECATED FOR DECISION LOGIC - USE FOR LOGGING/DEBUGGING ONLY ⚠️
-    
-#     With the canonical behavior refactor, this function is NO LONGER used for 
-#     making decisions about duplicate detection, conflict resolution, or behavior 
-#     storage. Those decisions are now made by:
-#     - Intent + Target matching (structured fields)
-#     - Context reasoning (contexts_match function)
-#     - Polarity comparison
-    
-#     Uses cosine distance where lower values indicate higher similarity:
-#     - 0.00-DUPLICATE_THRESHOLD: DUPLICATE (retrieval hint)
-#     - DUPLICATE_THRESHOLD-SIMILAR_THRESHOLD: SIMILAR (retrieval hint)
-#     - SIMILAR_THRESHOLD-CONFLICT_THRESHOLD_MAX: POTENTIAL_CONFLICT (retrieval hint)
-#     - CONFLICT_THRESHOLD_MAX+: UNRELATED (retrieval cutoff)
-    
-#     Args:
-#         distance: Cosine distance between behavior embeddings (0.0-2.0)
-        
-#     Returns:
-#         SimilarityClassification enum value (for logging only)
-
-#     """
-#     if distance < DUPLICATE_THRESHOLD:
-#         return SimilarityClassification.DUPLICATE
-#     elif distance < SIMILAR_THRESHOLD:
-#         return SimilarityClassification.SIMILAR
-#     elif distance < CONFLICT_THRESHOLD_MAX:
-#         return SimilarityClassification.POTENTIAL_CONFLICT
-#     else:
-#         return SimilarityClassification.UNRELATED
 
 
 def get_user_behaviors(user_id: str, include_states: List[str] = None) -> List[dict]:
@@ -383,6 +359,10 @@ def search_similar_behaviors(
 ) -> List[SimilarityResult]:
     """
     Find behaviors similar to query embedding using cosine similarity.
+    
+    Applies lazy decay to credibility on-the-fly when retrieving behaviors.
+    If decay is applied, updates the behavior in the database with new credibility.
+    
     Returns:
         List of SimilarityResult objects with classification and metadata
         Sorted by similarity (lowest distance first)
@@ -390,6 +370,7 @@ def search_similar_behaviors(
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
+                # Fetch behaviors with decay-related fields
                 cur.execute(
                     """
                     SELECT 
@@ -402,7 +383,9 @@ def search_similar_behaviors(
                         intent,
                         target,
                         context,
-                        polarity
+                        polarity,
+                        decay_rate,
+                        last_decay_applied_at
                     FROM behaviors
                     WHERE user_id = %s
                     AND behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED')
@@ -413,17 +396,42 @@ def search_similar_behaviors(
                 )
                 
                 results = cur.fetchall()
+                current_time = int(time.time())
                 
-                # Convert to SimilarityResult objects with classification
+                # Convert to SimilarityResult objects and apply lazy decay
                 similarity_results = []
+                behaviors_to_update = []
+                
                 for row in results:
-                    behavior_id, behavior_text, distance, credibility, last_seen_at, reinforcement_count, intent, target, context, polarity = row
+                    behavior_id, behavior_text, distance, stored_credibility, last_seen_at, reinforcement_count, intent, target, context, polarity, decay_rate, last_decay_applied_at = row
+                    
+                    # Apply lazy decay to credibility
+                    new_credibility, decay_applied, days_elapsed = apply_lazy_decay(
+                        stored_credibility=float(stored_credibility),
+                        decay_rate=float(decay_rate),
+                        last_decay_applied_at=last_decay_applied_at,
+                        current_time=current_time
+                    )
+                    
+                    # Track behaviors that need credibility update in DB
+                    if decay_applied:
+                        behaviors_to_update.append((
+                            new_credibility,
+                            current_time,
+                            behavior_id,
+                            user_id
+                        ))
+                        logger.debug(
+                            f"Lazy decay applied to {behavior_id}: "
+                            f"{stored_credibility:.4f} → {new_credibility:.4f} "
+                            f"({days_elapsed} days)"
+                        )
                     
                     similarity_results.append(SimilarityResult(
                         behavior_id=behavior_id,
                         behavior_text=behavior_text,
                         distance=float(distance),
-                        credibility=float(credibility),
+                        credibility=new_credibility,  # Use decayed credibility
                         last_seen_at=int(last_seen_at),
                         reinforcement_count=int(reinforcement_count),
                         intent=intent,
@@ -432,45 +440,28 @@ def search_similar_behaviors(
                         polarity=polarity
                     ))
                 
+                # Batch update behaviors with decayed credibility
+                if behaviors_to_update:
+                    cur.executemany(
+                        """
+                        UPDATE behaviors
+                        SET credibility = %s,
+                            last_decay_applied_at = %s
+                        WHERE behavior_id = %s AND user_id = %s
+                        """,
+                        behaviors_to_update
+                    )
+                    conn.commit()
+                    logger.info(
+                        f"Updated {len(behaviors_to_update)} behaviors with lazy decay"
+                    )
+                
                 logger.debug(f"Found {len(similarity_results)} similar behaviors for user {user_id}")
                 return similarity_results
                 
     except Exception as e:
         logger.error(f"Failed to search similar behaviors: {str(e)}")
         return []
-
-
-def search_similar_behaviors_raw(
-        user_id: str, 
-        query_embedding: List[float], 
-        limit: int = 5
-) -> List[Tuple[str, str, float]]:
-    """
-    Find behaviors similar to query embedding using cosine similarity.
-    
-    Args:
-        user_id: User identifier
-        query_embedding: Vector embedding (3072 dimensions) as list of floats
-        limit: Maximum number of results to return
-        
-    Returns:
-        List of tuples: (behavior_id, behavior_text, distance)
-        Lower distance = more similar
-    """
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT behavior_id, behavior_text,
-                    embedding <=> %s AS distance
-                FROM behaviors
-                WHERE user_id = %s
-                ORDER BY distance
-                LIMIT 10;
-                """,
-                (query_embedding, user_id)
-            )
-            return cur.fetchall()
         
 
 def insert_behavior_batch(payloads: List[dict]):
@@ -645,6 +636,7 @@ def supersede_behavior(
     while indicating which behavior is currently active. The old behavior:
     - State changed to SUPERSEDED
     - superseded_by_id set to new behavior ID
+    - last_accessed_at updated (behavior was actively used in conflict resolution)
     - No longer used for personalization
     - Kept in database for historical analysis
     
@@ -664,20 +656,25 @@ def supersede_behavior(
         True
     """
     try:
+        current_timestamp = int(time.time())
+        
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
                 # Update old behavior to SUPERSEDED state and link to new one
+                # Set last_accessed_at to mark it was actively used in conflict resolution
                 cur.execute(
                     """
                     UPDATE behaviors
                     SET 
                         behavior_state = %s,
-                        superseded_by_id = %s
+                        superseded_by_id = %s,
+                        last_accessed_at = %s
                     WHERE behavior_id = %s AND user_id = %s
                     """,
                     (
                         BehaviorState.SUPERSEDED.value,
                         new_behavior_id,
+                        current_timestamp,
                         old_behavior_id,
                         user_id
                     )
@@ -693,7 +690,8 @@ def supersede_behavior(
                     return False
                 
                 logger.info(
-                    f"Superseded behavior {old_behavior_id} with {new_behavior_id}"
+                    f"Superseded behavior {old_behavior_id} with {new_behavior_id} "
+                    f"(last_accessed_at updated)"
                 )
                 return True
                 
@@ -702,15 +700,74 @@ def supersede_behavior(
         raise Exception(f"Database error superseding behavior: {str(e)}")
 
 
+def update_behavior_access_time(
+    behavior_id: str,
+    user_id: str
+) -> bool:
+    """
+    Update last_accessed_at timestamp for a behavior.
+    
+    Called when a behavior is actively confirmed or used in system decisions:
+    - When existing behavior wins in conflict resolution (IGNORE_NEW)
+    - When behavior is selected by user in conflict resolution
+    - When behavior is used for context enrichment
+    
+    Args:
+        behavior_id: Behavior that was accessed
+        user_id: User ID (required for partitioned table)
+        
+    Returns:
+        True if update succeeded, False otherwise
+        
+    Example:
+        >>> update_behavior_access_time("beh_abc123", "user_xyz")
+        True
+    """
+    try:
+        current_timestamp = int(time.time())
+        
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE behaviors
+                    SET last_accessed_at = %s
+                    WHERE behavior_id = %s AND user_id = %s
+                    """,
+                    (current_timestamp, behavior_id, user_id)
+                )
+                
+                rows_affected = cur.rowcount
+                conn.commit()
+                
+                if rows_affected == 0:
+                    logger.warning(
+                        f"No behavior found to update access time: {behavior_id} for user {user_id}"
+                    )
+                    return False
+                
+                logger.debug(
+                    f"Updated last_accessed_at for behavior {behavior_id}"
+                )
+                return True
+                
+    except Exception as e:
+        logger.error(f"Failed to update behavior access time: {str(e)}")
+        return False
+
+
 def get_behaviors_by_user(user_id: str) -> List[dict]:
     """
     Get all behaviors for a specific user.
+    
+    Applies lazy decay to credibility on-the-fly when retrieving behaviors.
+    If decay is applied, updates the behavior in the database with new credibility.
     
     Args:
         user_id: The user identifier
         
     Returns:
-        List of behavior dictionaries with all fields
+        List of behavior dictionaries with all fields (credibility reflects decay)
     """
     try:
         with get_db_pool_connection() as conn:
@@ -735,7 +792,9 @@ def get_behaviors_by_user(user_id: str) -> List[dict]:
                         intent,
                         target,
                         context,
-                        polarity
+                        polarity,
+                        last_decay_applied_at,
+                        last_accessed_at
                     FROM behaviors
                     WHERE user_id = %s
                     ORDER BY last_seen_at DESC
@@ -743,15 +802,46 @@ def get_behaviors_by_user(user_id: str) -> List[dict]:
                     (user_id,)
                 )
                 
+                current_time = int(time.time())
                 behaviors = []
+                behaviors_to_update = []
+                
                 for row in cur.fetchall():
+                    behavior_id = row[0]
+                    stored_credibility = row[3]
+                    decay_rate = row[5]
+                    last_decay_applied_at = row[18]
+                    last_accessed_at = row[19]
+                    
+                    # Apply lazy decay to credibility
+                    new_credibility, decay_applied, days_elapsed = apply_lazy_decay(
+                        stored_credibility=float(stored_credibility),
+                        decay_rate=float(decay_rate),
+                        last_decay_applied_at=last_decay_applied_at,
+                        current_time=current_time
+                    )
+                    
+                    # Track behaviors that need credibility update in DB
+                    if decay_applied:
+                        behaviors_to_update.append((
+                            new_credibility,
+                            current_time,
+                            behavior_id,
+                            user_id
+                        ))
+                        logger.debug(
+                            f"Lazy decay applied to {behavior_id}: "
+                            f"{stored_credibility:.4f} → {new_credibility:.4f} "
+                            f"({days_elapsed} days)"
+                        )
+                    
                     behaviors.append({
-                        "behavior_id": row[0],
+                        "behavior_id": behavior_id,
                         "user_id": row[1],
                         "behavior_text": row[2],
-                        "credibility": row[3],
+                        "credibility": new_credibility,  # Use decayed credibility
                         "reinforcement_count": row[4],
-                        "decay_rate": row[5],
+                        "decay_rate": decay_rate,
                         "created_at": row[6],
                         "last_seen_at": row[7],
                         "prompt_history_ids": row[8],
@@ -763,8 +853,25 @@ def get_behaviors_by_user(user_id: str) -> List[dict]:
                         "intent": row[14],
                         "target": row[15],
                         "context": row[16],
-                        "polarity": row[17]
+                        "polarity": row[17],
+                        "last_accessed_at": last_accessed_at
                     })
+                
+                # Batch update behaviors with decayed credibility
+                if behaviors_to_update:
+                    cur.executemany(
+                        """
+                        UPDATE behaviors
+                        SET credibility = %s,
+                            last_decay_applied_at = %s
+                        WHERE behavior_id = %s AND user_id = %s
+                        """,
+                        behaviors_to_update
+                    )
+                    conn.commit()
+                    logger.info(
+                        f"Updated {len(behaviors_to_update)} behaviors with lazy decay"
+                    )
                 
                 return behaviors
                 
@@ -842,4 +949,271 @@ def get_user_conflicts(user_id: str) -> List[dict]:
     except Exception as e:
         logger.error(f"Failed to get conflicts for user {user_id}: {str(e)}")
         raise Exception(f"Database error retrieving conflicts: {str(e)}")
+
+
+def resolve_conflict(
+    conflict_id: str,
+    user_id: str,
+    resolution_choice: str
+) -> dict:
+    """
+    Resolve a conflict based on user's decision.
+    
+    Handles three resolution scenarios:
+    - OLD_WINS: Reinforce existing behavior, invalidate new (credibility = 0.0 for pruning)
+    - NEW_WINS: Set new behavior to ACTIVE, supersede old behavior
+    - BOTH_CORRECT: Reinforce both behaviors, set both to ACTIVE
+    
+    In all cases:
+    - Updates last_accessed_at (behavior was actively used in conflict resolution)
+    - Updates conflict record with resolution status and choice
+    - Maintains audit trail
+    
+    Args:
+        conflict_id: UUID of the conflict to resolve
+        user_id: User ID (for validation)
+        resolution_choice: One of "OLD_WINS", "NEW_WINS", "BOTH_CORRECT"
+        
+    Returns:
+        Dictionary with resolution details and updated behavior states
+        
+    Raises:
+        ValueError: If resolution_choice is invalid or conflict not found
+        Exception: If database operations fail
+        
+    Example:
+        >>> result = resolve_conflict(
+        ...     "conf_abc123",
+        ...     "user_xyz",
+        ...     "OLD_WINS"
+        ... )
+        >>> print(result["resolution_status"])
+        "USER_RESOLVED"
+    """
+    try:
+        # Validate resolution choice
+        valid_choices = ["OLD_WINS", "NEW_WINS", "BOTH_CORRECT"]
+        if resolution_choice not in valid_choices:
+            raise ValueError(
+                f"Invalid resolution_choice: {resolution_choice}. "
+                f"Must be one of {valid_choices}"
+            )
+        
+        current_timestamp = int(time.time())
+        
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                # Step 1: Fetch conflict details
+                cur.execute(
+                    """
+                    SELECT 
+                        conflict_id,
+                        user_id,
+                        behavior_id_1,
+                        behavior_id_2,
+                        resolution_status
+                    FROM behavior_conflicts
+                    WHERE conflict_id = %s AND user_id = %s
+                    """,
+                    (conflict_id, user_id)
+                )
+                
+                conflict = cur.fetchone()
+                
+                if not conflict:
+                    raise ValueError(
+                        f"Conflict {conflict_id} not found for user {user_id}"
+                    )
+                
+                if conflict[4] != ResolutionStatus.PENDING.value:
+                    raise ValueError(
+                        f"Conflict {conflict_id} already resolved with status: {conflict[4]}"
+                    )
+                
+                behavior_id_1 = conflict[2]  # Old/existing behavior
+                behavior_id_2 = conflict[3]  # New behavior
+                
+                logger.info(
+                    f"Resolving conflict {conflict_id}: "
+                    f"{behavior_id_1} vs {behavior_id_2} -> {resolution_choice}"
+                )
+                
+                # Step 2: Handle resolution based on user's choice
+                if resolution_choice == "OLD_WINS":
+                    # Reinforce old behavior (increases credibility, updates timestamps)
+                    reinforce_result = reinforce_behavior(
+                        behavior_id=behavior_id_1,
+                        user_id=user_id,
+                        segment_id=None
+                    )
+                    
+                    if not reinforce_result.success:
+                        raise Exception(f"Failed to reinforce old behavior: {reinforce_result.error}")
+                    
+                    # Update old behavior state to ACTIVE and last_accessed_at
+                    cur.execute(
+                        """
+                        UPDATE behaviors
+                        SET 
+                            behavior_state = %s,
+                            last_accessed_at = %s
+                        WHERE behavior_id = %s AND user_id = %s
+                        """,
+                        (BehaviorState.ACTIVE.value, current_timestamp, behavior_id_1, user_id)
+                    )
+                    
+                    # Invalidate new behavior by setting credibility to 0.0
+                    # User confirmed new behavior is incorrect, so mark it for pruning
+                    cur.execute(
+                        """
+                        UPDATE behaviors
+                        SET 
+                            credibility = 0.0,
+                            last_accessed_at = %s
+                        WHERE behavior_id = %s AND user_id = %s
+                        """,
+                        (current_timestamp, behavior_id_2, user_id)
+                    )
+                    
+                    logger.info(
+                        f"OLD_WINS: Reinforced {behavior_id_1} (set to ACTIVE), "
+                        f"invalidated {behavior_id_2} (credibility set to 0.0 for pruning)"
+                    )
+                
+                elif resolution_choice == "NEW_WINS":
+                    # Set new behavior to ACTIVE
+                    cur.execute(
+                        """
+                        UPDATE behaviors
+                        SET 
+                            behavior_state = %s,
+                            last_accessed_at = %s
+                        WHERE behavior_id = %s AND user_id = %s
+                        """,
+                        (BehaviorState.ACTIVE.value, current_timestamp, behavior_id_2, user_id)
+                    )
+                    
+                    # Supersede old behavior (sets state to SUPERSEDED, links to new, updates last_accessed_at)
+                    supersede_success = supersede_behavior(
+                        old_behavior_id=behavior_id_1,
+                        new_behavior_id=behavior_id_2,
+                        user_id=user_id
+                    )
+                    
+                    if not supersede_success:
+                        raise Exception(f"Failed to supersede old behavior {behavior_id_1}")
+                    
+                    logger.info(
+                        f"NEW_WINS: Set {behavior_id_2} to ACTIVE, "
+                        f"superseded {behavior_id_1}"
+                    )
+                
+                elif resolution_choice == "BOTH_CORRECT":
+                    # Reinforce both behaviors
+                    reinforce_result_1 = reinforce_behavior(
+                        behavior_id=behavior_id_1,
+                        user_id=user_id,
+                        segment_id=None
+                    )
+                    
+                    if not reinforce_result_1.success:
+                        raise Exception(f"Failed to reinforce behavior 1: {reinforce_result_1.error}")
+                    
+                    reinforce_result_2 = reinforce_behavior(
+                        behavior_id=behavior_id_2,
+                        user_id=user_id,
+                        segment_id=None
+                    )
+                    
+                    if not reinforce_result_2.success:
+                        raise Exception(f"Failed to reinforce behavior 2: {reinforce_result_2.error}")
+                    
+                    # Set both to ACTIVE and update last_accessed_at
+                    cur.execute(
+                        """
+                        UPDATE behaviors
+                        SET 
+                            behavior_state = %s,
+                            last_accessed_at = %s
+                        WHERE behavior_id IN (%s, %s) AND user_id = %s
+                        """,
+                        (
+                            BehaviorState.ACTIVE.value,
+                            current_timestamp,
+                            behavior_id_1,
+                            behavior_id_2,
+                            user_id
+                        )
+                    )
+                    
+                    logger.info(
+                        f"BOTH_CORRECT: Reinforced both {behavior_id_1} and {behavior_id_2}, "
+                        f"set both to ACTIVE"
+                    )
+                
+                # Step 3: Update conflict record
+                cur.execute(
+                    """
+                    UPDATE behavior_conflicts
+                    SET 
+                        resolution_status = %s,
+                        resolution_choice = %s,
+                        resolved_at = %s
+                    WHERE conflict_id = %s AND user_id = %s
+                    """,
+                    (
+                        ResolutionStatus.USER_RESOLVED.value,
+                        resolution_choice,
+                        current_timestamp,
+                        conflict_id,
+                        user_id
+                    )
+                )
+                
+                # Step 4: Fetch updated behavior states
+                cur.execute(
+                    """
+                    SELECT 
+                        behavior_id,
+                        behavior_text,
+                        behavior_state,
+                        credibility,
+                        last_accessed_at
+                    FROM behaviors
+                    WHERE behavior_id IN (%s, %s) AND user_id = %s
+                    """,
+                    (behavior_id_1, behavior_id_2, user_id)
+                )
+                
+                behaviors = []
+                for row in cur.fetchall():
+                    behaviors.append({
+                        "behavior_id": row[0],
+                        "behavior_text": row[1],
+                        "behavior_state": row[2],
+                        "credibility": row[3],
+                        "last_accessed_at": row[4]
+                    })
+                
+                conn.commit()
+                
+                logger.info(
+                    f"Conflict {conflict_id} resolved successfully: {resolution_choice}"
+                )
+                
+                return {
+                    "success": True,
+                    "conflict_id": conflict_id,
+                    "resolution_status": ResolutionStatus.USER_RESOLVED.value,
+                    "resolution_choice": resolution_choice,
+                    "resolved_at": current_timestamp,
+                    "behaviors": behaviors
+                }
+                
+    except ValueError as e:
+        logger.error(f"Validation error resolving conflict {conflict_id}: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to resolve conflict {conflict_id}: {str(e)}")
+        raise Exception(f"Database error resolving conflict: {str(e)}")
 
