@@ -139,7 +139,8 @@ Main extraction endpoint with flow tracking.
 ```json
 {
   "prompt": "Your prompt here",
-  "session_id": "demo_user"
+  "user_id": "demo_user",
+  "session_id": "session_001"  // Optional, defaults to "default"
 }
 ```
 
@@ -231,7 +232,7 @@ Retrieve all conflicts for a user.
 - Ensure the database connection is working
 
 ### Behaviors not appearing in "View All"?
-- Make sure you're using the same session_id
+- Make sure you're using the same user_id to see behaviors accumulate across multiple extractions
 - Check if behaviors were actually stored (not pruned)
 
 ## Technical Details

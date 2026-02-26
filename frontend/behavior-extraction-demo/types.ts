@@ -174,7 +174,8 @@ export interface ConflictsResponseData {
 
 export interface ExtractRequest {
   prompt: string;
-  session_id: string;
+  user_id: string;
+  session_id?: string;
   enable_llm_conflict_resolution?: boolean;
 }
 
@@ -192,7 +193,7 @@ export interface ApiResponse<T> {
 export interface ExtractResponseData {
   processing: ProcessingSummary;
   flow_info: BehaviorFlow[];
-  session_id: string;
+  user_id: string;
   extraction_timestamp: number;
 }
 

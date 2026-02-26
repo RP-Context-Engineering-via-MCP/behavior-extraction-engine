@@ -313,7 +313,8 @@ def _create_stored_behavior(
     linguistic_strength: float,
     embedding_vector: List[float],
     segment_id: str,
-    canonical: CanonicalBehavior
+    canonical: CanonicalBehavior,
+    session_id: str = "default"
 ) -> StoredBehavior:
     """Create a StoredBehavior object from extraction data with intent-based decay rate."""
     # Get intent-specific decay rate based on behavioral intent
@@ -342,7 +343,7 @@ def _create_stored_behavior(
         last_seen_at=current_time,
         last_decay_applied_at=decay_starts_at,
         prompt_history_ids=[segment_id],
-        session_id="default",
+        session_id=session_id,
         intent=canonical.intent,
         target=canonical.target,
         context=canonical.context,
@@ -403,7 +404,8 @@ def _handle_llm_conflict_analysis(
     embedding_vector: List[float],
     segment_id: str,
     canonical: CanonicalBehavior,
-    stored_behaviors: List[StoredBehavior]
+    stored_behaviors: List[StoredBehavior],
+    session_id: str = "default"
 ) -> tuple[bool, bool]:
     """
     Handle LLM conflict analysis for ambiguous credibility scenarios.
@@ -434,7 +436,8 @@ def _handle_llm_conflict_analysis(
         linguistic_strength=linguistic_strength,
         embedding_vector=embedding_vector,
         segment_id=segment_id,
-        canonical=canonical
+        canonical=canonical,
+        session_id=session_id
     )
 
     if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
@@ -475,7 +478,8 @@ def _handle_polarity_conflict(
     embedding_vector: List[float],
     segment_id: str,
     canonical: CanonicalBehavior,
-    stored_behaviors: List[StoredBehavior]
+    stored_behaviors: List[StoredBehavior],
+    session_id: str = "default"
 ) -> tuple[bool, bool]:
     """
     Handle polarity conflict (same target, different polarity).
@@ -511,7 +515,8 @@ def _handle_polarity_conflict(
             linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
             segment_id=segment_id,
-            canonical=canonical
+            canonical=canonical,
+            session_id=session_id
         )
         
         _supersede_existing_behavior(
@@ -547,7 +552,8 @@ def _handle_polarity_conflict(
             embedding_vector=embedding_vector,
             segment_id=segment_id,
             canonical=canonical,
-            stored_behaviors=stored_behaviors
+            stored_behaviors=stored_behaviors,
+            session_id=session_id
         )
 
     return (False, False)
@@ -564,7 +570,8 @@ def _handle_potential_conflict(
     embedding_vector: List[float],
     segment_id: str,
     canonical: CanonicalBehavior,
-    stored_behaviors: List[StoredBehavior]
+    stored_behaviors: List[StoredBehavior],
+    session_id: str = "default"
 ) -> tuple[bool, bool]:
     """
     Handle potential conflict (different target, same context).
@@ -602,7 +609,8 @@ def _handle_potential_conflict(
         linguistic_strength=linguistic_strength,
         embedding_vector=embedding_vector,
         segment_id=segment_id,
-        canonical=canonical
+        canonical=canonical,
+        session_id=session_id
     )
 
     if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
@@ -837,7 +845,8 @@ def _process_relationships(
     linguistic_strength: float,
     embedding_vector: List[float],
     segment_id: str,
-    stored_behaviors: List[StoredBehavior]
+    stored_behaviors: List[StoredBehavior],
+    session_id: str = "default"
 ) -> bool:
     """
     Process all collected relationships and take appropriate actions.
@@ -911,7 +920,8 @@ def _process_relationships(
                 embedding_vector=embedding_vector,
                 segment_id=segment_id,
                 canonical=canonical,
-                stored_behaviors=stored_behaviors
+                stored_behaviors=stored_behaviors,
+                session_id=session_id
             )
             if not decision_taken:
                 all_conflicts_resolved = False
@@ -948,7 +958,8 @@ def _process_relationships(
                 embedding_vector=embedding_vector,
                 segment_id=segment_id,
                 canonical=canonical,
-                stored_behaviors=stored_behaviors
+                stored_behaviors=stored_behaviors,
+                session_id=session_id
             )
             if decision_taken:
                 return True
@@ -974,7 +985,8 @@ def _process_relationships(
                 embedding_vector=embedding_vector,
                 segment_id=segment_id,
                 canonical=canonical,
-                stored_behaviors=stored_behaviors
+                stored_behaviors=stored_behaviors,
+                session_id=session_id
             )
             if decision_taken:
                 return True
@@ -985,7 +997,8 @@ def _process_relationships(
 
 def store_behavior(
     extraction_result: ExtractionResult,
-    user_id: str = SAMPLE_USERID
+    user_id: str = SAMPLE_USERID,
+    session_id: str = "default"
 ) -> List[StoredBehavior]:
     """
     Store extracted behaviors using CANONICAL reasoning with
@@ -1079,6 +1092,7 @@ def store_behavior(
                 candidates = search_similar_behaviors(
                     user_id=user_id,
                     query_embedding=embedding_vector,
+                    session_id=session_id,
                     limit=5
                 )
                 logger.info(
@@ -1119,7 +1133,8 @@ def store_behavior(
                 linguistic_strength=behavior.linguistic_strength,
                 embedding_vector=embedding_vector,
                 segment_id=segment_id,
-                stored_behaviors=stored_behaviors
+                stored_behaviors=stored_behaviors,
+                session_id=session_id
             )
 
             # ==============================================================
@@ -1140,7 +1155,8 @@ def store_behavior(
                 linguistic_strength=behavior.linguistic_strength,
                 embedding_vector=embedding_vector,
                 segment_id=segment_id,
-                canonical=canonical
+                canonical=canonical,
+                session_id=session_id
             )
 
             try:
@@ -1155,7 +1171,8 @@ def store_behavior(
 
 def store_behavior_with_tracking(
     extraction_result: ExtractionResult,
-    user_id: str = SAMPLE_USERID
+    user_id: str = SAMPLE_USERID,
+    session_id: str = "default"
 ) -> DetailedExtractionResult:
     """
     Store extracted behaviors with detailed flow tracking for UI display.
@@ -1268,6 +1285,7 @@ def store_behavior_with_tracking(
                 candidates = search_similar_behaviors(
                     user_id=user_id,
                     query_embedding=embedding_vector,
+                    session_id=session_id,
                     limit=5
                 )
                 logger.info(f"Retrieved {len(candidates)} candidate(s)")
@@ -1305,7 +1323,8 @@ def store_behavior_with_tracking(
                     linguistic_strength=behavior.linguistic_strength,
                     embedding_vector=embedding_vector,
                     segment_id=segment_id,
-                    stored_behaviors=stored_behaviors
+                    stored_behaviors=stored_behaviors,
+                    session_id=session_id
                 )
                 
                 if decision_taken:
@@ -1337,7 +1356,8 @@ def store_behavior_with_tracking(
                     linguistic_strength=behavior.linguistic_strength,
                     embedding_vector=embedding_vector,
                     segment_id=segment_id,
-                    canonical=canonical
+                    canonical=canonical,
+                    session_id=session_id
                 )
                 
                 try:
@@ -1401,7 +1421,8 @@ def _process_candidate_with_tracking(
     linguistic_strength: float,
     embedding_vector: List[float],
     segment_id: str,
-    stored_behaviors: List[StoredBehavior]
+    stored_behaviors: List[StoredBehavior],
+    session_id: str = "default"
 ) -> tuple[bool, Optional[BehaviorFlowInfo]]:
     """
     Process a single candidate behavior with flow tracking.
@@ -1513,7 +1534,8 @@ def _process_candidate_with_tracking(
                     linguistic_strength=linguistic_strength,
                     embedding_vector=embedding_vector,
                     segment_id=segment_id,
-                    canonical=canonical
+                    canonical=canonical,
+                    session_id=session_id
                 )
                 
                 _flag_and_create_conflict(
@@ -1596,7 +1618,8 @@ def _process_candidate_with_tracking(
             linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
             segment_id=segment_id,
-            canonical=canonical
+            canonical=canonical,
+            session_id=session_id
         )
         
         if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:

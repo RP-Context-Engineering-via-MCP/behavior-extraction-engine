@@ -303,9 +303,13 @@ class ExtractRequest(BaseModel):
         ...,
         description="User's natural language prompt"
     )
+    user_id: str = Field(
+        ...,
+        description="User identifier for behavior extraction and storage"
+    )
     session_id: str = Field(
         default="default",
-        description="session id for session specific behavior grouping "
+        description="Optional session ID for session-specific behavior grouping within a user"
     )
 
     @field_validator('prompt')
@@ -314,11 +318,21 @@ class ExtractRequest(BaseModel):
             raise ValueError("Prompt cannot be empty or whitespace only")
         return v.strip()
     
+    @field_validator('user_id')
+    def validate_user_id(cls, v):
+        sanitized = v.strip()
+        if not sanitized:
+            raise ValueError("User ID cannot be empty")
+        # Allow only alphanumeric, hyphens, underscores
+        if not all(c.isalnum() or c in ['-', '_'] for c in sanitized):
+            raise ValueError("User ID can only contain alphanumeric characters, hyphens, and underscores")
+        return sanitized
+    
     @field_validator('session_id')
     def validate_session_id(cls, v):
         sanitized = v.strip()
         if not sanitized:
-            raise ValueError("Session ID cannot be empty")
+            return "default"
         # Allow only alphanumeric, hyphens, underscores
         if not all(c.isalnum() or c in ['-', '_'] for c in sanitized):
             raise ValueError("Session ID can only contain alphanumeric characters, hyphens, and underscores")

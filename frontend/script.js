@@ -62,7 +62,7 @@ async function handleExtraction() {
             },
             body: JSON.stringify({
                 prompt: prompt,
-                session_id: sessionId
+                user_id: sessionId
             })
         });
 

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, status
+from fastapi import FastAPI, status, Query
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,7 +73,7 @@ app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="front
 )
 def extract_behaviors(request: ExtractRequest):
     try:
-        logger.info(f"Received extraction request for session: {request.session_id}")
+        logger.info(f"Received extraction request for user: {request.user_id}")
 
         extraction_result = run_behavior_extraction(request.prompt)
 
@@ -92,10 +92,11 @@ def extract_behaviors(request: ExtractRequest):
         try:
             stored_behaviors = store_behavior(
                 extraction_result,
-                user_id=request.session_id
+                user_id=request.user_id,
+                session_id=request.session_id
             )
 
-            logger.info(f"Stored {len(stored_behaviors)} behaviors for session: {request.session_id}")
+            logger.info(f"Stored {len(stored_behaviors)} behaviors for user: {request.user_id}")
         except Exception as e:
             logger.error(f"Failed to store behaviors: {str(e)}")
             # stored_behaviors remains as empty list if error occurs
@@ -176,7 +177,7 @@ def extract_behaviors(request: ExtractRequest):
                         "total_behaviors_stored": len(stored_behaviors),
                         "behaviors_filtered": total_behaviors - len(stored_behaviors)
                     },
-                    "session_id": request.session_id
+                    "user_id": request.user_id
                 },
                 "error": None
             }
@@ -223,7 +224,7 @@ def extract_behaviors_detailed(request: ExtractRequest):
     This is specifically designed for the frontend UI to show the processing path.
     """
     try:
-        logger.info(f"Received detailed extraction request for session: {request.session_id}")
+        logger.info(f"Received detailed extraction request for user: {request.user_id}")
 
         # Run extraction
         extraction_result = run_behavior_extraction(request.prompt)
@@ -243,7 +244,8 @@ def extract_behaviors_detailed(request: ExtractRequest):
         try:
             detailed_result = store_behavior_with_tracking(
                 extraction_result,
-                user_id=request.session_id
+                user_id=request.user_id,
+                session_id=request.session_id
             )
 
             logger.info(
@@ -297,7 +299,7 @@ def extract_behaviors_detailed(request: ExtractRequest):
                         "total_pruned": detailed_result.total_pruned
                     },
                     "flow_info": flow_info_formatted,
-                    "session_id": request.session_id
+                    "user_id": request.user_id
                 },
                 "error": None
             }
@@ -327,13 +329,15 @@ def extract_behaviors_detailed(request: ExtractRequest):
 @app.get(
     "/behaviors/{user_id}",
     summary="Get all behaviors for a user",
-    description="Retrieve all stored behaviors for a specific user",
+    description="Retrieve all stored behaviors for a specific user. Optionally filter by session_id.",
     response_description="List of behaviors with all details"
 )
-def get_user_behaviors(user_id: str):
-    """Get all behaviors for a specific user."""
+def get_user_behaviors(user_id: str, session_id: str = Query(None, description="Optional session ID to filter behaviors")):
+    """Get all behaviors for a specific user. If session_id is provided, only returns behaviors from that session."""
     try:
-        behaviors = get_behaviors_by_user(user_id)
+        behaviors = get_behaviors_by_user(user_id, session_id=session_id)
+        
+        session_info = f" in session {session_id}" if session_id else " (all sessions)"
         
         return JSONResponse(
             status_code=status.HTTP_200_OK,
@@ -341,6 +345,7 @@ def get_user_behaviors(user_id: str):
                 "success": True,
                 "data": {
                     "user_id": user_id,
+                    "session_id": session_id,
                     "total_behaviors": len(behaviors),
                     "behaviors": behaviors
                 },
