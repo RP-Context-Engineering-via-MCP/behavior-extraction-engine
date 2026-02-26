@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from services.extractor import run_behavior_extraction, store_behavior, store_behavior_with_tracking
-from services.behaviorRepository import insert_behavior, search_similar_behaviors, get_behaviors_by_user, get_user_conflicts
+from services.behaviorRepository import insert_behavior, search_similar_behaviors, get_behaviors_by_user, get_user_conflicts, resolve_conflict
 from models.behavior import ExtractRequest
 from db.connection import close_db_pool, init_db_pool
 from contextlib import asynccontextmanager
@@ -23,6 +23,15 @@ class BehaviorSimilarityRequest(BaseModel):
     metric: Literal["cosine", "euclidean", "manhattan"] = Field(
         default="cosine",
         description="Distance metric to use for comparison"
+    )
+
+class ConflictResolutionRequest(BaseModel):
+    """Request model for resolving behavior conflicts"""
+    conflict_id: str = Field(..., description="UUID of the conflict to resolve")
+    user_id: str = Field(..., description="User ID who owns the conflicting behaviors")
+    resolution_choice: Literal["OLD_WINS", "NEW_WINS", "BOTH_CORRECT"] = Field(
+        ...,
+        description="User's decision: OLD_WINS (keep existing), NEW_WINS (replace with new), BOTH_CORRECT (keep both)"
     )
 
 @asynccontextmanager
@@ -474,6 +483,82 @@ def calculate_similarity(request: BehaviorSimilarityRequest):
         )
     except Exception as e:
         logger.exception("Unexpected error during similarity calculation")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "success": False,
+                "data": None,
+                "error": f"Internal server error: {str(e)}"
+            }
+        )
+
+
+@app.post(
+    "/resolve-conflict",
+    summary="Resolve a behavior conflict",
+    description="Allows user to resolve a flagged behavior conflict by choosing which behavior(s) to keep",
+    response_description="Resolution result with updated behavior states"
+)
+def resolve_behavior_conflict(request: ConflictResolutionRequest):
+    """
+    Resolve a conflict based on user's decision.
+    
+    Resolution choices:
+    - OLD_WINS: Keep existing behavior (reinforced), invalidate new behavior (credibility = 0.0)
+    - NEW_WINS: Replace existing behavior (superseded), new behavior becomes ACTIVE
+    - BOTH_CORRECT: Keep both behaviors as ACTIVE (both reinforced)
+    
+    All resolutions update last_accessed_at to reflect active conflict resolution.
+    """
+    try:
+        logger.info(
+            f"Received conflict resolution request: "
+            f"conflict_id={request.conflict_id}, "
+            f"user_id={request.user_id}, "
+            f"choice={request.resolution_choice}"
+        )
+        
+        # Call the repository function to handle the resolution
+        result = resolve_conflict(
+            conflict_id=request.conflict_id,
+            user_id=request.user_id,
+            resolution_choice=request.resolution_choice
+        )
+        
+        logger.info(
+            f"Conflict {request.conflict_id} resolved successfully: "
+            f"{request.resolution_choice}"
+        )
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "data": result,
+                "error": None
+            }
+        )
+        
+    except ValueError as e:
+        logger.warning(f"Validation error: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "success": False,
+                "data": None,
+                "error": str(e)
+            }
+        )
+    except Exception as e:
+        logger.exception(f"Unexpected error resolving conflict {request.conflict_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "success": False,
+                "data": None,
+                "error": f"Internal server error: {str(e)}"
+            }
+        )
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={

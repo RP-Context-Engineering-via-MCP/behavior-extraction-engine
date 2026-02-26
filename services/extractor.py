@@ -27,7 +27,8 @@ from services.behaviorRepository import (
     reinforce_behavior,
     insert_conflict,
     supersede_behavior,
-    update_behavior_state
+    update_behavior_state,
+    update_behavior_access_time
 )
 from datetime import datetime
 import time
@@ -528,6 +529,8 @@ def _handle_polarity_conflict(
             f"AUTO-RESOLVE: Ignoring new behavior "
             f"(credibility: {initial_credibility:.2f} < {existing.credibility:.2f})"
         )
+        # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+        update_behavior_access_time(existing.behavior_id, user_id)
         return (True, True)
 
     # Case C: Ambiguous credibilities → LLM analysis needed
@@ -638,6 +641,8 @@ def _handle_potential_conflict(
         # Case B: Existing behavior wins, ignore new
         elif resolution_type == "IGNORE_NEW":
             logger.info("AUTO-RESOLVE: Ignoring new behavior")
+            # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+            update_behavior_access_time(existing.behavior_id, user_id)
             return (True, True)
 
         # Case C: Ambiguous credibilities → flag for user decision
@@ -1470,6 +1475,9 @@ def _process_candidate_with_tracking(
                 return (True, flow_info)
             
             elif resolution_type == "IGNORE_NEW":
+                # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+                update_behavior_access_time(existing.behavior_id, user_id)
+                
                 flow_info = BehaviorFlowInfo(
                     behavior_description=behavior_description,
                     action=BehaviorFlowAction.IGNORED_NEW,
@@ -1653,6 +1661,9 @@ def _process_candidate_with_tracking(
                 return (True, flow_info)
             
             elif resolution_type == "IGNORE_NEW":
+                # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+                update_behavior_access_time(existing.behavior_id, user_id)
+                
                 flow_info = BehaviorFlowInfo(
                     behavior_description=behavior_description,
                     action=BehaviorFlowAction.IGNORED_NEW,

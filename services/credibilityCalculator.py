@@ -1,6 +1,7 @@
 import logging
 import math
-from typing import Dict, Any, Optional
+import time
+from typing import Dict, Any, Optional, Tuple
 from config.configurations import (
     CREDIBILITY_WEIGHTS,
     DEFAULT_DECAY_RATE,
@@ -139,6 +140,109 @@ def get_decay_rate(behavior_text: str = None, intent: Optional[str] = None) -> f
         logger.warning(f"Unknown intent '{intent}', using default decay rate {DEFAULT_DECAY_RATE}")
     
     return DEFAULT_DECAY_RATE
+
+
+def apply_lazy_decay(
+    stored_credibility: float,
+    decay_rate: float,
+    last_decay_applied_at: Optional[int],
+    current_time: Optional[int] = None
+) -> Tuple[float, bool, int]:
+    """
+    Apply exponential decay to credibility based on full days elapsed.
+    
+    This implements a "lazy" decay mechanism where decay is calculated on-the-fly
+    when behaviors are retrieved, rather than through batch processing.
+    
+    IMPORTANT: Decay is only applied for FULL DAYS elapsed (86400 seconds = 1 day).
+    This prevents constant micro-adjustments and makes decay predictable.
+    
+    Formula: C_current = C_stored × e^(-λ × days_elapsed)
+    Where:
+    - C_stored: Credibility value stored in database
+    - λ (lambda): Decay rate (intent-based, per day)
+    - days_elapsed: Number of FULL days since last decay application
+    - e: Euler's number (~2.71828)
+    
+    Args:
+        stored_credibility: The credibility value currently in the database
+        decay_rate: Intent-based decay rate (λ) per day
+        last_decay_applied_at: Timestamp when decay was last applied (or grace period end)
+        current_time: Current timestamp (defaults to now if not provided)
+        
+    Returns:
+        Tuple of (new_credibility, decay_applied, days_elapsed):
+        - new_credibility: Calculated credibility after decay
+        - decay_applied: Whether decay was actually applied (False if < 1 full day)
+        - days_elapsed: Number of full days elapsed since last decay application
+        
+    Example:
+        >>> # If decay last applied today at 6am, retrieval at 5:59am tomorrow = no decay
+        >>> # If decay last applied today at 6am, retrieval at 6:00am tomorrow = 1 day decay
+        >>> stored_cred = 0.85
+        >>> decay_rate = 0.015  # PREFERENCE intent (per day)
+        >>> last_applied = int(time.time()) - (30 * 24 * 60 * 60)  # 30 days ago
+        >>> new_cred, applied, days = apply_lazy_decay(stored_cred, decay_rate, last_applied)
+        >>> # new_cred will reflect 30 full days of decay
+        
+    Notes:
+        - If last_decay_applied_at is None, no decay is applied
+        - If current_time < last_decay_applied_at, no decay (still in grace period)
+        - Decay only applied if at least 1 FULL day (86400 seconds) has elapsed
+        - Credibility is clamped to [0.0, 1.0] range
+        - Uses exponential decay for smooth, continuous degradation
+    """
+    # Constants
+    SECONDS_PER_DAY = 86400  # 24 * 60 * 60
+    
+    # Default to current time if not provided
+    if current_time is None:
+        current_time = int(time.time())
+    
+    # If last_decay_applied_at is not set, no decay can be applied
+    if last_decay_applied_at is None:
+        logger.debug("No last_decay_applied_at timestamp, skipping decay")
+        return (stored_credibility, False, 0)
+    
+    # If still in grace period, no decay
+    if current_time < last_decay_applied_at:
+        time_until_decay = last_decay_applied_at - current_time
+        logger.debug(
+            f"Still in grace period, {time_until_decay} seconds until decay starts"
+        )
+        return (stored_credibility, False, 0)
+    
+    # Calculate time elapsed since last decay application (in seconds)
+    time_elapsed_seconds = current_time - last_decay_applied_at
+    
+    # Calculate FULL DAYS elapsed (integer division)
+    days_elapsed = time_elapsed_seconds // SECONDS_PER_DAY
+    
+    # If less than 1 full day has elapsed, don't apply decay
+    if days_elapsed < 1:
+        logger.debug(
+            f"Less than 1 full day elapsed ({time_elapsed_seconds} seconds), "
+            f"skipping decay"
+        )
+        return (stored_credibility, False, 0)
+    
+    # Apply exponential decay formula: C_current = C_stored × e^(-λ × days)
+    decay_factor = math.exp(-decay_rate * days_elapsed)
+    new_credibility = stored_credibility * decay_factor
+    
+    # Clamp to valid range [0.0, 1.0]
+    new_credibility = max(0.0, min(1.0, new_credibility))
+    
+    # Calculate credibility loss for logging
+    credibility_loss = stored_credibility - new_credibility
+    
+    logger.info(
+        f"Lazy decay applied: {stored_credibility:.4f} → {new_credibility:.4f} "
+        f"(loss: {credibility_loss:.4f}, {days_elapsed} full days elapsed, "
+        f"decay_rate: {decay_rate}/day, factor: {decay_factor:.6f})"
+    )
+    
+    return (new_credibility, True, days_elapsed)
 
 
 def calculate_reinforcement_boost(
