@@ -58,7 +58,7 @@ function App() {
     try {
       const response = await extractDetailed({
         prompt: prompt,
-        session_id: sessionId,
+        user_id: sessionId,
         enable_llm_conflict_resolution: true
       });
 

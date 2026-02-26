@@ -279,12 +279,16 @@ def reinforce_behavior(
 
 
 
-def get_user_behaviors(user_id: str, include_states: List[str] = None) -> List[dict]:
+def get_user_behaviors(user_id: str, session_id: Optional[str] = None, include_states: List[str] = None) -> List[dict]:
     """
     Get all behaviors for a user
     
+    SESSION ISOLATION: If session_id is provided, only returns behaviors from that session.
+    If session_id is None, returns behaviors from all sessions.
+    
     Args:
         user_id: User identifier
+        session_id: Optional session identifier for filtering (None = all sessions)
         include_states: List of behavior states to include (defaults to ['ACTIVE', 'NEW'])
         
     Returns:
@@ -296,8 +300,8 @@ def get_user_behaviors(user_id: str, include_states: List[str] = None) -> List[d
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                # Build query with optional session_id filter
+                query = """
                     SELECT 
                         behavior_id,
                         user_id,
@@ -313,14 +317,22 @@ def get_user_behaviors(user_id: str, include_states: List[str] = None) -> List[d
                         intent,
                         target,
                         context,
-                        polarity
+                        polarity,
+                        session_id
                     FROM behaviors
                     WHERE user_id = %s
                     AND behavior_state = ANY(%s)
-                    ORDER BY created_at DESC;
-                    """,
-                    (user_id, include_states)
-                )
+                """
+                params = [user_id, include_states]
+                
+                # Add session_id filter if provided
+                if session_id is not None:
+                    query += " AND session_id = %s"
+                    params.append(session_id)
+                
+                query += " ORDER BY created_at DESC;"
+                
+                cur.execute(query, params)
                 
                 results = cur.fetchall()
                 
@@ -341,10 +353,12 @@ def get_user_behaviors(user_id: str, include_states: List[str] = None) -> List[d
                         'intent': row[11],
                         'target': row[12],
                         'context': row[13],
-                        'polarity': row[14]
+                        'polarity': row[14],
+                        'session_id': row[15]
                     })
                 
-                logger.debug(f"Found {len(behaviors)} behaviors for user {user_id}")
+                session_info = f" in session {session_id}" if session_id else " (all sessions)"
+                logger.debug(f"Found {len(behaviors)} behaviors for user {user_id}{session_info}")
                 return behaviors
                 
     except Exception as e:
@@ -355,13 +369,23 @@ def get_user_behaviors(user_id: str, include_states: List[str] = None) -> List[d
 def search_similar_behaviors(
         user_id: str, 
         query_embedding: List[float], 
+        session_id: str = "default",
         limit: int = 5
 ) -> List[SimilarityResult]:
     """
     Find behaviors similar to query embedding using cosine similarity.
     
+    SESSION ISOLATION: Only searches behaviors within the same session_id.
+    This ensures behaviors from different contexts (work, personal, etc.) don't interfere.
+    
     Applies lazy decay to credibility on-the-fly when retrieving behaviors.
     If decay is applied, updates the behavior in the database with new credibility.
+    
+    Args:
+        user_id: User identifier
+        query_embedding: Vector embedding to search against
+        session_id: Session identifier for isolation (defaults to "default")
+        limit: Maximum number of results to return
     
     Returns:
         List of SimilarityResult objects with classification and metadata
@@ -371,6 +395,7 @@ def search_similar_behaviors(
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
                 # Fetch behaviors with decay-related fields
+                # SESSION ISOLATION: Only search within the same session_id
                 cur.execute(
                     """
                     SELECT 
@@ -388,11 +413,12 @@ def search_similar_behaviors(
                         last_decay_applied_at
                     FROM behaviors
                     WHERE user_id = %s
+                    AND session_id = %s
                     AND behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED')
                     ORDER BY distance
                     LIMIT %s;
                     """,
-                    (query_embedding, user_id, limit)
+                    (query_embedding, user_id, session_id, limit)
                 )
                 
                 results = cur.fetchall()
@@ -456,7 +482,7 @@ def search_similar_behaviors(
                         f"Updated {len(behaviors_to_update)} behaviors with lazy decay"
                     )
                 
-                logger.debug(f"Found {len(similarity_results)} similar behaviors for user {user_id}")
+                logger.debug(f"Found {len(similarity_results)} similar behaviors for user {user_id} in session {session_id}")
                 return similarity_results
                 
     except Exception as e:
@@ -756,15 +782,19 @@ def update_behavior_access_time(
         return False
 
 
-def get_behaviors_by_user(user_id: str) -> List[dict]:
+def get_behaviors_by_user(user_id: str, session_id: Optional[str] = None) -> List[dict]:
     """
     Get all behaviors for a specific user.
+    
+    SESSION ISOLATION: If session_id is provided, only returns behaviors from that session.
+    If session_id is None, returns behaviors from all sessions.
     
     Applies lazy decay to credibility on-the-fly when retrieving behaviors.
     If decay is applied, updates the behavior in the database with new credibility.
     
     Args:
         user_id: The user identifier
+        session_id: Optional session identifier for filtering (None = all sessions)
         
     Returns:
         List of behavior dictionaries with all fields (credibility reflects decay)
@@ -772,8 +802,8 @@ def get_behaviors_by_user(user_id: str) -> List[dict]:
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
+                # Build query with optional session_id filter
+                query = """
                     SELECT 
                         behavior_id,
                         user_id,
@@ -797,10 +827,17 @@ def get_behaviors_by_user(user_id: str) -> List[dict]:
                         last_accessed_at
                     FROM behaviors
                     WHERE user_id = %s
-                    ORDER BY last_seen_at DESC
-                    """,
-                    (user_id,)
-                )
+                """
+                params = [user_id]
+                
+                # Add session_id filter if provided
+                if session_id is not None:
+                    query += " AND session_id = %s"
+                    params.append(session_id)
+                
+                query += " ORDER BY last_seen_at DESC"
+                
+                cur.execute(query, params)
                 
                 current_time = int(time.time())
                 behaviors = []
@@ -1069,10 +1106,11 @@ def resolve_conflict(
                         UPDATE behaviors
                         SET 
                             credibility = 0.0,
+                            behavior_state = %s,
                             last_accessed_at = %s
                         WHERE behavior_id = %s AND user_id = %s
                         """,
-                        (current_timestamp, behavior_id_2, user_id)
+                        (BehaviorState.SUPERSEDED.value, current_timestamp, behavior_id_2, user_id)
                     )
                     
                     logger.info(
