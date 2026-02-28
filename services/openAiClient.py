@@ -216,7 +216,7 @@ def extract_behavior(prompt: str) -> dict[str, any]:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.2, 
+            temperature=0.0, 
             max_tokens=5500,
             top_p=1.0,
             frequency_penalty=0.0,
@@ -268,6 +268,334 @@ def extract_behavior(prompt: str) -> dict[str, any]:
         extraction_time_ms = (time() - start_time) * 1000
         error_type = type(e).__name__
         return {
+            "segments": [],
+            "success": False,
+            "error": f"{error_type}: {str(e)}",
+            "metadata": {
+                "prompt_length": len(prompt),
+                "extraction_time_ms": round(extraction_time_ms, 2),
+                "tokens_used": 0
+            }
+        }
+
+
+def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> dict[str, any]:
+    """
+    Extract behaviors from a prompt AND enrich it to a standalone query using conversation history.
+    
+    This performs two simultaneous tasks:
+    1. Contextual Query Rewriting - converts prompt to standalone query for similarity search
+    2. Behavior Canonicalization - extracts long-term behaviors
+    
+    Args:
+        prompt: User's latest prompt (may contain references like "it", "that", "the above")
+        recent_history: List of recent conversation messages [{"role": "user"/"assistant", "text": "..."}]
+        
+    Returns:
+        dict with:
+            - standalone_query: str - The enriched standalone version of the prompt
+            - segments: list - Extracted behavior segments
+            - success: bool
+            - error: Optional[str]
+            - metadata: dict with timing and token info
+    """
+    if not prompt or not prompt.strip():
+        return {
+            "standalone_query": None,
+            "segments": [],
+            "success": False,
+            "error": "Prompt cannot be empty",
+            "metadata": {"prompt_length": 0, "extraction_time_ms": 0, "tokens_used": 0}
+        }
+    
+    prompt = prompt.strip()
+    
+    if len(prompt) < MIN_PROMPT_LENGTH:
+        return {
+            "standalone_query": None,
+            "segments": [],
+            "success": False,
+            "error": f"Prompt too short (min {MIN_PROMPT_LENGTH} chars)",
+            "metadata": {"prompt_length": len(prompt), "extraction_time_ms": 0, "tokens_used": 0}
+        }
+    
+    if len(prompt) > MAX_PROMPT_LENGTH:
+        return {
+            "standalone_query": None,
+            "segments": [],
+            "success": False,
+            "error": f"Prompt too long (max {MAX_PROMPT_LENGTH} chars)",
+            "metadata": {"prompt_length": len(prompt), "extraction_time_ms": 0, "tokens_used": 0}
+        }
+
+    system_prompt = """You are performing TWO tasks on user input:
+    
+    TASK 1: CONTEXTUAL QUERY REWRITING (if conversation history exists)
+    ---
+    Look at 'RECENT HISTORY' and 'LATEST PROMPT'. Rewrite the prompt into a self-contained query by:
+    - Resolving pronouns/references ("it", "that", "those") to specific entities from history
+    - Replacing vague terms with explicit context
+    - If already standalone, keep as-is
+    - Keep concise (10-30 words)
+    
+    Examples:
+    History: "I like Python and JavaScript" | Latest: "which is better for backend?" → "which is better for backend development: Python or JavaScript?"
+    History: "Popular frameworks include React, Angular, Vue" | Latest: "I prefer the first one" → "I prefer React framework"
+    
+    TASK 2: BEHAVIOR CANONICALIZATION
+    ---
+    Extract ONLY long-term, reusable user behaviors and represent them in a normalized, machine-reasonable form. A behavior MUST be stable across time. 
+    Do NOT extract temporary states or one-time requests.
+    ---
+    FOR EACH BEHAVIOR, YOU MUST PRODUCE A CANONICAL FORM WITH THESE FIELDS:
+    
+    1. intent (choose ONE that best fits - ordered by precedence):
+       - CONSTRAINT → Hard rules: cannot, must not, avoids, allergic to, restricted from, forbidden, never
+         ⚠️ CONSTRAINT behaviors are HARD RULES that can override other intent types!
+         Examples: "never use eval()", "cannot eat gluten", "must not work weekends"
+       - PREFERENCE → Soft desires: likes, prefers, enjoys, favors, interested in
+       - HABIT → Frequency patterns: usually, always, regularly, tends to, routinely
+       - SKILL → Capabilities: experienced with, proficient in, knows, capable of, expert in
+       - COMMUNICATION → Interaction style: prefers brief answers, wants examples, needs context
+    
+    2. target (CRITICAL - must be CONCISE, NOUN-LIKE, and CANONICALLY NAMED):
+       ✓ GOOD: "Python", "dark mode", "spicy food", "morning exercise", "lactose"
+       ✗ BAD: "writing CSS directly", "using Python for backend", "eating spicy food always", "lactose intolerance"
+       
+       CANONICALIZATION RULES (VERY IMPORTANT):
+       - Always use the FULL, STANDARD, MOST WIDELY RECOGNIZED name
+       - NEVER use abbreviations, acronyms, or shorthand for the target
+       - Convert all variations to the canonical form:
+         
+         Programming Languages & Technologies:
+         * JS, js → "JavaScript"
+         * TS, ts → "TypeScript"  
+         * PY, py → "Python"
+         * C# → "C Sharp"
+         * CPP, cpp, C++ → "C Plus Plus"
+         * RB, rb → "Ruby"
+         * Go, golang → "Go"
+         * K8s, k8 → "Kubernetes"
+         * DB, db → "database"
+         * SQL, sql → "SQL"
+         * NoSQL, nosql → "NoSQL"
+         * API, api → "API"
+         * REST, rest → "REST API"
+         * GraphQL, gql → "GraphQL"
+         * HTML, html → "HTML"
+         * CSS, css → "CSS"
+         * SCSS, scss → "SCSS"
+         
+         General:
+         * TDD, tdd → "test-driven development"
+         * OOP, oop → "object-oriented programming"
+         * FP, fp → "functional programming"
+         * CI/CD, cicd → "CI/CD"
+         * PR, pr (code context) → "pull request"
+         * WFH, wfh → "remote work"
+         * AM, am → "morning"
+         * PM, pm → "afternoon"
+       
+       - Extract the CORE NOUN or noun phrase (1-3 words maximum)
+       - Remove verbs, articles, and modifiers
+       - Use lowercase for common nouns, proper case for proper nouns
+    
+    3. context (optional scope where behavior applies):
+       - Programming: "IDE", "frontend", "backend", "testing", "code review", "debugging"
+       - Work: "work", "meetings", "presentations", "team collaboration"
+       - Time: "morning", "night", "weekends", "weekdays"
+       - Environment: "home", "office", "gym", "outdoors"
+       - If no specific context, use "general"
+       - DO NOT invent context - only extract if explicitly mentioned
+    
+    4. polarity (behavioral direction):
+       - POSITIVE → likes, prefers, wants, enjoys, seeks, uses, enables
+       - NEGATIVE → dislikes, avoids, cannot, restricts, rejects, disables, never
+    
+    5. confidence, clarity, linguistic_strength (all 0.0-1.0):
+       - confidence: How certain you are this is a stable behavior (not a question or temporary state)
+       - clarity: How clear and unambiguous the statement is
+       - linguistic_strength: Intensity of user's language
+         * Strong indicators → 0.8-1.0: "strongly", "always", "never", "absolutely", "definitely", "must", "cannot"
+         * Normal preference → 0.6-0.8: "prefer", "like", "usually", "generally"
+         * Mild → 0.4-0.6: "tend to", "somewhat", "kind of", "sometimes"
+         * Weak/uncertain → <0.4: "might", "maybe", "could", "possibly"
+         
+         ⚠️ CONSTRAINT intent should typically have high linguistic_strength (0.8+)
+    ---
+    OUTPUT FORMAT (STRICT JSON - use these EXACT field names):
+    
+    {
+      "standalone_query": "The fully resolved, decontextualized version of the LATEST PROMPT",
+      "segments": [
+        {
+          "text": "original segment text",
+          "behaviors": [
+            {
+              "description": "concise human-readable summary (e.g., 'prefers Python for backend')",
+              "intent": "PREFERENCE",
+              "target": "Python",
+              "context": "backend",
+              "polarity": "POSITIVE",
+              "confidence": 0.92,
+              "clarity": 0.88,
+              "linguistic_strength": 0.75
+            }
+          ]
+        }
+      ]
+    }
+    
+    CRITICAL RULES:
+    - standalone_query is MANDATORY - always provide it
+    - Target must be CONCISE (1-3 words) - the noun, not the whole phrase
+    - Target must use CANONICAL/FULL form - NEVER abbreviations (JavaScript not JS)
+    - Use field name "linguistic_strength" (NOT "strength")
+    - If no stable behavior exists, return empty behaviors list
+    - Do NOT invent context if not mentioned
+    - Do NOT include extra fields or explanations
+    - All scores must be between 0.0 and 1.0
+    - CONSTRAINT behaviors represent hard rules and should have high linguistic_strength
+    - Do NOT extract background context as behaviors (e.g., "I'm a software engineer" is not a behavior)
+    
+    ⚠️ COMPARATIVE STATEMENTS: For "X over Y" or "X instead of Y" statements:
+    - Extract ONLY the PREFERRED option (X) with POSITIVE polarity
+    - Do NOT extract the rejected option (Y) as a separate behavior
+    - Examples:
+      * "I prefer TypeScript over JavaScript" → Extract ONLY TypeScript POSITIVE
+      * "I like Angular instead of React" → Extract ONLY Angular POSITIVE
+      * "I don't like React, prefer Angular" → Extract ONLY Angular POSITIVE
+    - This prevents creating multiple conflicting behaviors from a single preference statement
+    
+    MULTI-DOMAIN EXAMPLES:
+    
+    Input: "I'm vegetarian and cannot eat meat"
+    Output: {"intent": "CONSTRAINT", "target": "meat", "context": "general", "polarity": "NEGATIVE", "linguistic_strength": 0.9}
+    
+    Input: "I prefer working from home in the mornings"
+    Output: {"intent": "PREFERENCE", "target": "remote work", "context": "morning", "polarity": "POSITIVE", "linguistic_strength": 0.7}
+    
+    Input: "I always do yoga before breakfast"
+    Output: {"intent": "HABIT", "target": "yoga", "context": "morning", "polarity": "POSITIVE", "linguistic_strength": 0.85}
+    
+    Input: "I'm experienced with AWS cloud infrastructure"
+    Output: {"intent": "SKILL", "target": "AWS", "context": "cloud infrastructure", "polarity": "POSITIVE", "linguistic_strength": 0.75}
+    
+    Input: "I like JS for frontend development"
+    Output: {"intent": "PREFERENCE", "target": "JavaScript", "context": "frontend", "polarity": "POSITIVE", "linguistic_strength": 0.65}
+    ⚠️ Note: "JS" was normalized to "JavaScript"
+    
+    Input: "Never use eval() in production code"
+    Output: {"intent": "CONSTRAINT", "target": "eval function", "context": "production", "polarity": "NEGATIVE", "linguistic_strength": 0.95}
+    ⚠️ Note: "Never" indicates CONSTRAINT with high linguistic_strength
+    
+    Input: "I prefer TypeScript over JavaScript for frontend"
+    Output: {"intent": "PREFERENCE", "target": "TypeScript", "context": "frontend", "polarity": "POSITIVE", "linguistic_strength": 0.7}
+    ⚠️ Note: Comparative statement - only extract the PREFERRED option (TypeScript), not the rejected one
+    
+    Input: "I like Angular instead of React"
+    Output: {"intent": "PREFERENCE", "target": "Angular", "context": "general", "polarity": "POSITIVE", "linguistic_strength": 0.65}
+    ⚠️ Note: Extract only the preferred choice (Angular)
+    
+    Input: "Maybe I should try using JavaScript for backend"
+    Output: {"intent": "PREFERENCE", "target": "JavaScript", "context": "backend", "polarity": "POSITIVE", "confidence": 0.35, "clarity": 0.4, "linguistic_strength": 0.3}
+    ⚠️ Note: Weak/uncertain statement - still extract but with low scores to reflect uncertainty
+    
+    Input: "I am a software engineer who work late nights. I have decided to go for a 1h walk every morning. Note that I have lactose intolerance."
+    Output: 
+    {
+      "standalone_query": "software engineer working late nights decides to walk 1 hour every morning, has lactose intolerance",
+      "segments": [
+        {"text": "I have decided to go for a 1h walk every morning", "behaviors": [{"intent": "HABIT", "target": "morning walk", "context": "morning", "polarity": "POSITIVE", ...}]},
+        {"text": "I have lactose intolerance", "behaviors": [{"intent": "CONSTRAINT", "target": "lactose", "context": "general", "polarity": "NEGATIVE", ...}]}
+      ]
+    }
+    ⚠️ Note: "software engineer working late nights" is background context, NOT extracted as behavior. "lactose intolerance" → target is "lactose" (not "lactose intolerance")
+    """
+
+    # Build conversation context
+    user_content = "RECENT HISTORY:\n"
+    if recent_history and len(recent_history) > 0:
+        for msg in recent_history:
+            role = msg.get("role", "user")
+            text = msg.get("text", "")
+            user_content += f'[{role.upper()}]: "{text}"\n'
+    else:
+        user_content += "[No prior history]\n"
+    
+    user_content += f'\nLATEST PROMPT:\n{prompt}'
+
+    start_time = time()
+    try:
+        response = client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.0, 
+            max_tokens=5500,
+            top_p=1.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            response_format={"type": "json_object"}
+        )
+        
+        extraction_time_ms = int((time() - start_time) * 1000)
+        token_used = response.usage.total_tokens if response.usage else 0
+        content = response.choices[0].message.content
+
+        if not content:
+            return {
+                "standalone_query": None,
+                "segments": [],
+                "success": False,
+                "error": "Empty response from GPT",
+                "metadata": {
+                    "prompt_length": len(prompt),
+                    "extraction_time_ms": extraction_time_ms,
+                    "tokens_used": token_used
+                }
+            }   
+           
+        result = json.loads(content)
+        
+        # Validate that standalone_query exists
+        standalone_query = result.get("standalone_query")
+        if not standalone_query or not standalone_query.strip():
+            logger.warning("LLM did not provide standalone_query, using original prompt")
+            standalone_query = prompt
+
+        return {
+            "standalone_query": standalone_query.strip(),
+            "segments": result.get("segments", []),
+            "success": True,
+            "error": None,
+            "metadata": {
+                "prompt_length": len(prompt),
+                "extraction_time_ms": round(extraction_time_ms, 2),
+                "tokens_used": token_used
+            }
+        }
+    
+    except json.JSONDecodeError as e:
+        extraction_time_ms = (time() - start_time) * 1000
+        return {
+            "standalone_query": None,
+            "segments": [],
+            "success": False,
+            "error": f"Failed to parse GPT response as JSON: {str(e)}",
+            "metadata": {
+                "prompt_length": len(prompt),
+                "extraction_time_ms": round(extraction_time_ms, 2),
+                "tokens_used": 0
+            }
+        }
+    except Exception as e:
+        extraction_time_ms = (time() - start_time) * 1000
+        error_type = type(e).__name__
+        return {
+            "standalone_query": None,
             "segments": [],
             "success": False,
             "error": f"{error_type}: {str(e)}",
