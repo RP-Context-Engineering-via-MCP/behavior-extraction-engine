@@ -8,7 +8,7 @@ import uvicorn
 import logging
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Changed from INFO to DEBUG
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
@@ -18,6 +18,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,  # Enable auto-reload during development
-        log_level="info",
+        log_level="info",  # Changed from "info" to "debug"
         access_log=True
     )

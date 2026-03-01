@@ -171,6 +171,7 @@ def run_behavior_extraction(prompt: str) -> ExtractionResult:
     
     except KeyError as e:
         # Missing required field in response
+        logger.error(f"Invalid response structure: missing field {str(e)}")
         return ExtractionResult(
             segments=[],
             success=False,
@@ -180,6 +181,7 @@ def run_behavior_extraction(prompt: str) -> ExtractionResult:
     
     except Exception as e:
         # Pydantic validation error or other unexpected error
+        logger.error(f"Failed to validate extraction result: {str(e)}")
         return ExtractionResult(
             segments=[],
             success=False,
@@ -227,7 +229,7 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
         "which is better for backend development: Python or JavaScript?"
     """
     raw_response = extract_behavior_with_history(prompt, recent_history)
-
+    
     if not raw_response.get("success", False):
         return ExtractionResult(
             segments=[],
@@ -275,17 +277,25 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
             logger.warning("No standalone_query in response, using original prompt")
             standalone_query = prompt
         
-        # Return successful extraction result with standalone query
+        # Extract required_intents for hybrid retrieval (3D search)
+        required_intents = raw_response.get("required_intents")
+        if not required_intents or not isinstance(required_intents, list):
+            logger.warning("No required_intents in response, using default [PREFERENCE, CONSTRAINT]")
+            required_intents = ["PREFERENCE", "CONSTRAINT"]
+        
+        # Return successful extraction result with standalone query and required intents
         return ExtractionResult(
             segments=validated_segments,
             success=True,
             error=None,
             extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
-            standalone_query=standalone_query.strip()
+            standalone_query=standalone_query.strip(),
+            required_intents=required_intents
         )
     
     except KeyError as e:
         # Missing required field in response
+        logger.error(f"Invalid response structure: missing field {str(e)}")
         return ExtractionResult(
             segments=[],
             success=False,
@@ -296,6 +306,7 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
     
     except Exception as e:
         # Pydantic validation error or other unexpected error
+        logger.error(f"Failed to validate extraction result: {e}")
         return ExtractionResult(
             segments=[],
             success=False,

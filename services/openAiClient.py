@@ -330,7 +330,27 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> di
 
     system_prompt = """You are performing TWO tasks on user input:
     
-    TASK 1: CONTEXTUAL QUERY REWRITING (if conversation history exists)
+    ⚠️ CRITICAL: Extract behaviors ONLY from 'LATEST PROMPT', NOT from 'RECENT HISTORY'!
+    Recent history is ONLY for query rewriting (TASK 2), NOT for behavior extraction!
+    
+    TASK 1: BEHAVIOR EXTRACTION FROM LATEST PROMPT ONLY
+    ---
+    Extract ONLY long-term, reusable user behaviors from the 'LATEST PROMPT' and represent them in a normalized, machine-reasonable form.
+    
+    ⚠️ STRICT RULE: Do NOT extract behaviors from 'RECENT HISTORY'! 
+    - History messages have ALREADY been processed by the system
+    - Extracting from history causes false reinforcement of existing behaviors
+    - ONLY analyze the 'LATEST PROMPT' for NEW behaviors
+    
+    A behavior MUST be stable across time. 
+    Do NOT extract temporary states, questions, or one-time requests.
+    
+    Examples of what NOT to extract:
+    - Questions: "which is better?", "what do you recommend?"
+    - Requests: "tell me about...", "explain..."
+    - Temporary states: "I'm hungry right now", "currently working on..."
+    
+    TASK 2: CONTEXTUAL QUERY REWRITING (using history for context)
     ---
     Look at 'RECENT HISTORY' and 'LATEST PROMPT'. Rewrite the prompt into a self-contained query by:
     - Resolving pronouns/references ("it", "that", "those") to specific entities from history
@@ -341,11 +361,6 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> di
     Examples:
     History: "I like Python and JavaScript" | Latest: "which is better for backend?" → "which is better for backend development: Python or JavaScript?"
     History: "Popular frameworks include React, Angular, Vue" | Latest: "I prefer the first one" → "I prefer React framework"
-    
-    TASK 2: BEHAVIOR CANONICALIZATION
-    ---
-    Extract ONLY long-term, reusable user behaviors and represent them in a normalized, machine-reasonable form. A behavior MUST be stable across time. 
-    Do NOT extract temporary states or one-time requests.
     ---
     FOR EACH BEHAVIOR, YOU MUST PRODUCE A CANONICAL FORM WITH THESE FIELDS:
     
@@ -427,9 +442,10 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> di
     
     {
       "standalone_query": "The fully resolved, decontextualized version of the LATEST PROMPT",
+      "required_intents": ["CONSTRAINT", "PREFERENCE"],
       "segments": [
         {
-          "text": "original segment text",
+          "text": "original segment text FROM LATEST PROMPT ONLY",
           "behaviors": [
             {
               "description": "concise human-readable summary (e.g., 'prefers Python for backend')",
@@ -446,12 +462,26 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> di
       ]
     }
     
-    CRITICAL RULES:
+    REQUIRED_INTENTS RULES:
+    - Predict which behavior intent types are RELEVANT to the user's query for retrieval
+    - This determines which stored behaviors should be searched
+    - Use the standalone_query to decide what intent types matter:
+      * Food/diet queries → ["CONSTRAINT", "PREFERENCE"] (allergies + food preferences)
+      * Coding queries → ["PREFERENCE", "SKILL", "CONSTRAINT"] (tools, skills, restrictions)
+      * Routine/schedule queries → ["HABIT", "CONSTRAINT"] (routines + restrictions)
+      * Communication queries → ["COMMUNICATION", "PREFERENCE"]
+      * General queries → ["PREFERENCE", "CONSTRAINT"] (safe default)
+    - ALWAYS include "CONSTRAINT" — constraints (allergies, restrictions) are safety-critical
+    - Return 2-3 intent types maximum
+    
+    ⚠️ CRITICAL RULES:
+    - Extract behaviors ONLY from 'LATEST PROMPT' - NEVER from 'RECENT HISTORY'!
+    - If LATEST PROMPT is a question or has no behaviors, return empty segments list []
     - standalone_query is MANDATORY - always provide it
     - Target must be CONCISE (1-3 words) - the noun, not the whole phrase
     - Target must use CANONICAL/FULL form - NEVER abbreviations (JavaScript not JS)
     - Use field name "linguistic_strength" (NOT "strength")
-    - If no stable behavior exists, return empty behaviors list
+    - If no stable behavior exists in LATEST PROMPT, return empty behaviors list
     - Do NOT invent context if not mentioned
     - Do NOT include extra fields or explanations
     - All scores must be between 0.0 and 1.0
@@ -511,6 +541,31 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> di
       ]
     }
     ⚠️ Note: "software engineer working late nights" is background context, NOT extracted as behavior. "lactose intolerance" → target is "lactose" (not "lactose intolerance")
+    
+    ⚠️ CRITICAL EXAMPLE - Behavior Extraction with History:
+    
+    RECENT HISTORY:
+    [USER]: "I like healthy breakfast options like oatmeal and fruits."
+    [ASSISTANT]: "Great! Oatmeal with berries, or a banana smoothie are excellent choices."
+    
+    LATEST PROMPT: "among above what is the sweetest food"
+    
+    CORRECT Output:
+    {
+      "standalone_query": "Which is the sweetest food among oatmeal and fruits?",
+      "segments": []
+    }
+    
+    ⚠️ WHY segments is empty:
+    - Latest prompt is a QUESTION, not a behavior statement
+    - "I like healthy breakfast..." is in HISTORY and was ALREADY PROCESSED - DO NOT extract it again!
+    - Extracting from history causes false reinforcement
+    
+    WRONG Output (DO NOT DO THIS):
+    {
+      "standalone_query": "Which is the sweetest food among oatmeal and fruits?",
+      "segments": [{"text": "I like healthy breakfast options...", "behaviors": [...]}]  ❌ WRONG! This is from history!
+    }
     """
 
     # Build conversation context
@@ -566,8 +621,17 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> di
             logger.warning("LLM did not provide standalone_query, using original prompt")
             standalone_query = prompt
 
+        # Extract required_intents with safe default
+        required_intents = result.get("required_intents", ["PREFERENCE", "CONSTRAINT"])
+        # Validate intent values
+        valid_intents = {"PREFERENCE", "CONSTRAINT", "HABIT", "SKILL", "COMMUNICATION"}
+        required_intents = [i for i in required_intents if i in valid_intents]
+        if not required_intents:
+            required_intents = ["PREFERENCE", "CONSTRAINT"]
+
         return {
             "standalone_query": standalone_query.strip(),
+            "required_intents": required_intents,
             "segments": result.get("segments", []),
             "success": True,
             "error": None,

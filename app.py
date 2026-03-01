@@ -1,12 +1,12 @@
-from fastapi import FastAPI, status, Query
+from fastapi import FastAPI, status, Query, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from services.extractor import run_behavior_extraction, run_behavior_extraction_with_history, store_behavior, store_behavior_with_tracking
-from services.behaviorRepository import insert_behavior, search_similar_behaviors, get_behaviors_by_user, get_user_conflicts, resolve_conflict
+from services.behaviorRepository import insert_behavior, search_similar_behaviors, search_similar_behavior_3D, persist_retrieval_updates_batch, get_behaviors_by_user, get_user_conflicts, resolve_conflict
 from models.behavior import ExtractRequest, ExtractRequestWithHistory, HistoryMessage
 from db.connection import close_db_pool, init_db_pool
-from config.configurations import RELATED_BEHAVIORS_DISTANCE_THRESHOLD
+from config.configurations import RELATED_BEHAVIORS_DISTANCE_THRESHOLD, HYBRID_SCORE_THRESHOLD
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -566,28 +566,56 @@ def resolve_behavior_conflict(request: ConflictResolutionRequest):
             }
         )
 
+def _store_behaviors_async(extraction_result, user_id: str, session_id: str):
+    """
+    Background task for storing behaviors with conflict detection and reinforcement.
+    This runs asynchronously after the response has been sent to the client.
+    """
+    try:
+        stored_behaviors = store_behavior(
+            extraction_result,
+            user_id=user_id,
+            session_id=session_id
+        )
+        logger.info(f"[ASYNC] Successfully stored {len(stored_behaviors)} behaviors for user: {user_id}")
+    except Exception as e:
+        logger.error(f"[ASYNC] Failed to store behaviors for user {user_id}: {str(e)}")
+
+
 @app.post(
     "/v2/extract",
-    summary="Extract behaviors with conversation history and enrich prompt for similarity search",
+    summary="Extract behaviors with conversation history and retrieve related behaviors (optimized)",
     description="""
-    Analyzes a natural language prompt with conversation history to:
-    1. Extract user behaviors, preferences, and patterns
-    2. Enrich the prompt to a standalone query for effective similarity search
+    Optimized endpoint that prioritizes fast response with related behaviors.
+    
+    Workflow:
+    1. Extract behaviors from prompt with conversation history
+    2. Enrich prompt to standalone query for similarity search
+    3. Search and return related behaviors IMMEDIATELY
+    4. Store extracted behaviors asynchronously in background (conflict detection, reinforcement)
     
     This endpoint resolves contextual references (e.g., "it", "that", "the above") 
     using the recent conversation history, making the prompt fully self-contained 
     for better semantic search against stored behaviors.
+    
+    Response contains ONLY related behaviors from the database, optimized for speed.
     """,
-    response_description="Extraction result with standalone query and segmented behaviors"
+    response_description="Related behaviors from similarity search (fast response)"
 )
-def extract_behaviors_with_history(request: ExtractRequestWithHistory):
+def extract_behaviors_with_history(request: ExtractRequestWithHistory, background_tasks: BackgroundTasks):
     """
-    Extract behaviors from a prompt with conversation history.
+    Extract behaviors from a prompt with conversation history and return related behaviors quickly.
+    
+    Optimized for speed by:
+    - Returning related behaviors immediately after similarity search
+    - Running behavior storage (conflict detection, reinforcement) asynchronously
+    - Excluding extracted/stored behavior details from response
     
     This endpoint is useful when:
     - The prompt contains references like "it", "that", "those", "the above"
     - The prompt depends on previous conversation context
     - You need a standalone query for similarity search
+    - You need the fastest possible response with related behaviors
     
     Example payload:
     {
@@ -611,7 +639,7 @@ def extract_behaviors_with_history(request: ExtractRequestWithHistory):
                 for msg in request.recent_history
             ]
         
-        # Run extraction with history
+        # STEP 1: Extract behaviors and get standalone query (LLM call - cannot optimize)
         extraction_result = run_behavior_extraction_with_history(
             prompt=request.prompt,
             recent_history=history_dicts
@@ -628,80 +656,11 @@ def extract_behaviors_with_history(request: ExtractRequestWithHistory):
                 }
             )
         
-        # Store extracted behaviors
-        stored_behaviors = []
-        try:
-            stored_behaviors = store_behavior(
-                extraction_result,
-                user_id=request.user_id,
-                session_id=request.session_id
-            )
-            logger.info(f"Stored {len(stored_behaviors)} behaviors for user: {request.user_id}")
-        except Exception as e:
-            logger.error(f"Failed to store behaviors: {str(e)}")
-            # Continue even if storage fails
-        
-        total_behaviors = sum(len(seg.behaviors) for seg in extraction_result.segments)
-        logger.info(
-            f"Extraction successful: {len(extraction_result.segments)} segments, "
-            f"{total_behaviors} behaviors, standalone_query generated"
-        )
+        logger.info(f"Extraction process is successful. extracted results : {extraction_result.model_dump_json(indent=2)}")
 
-        # Prepare extracted behaviors data with canonical fields (same as extract_behaviors)
-        segments_data = [
-            {
-                "text": segment.text,
-                "behaviors": [
-                    {
-                        "description": behavior.description,
-                        "confidence": behavior.confidence,
-                        "clarity": behavior.clarity,
-                        "linguistic_strength": behavior.linguistic_strength,
-                        "extracted_at": behavior.extracted_at,
-                        # Canonical fields extracted by LLM
-                        "canonical": {
-                            "intent": behavior.intent,
-                            "target": behavior.target,
-                            "context": behavior.context,
-                            "polarity": behavior.polarity
-                        }
-                    }
-                    for behavior in segment.behaviors
-                ]
-            }
-            for segment in extraction_result.segments
-        ]
-
-        # Prepare stored behaviors data with all fields including canonical (same as extract_behaviors)
-        stored_behaviors_data = [
-            {
-                "behavior_id": stored_behavior.behavior_id,
-                "user_id": stored_behavior.user_id,
-                "behavior_text": stored_behavior.behavior_text,
-                "credibility": stored_behavior.credibility,
-                "reinforcement_count": stored_behavior.reinforcement_count,
-                "decay_rate": stored_behavior.decay_rate,
-                "created_at": stored_behavior.created_at,
-                "last_seen_at": stored_behavior.last_seen_at,
-                "prompt_history_ids": stored_behavior.prompt_history_ids,
-                "clarity_score": stored_behavior.clarity_score,
-                "extraction_confidence": stored_behavior.extraction_confidence,
-                "linguistic_strength": stored_behavior.linguistic_strength,
-                "session_id": stored_behavior.session_id,
-                "embedding_dimensions": len(stored_behavior.embedding) if stored_behavior.embedding else 0,
-                # Canonical fields (for structured behavior reasoning)
-                "canonical": {
-                    "intent": stored_behavior.intent,
-                    "target": stored_behavior.target,
-                    "context": stored_behavior.context,
-                    "polarity": stored_behavior.polarity
-                }
-            }
-            for stored_behavior in stored_behaviors
-        ]
-        
-        # Enrich using standalone query if available
+        # STEP 2: Search for related behaviors using 3D hybrid retrieval (FAST - priority)
         related_behaviors = []
+        hybrid_response = None
         if extraction_result.standalone_query:
             try:
                 from services.openAiClient import embed_text
@@ -709,13 +668,21 @@ def extract_behaviors_with_history(request: ExtractRequestWithHistory):
                 # Use the enriched standalone query for similarity search
                 query_embedding = embed_text(extraction_result.standalone_query)
                 
-                # Search with higher limit and filter by relevance threshold
-                # Distance ranges: 0.0-0.4 (very similar), 0.4-0.7 (related), 0.7+ (unrelated)
-                similar_behaviors = search_similar_behaviors(
+                # 3D Hybrid Search: Dense (semantic) + Sparse (BM25) + Metadata (intent filter)
+                hybrid_response = search_similar_behavior_3D(
                     user_id=request.user_id,
                     query_embedding=query_embedding,
+                    query_text=extraction_result.standalone_query,
                     session_id=request.session_id,
-                    limit=20  # Get more candidates, filter by distance
+                    required_intents=extraction_result.required_intents
+                )
+                logger.info(f"[3D] Found {len(hybrid_response.results)} similar behaviors for standalone query: '{extraction_result.standalone_query}'")
+                logger.info(f"[3D] Required intents boost: {extraction_result.required_intents}")
+
+                logger.info(
+                    f"[3D] Hybrid search returned {len(hybrid_response.results)} results, "
+                    f"{len(hybrid_response.decay_updates)} pending decay updates, "
+                    f"{len(hybrid_response.accessed_behavior_ids)} access timestamps to update"
                 )
                 
                 # Filter by relevance threshold
@@ -724,48 +691,58 @@ def extract_behaviors_with_history(request: ExtractRequestWithHistory):
                         "behavior_id": b.behavior_id,
                         "behavior_text": b.behavior_text,
                         "distance": b.distance,
-                        "credibility": b.credibility,
-                        "reinforcement_count": b.reinforcement_count,
                         "intent": b.intent,
                         "target": b.target,
                         "context": b.context,
-                        "polarity": b.polarity
+                        "polarity": b.polarity,
+                        "credibility": b.credibility,
                     }
-                    for b in similar_behaviors
-                    if b.distance <= RELATED_BEHAVIORS_DISTANCE_THRESHOLD  # Only include related behaviors
+                    for b in hybrid_response.results
+                    if b.distance <= RELATED_BEHAVIORS_DISTANCE_THRESHOLD
                 ]
                 
                 logger.info(
-                    f"Found {len(related_behaviors)} related behaviors "
-                    f"(filtered {len(similar_behaviors) - len(related_behaviors)} unrelated, "
-                    f"threshold: {RELATED_BEHAVIORS_DISTANCE_THRESHOLD})"
+                    f"[3D] Returning {len(related_behaviors)} related behaviors "
+                    f"(filtered {len(hybrid_response.results) - len(related_behaviors)} below threshold, "
+                    f"distance_threshold: {RELATED_BEHAVIORS_DISTANCE_THRESHOLD})"
                 )
             except Exception as e:
                 logger.error(f"Failed to search related behaviors: {str(e)}")
+        
+        # STEP 3: Schedule behavior storage in background (ASYNC - non-blocking)
+        background_tasks.add_task(
+            _store_behaviors_async,
+            extraction_result,
+            request.user_id,
+            request.session_id
+        )
+        logger.info(f"Scheduled async storage of behaviors for user: {request.user_id}")
+        
+        # STEP 3b: Schedule retrieval updates in background (decay persistence + last_accessed_at)
+        if hybrid_response and (hybrid_response.decay_updates or hybrid_response.accessed_behavior_ids):
+            background_tasks.add_task(
+                persist_retrieval_updates_batch,
+                hybrid_response.decay_updates,
+                hybrid_response.accessed_behavior_ids,
+                request.user_id
+            )
+            logger.info(
+                f"Scheduled async retrieval updates: "
+                f"{len(hybrid_response.decay_updates)} decay updates, "
+                f"{len(hybrid_response.accessed_behavior_ids)} access timestamps"
+            )
 
+        # STEP 4: Return response IMMEDIATELY with related behaviors only
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
                 "success": True,
                 "data": {
-                    # NEW: Standalone query for similarity search
                     "standalone_query": extraction_result.standalone_query,
+                    "required_intents": extraction_result.required_intents,
                     "original_prompt": request.prompt,
-                    # Standard extraction data (same as /extract endpoint)
-                    "extraction": {
-                        "segments": segments_data,
-                        "extraction_time_ms": extraction_result.extraction_time,
-                        "total_segments": len(extraction_result.segments),
-                        "total_behaviors_extracted": total_behaviors
-                    },
-                    # Standard storage data (same as /extract endpoint)
-                    "storage": {
-                        "stored_behaviors": stored_behaviors_data,
-                        "total_behaviors_stored": len(stored_behaviors),
-                        "behaviors_filtered": total_behaviors - len(stored_behaviors)
-                    },
-                    # NEW: Related behaviors from similarity search using enriched query
                     "related_behaviors": related_behaviors,
+                    "extraction_time_ms": extraction_result.extraction_time,
                     "user_id": request.user_id
                 },
                 "error": None

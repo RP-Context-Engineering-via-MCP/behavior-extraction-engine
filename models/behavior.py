@@ -77,6 +77,10 @@ class ExtractionResult(BaseModel):
         None,
         description="Enriched standalone version of the prompt for similarity search (with conversation context resolved)"
     )
+    required_intents: Optional[List[str]] = Field(
+        default=None,
+        description="LLM-predicted intent types relevant to the query for metadata pre-filtering (e.g., ['CONSTRAINT', 'PREFERENCE'])"
+    )
 
 
 class StoredBehavior(BaseModel):
