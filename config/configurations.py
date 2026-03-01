@@ -113,3 +113,31 @@ HYBRID_SCORE_THRESHOLD = 0.10
 # in the top result — a 40% gap would kill equally relevant behaviors that
 # simply lack exact keyword overlap.
 RELEVANCE_GAP_DROP_RATIO = 0.55
+
+# Soft cap: maximum number of results returned after gap cutoff filtering.
+# Prevents over-retrieval for broad/vague queries where many behaviors
+# cluster in a similar score range and gap cutoff alone can't prune them.
+# Test 4 showed Phase 3 averaging 14.2 behaviors/query with peaks of 27.
+MAX_RETRIEVAL_RESULTS = 20
+
+# All known intent types for behavioral classification
+ALL_INTENT_TYPES = ["HABIT", "PREFERENCE", "CONSTRAINT", "SKILL", "COMMUNICATION"]
+
+# Intent affinity matrix: graduated boost for related (but non-matching) intents.
+# Key: frozenset of two intent types (symmetric relationship)
+# Value: affinity score 0.0-1.0 (how related the intents are)
+# Exact match always gets 1.0 (handled separately). These cover cross-intent relevance.
+# Example: A HABIT behavior about vitamins is relevant when searching for CONSTRAINTs
+#          about health, so HABIT<->CONSTRAINT affinity = 0.50.
+INTENT_AFFINITY = {
+    frozenset({"HABIT", "CONSTRAINT"}): 0.50,        # routines <-> restrictions (health, exercise)
+    frozenset({"HABIT", "PREFERENCE"}): 0.40,        # habits often reflect preferences
+    frozenset({"PREFERENCE", "CONSTRAINT"}): 0.35,   # preferences <-> restrictions overlap
+    frozenset({"COMMUNICATION", "PREFERENCE"}): 0.30,
+    frozenset({"COMMUNICATION", "HABIT"}): 0.20,
+    frozenset({"SKILL", "HABIT"}): 0.20,
+    frozenset({"SKILL", "PREFERENCE"}): 0.15,
+    frozenset({"SKILL", "CONSTRAINT"}): 0.10,
+    frozenset({"COMMUNICATION", "CONSTRAINT"}): 0.10,
+    frozenset({"COMMUNICATION", "SKILL"}): 0.10,
+}

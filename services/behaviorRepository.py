@@ -566,7 +566,10 @@ def search_similar_behavior_3D(
         HYBRID_INTENT_BOOST_WEIGHT,
         HYBRID_SEARCH_LIMIT,
         HYBRID_SCORE_THRESHOLD,
-        RELEVANCE_GAP_DROP_RATIO
+        RELEVANCE_GAP_DROP_RATIO,
+        MAX_RETRIEVAL_RESULTS,
+        ALL_INTENT_TYPES,
+        INTENT_AFFINITY
     )
     
     if limit is None:
@@ -611,20 +614,50 @@ def search_similar_behavior_3D(
                 # Hybrid scoring query — 3 signals combined:
                 #   Signal 1: Dense score  = 1 - cosine_distance  (semantic)
                 #   Signal 2: Sparse score = ts_rank_cd / BM25    (keyword)
-                #   Signal 3: Intent boost = CASE WHEN intent matches → boost
+                #   Signal 3: Intent boost = graduated affinity-based boost
                 #
-                # Intent is a SOFT BOOST, not a hard filter. This ensures
-                # behaviors with non-matching intents still appear if they
-                # score well on dense + sparse signals.
+                # Intent is a GRADUATED SOFT BOOST via affinity matrix.
+                # Exact intent matches get full boost, related intents get
+                # partial boost (e.g., HABIT→CONSTRAINT = 0.50), unrelated
+                # intents get 0. This prevents "intent blind spots".
                 #
                 # IMPORTANT: params must be ordered to match %s appearance:
                 #   SELECT clause params → WHERE clause params → LIMIT
                 # ----------------------------------------------------------
                 
-                # Build intent boost SQL fragment
+                # Build intent boost SQL fragment (graduated via affinity matrix)
+                # Instead of binary 1.0/0.0, related intents get partial boost.
+                # This prevents "intent blind spots" where HABIT behaviors about
+                # health are invisible to CONSTRAINT/PREFERENCE queries.
                 use_intent_boost = required_intents and len(required_intents) > 0
                 if use_intent_boost:
-                    intent_boost_sql = "%s * CASE WHEN intent = ANY(%s) THEN 1.0 ELSE 0.0 END"
+                    boost_map = {}
+                    for intent_type in ALL_INTENT_TYPES:
+                        if intent_type in required_intents:
+                            boost_map[intent_type] = 1.0
+                        else:
+                            max_affinity = 0.0
+                            for req in required_intents:
+                                key = frozenset({intent_type, req})
+                                affinity = INTENT_AFFINITY.get(key, 0.0)
+                                max_affinity = max(max_affinity, affinity)
+                            boost_map[intent_type] = max_affinity
+
+                    # Build graduated CASE — intent names are from ALL_INTENT_TYPES
+                    # (known enum, safe to interpolate). Only weight is parameterized.
+                    case_parts = []
+                    for intent_type, boost_val in boost_map.items():
+                        if boost_val > 0.0:
+                            case_parts.append(f"WHEN intent = '{intent_type}' THEN {boost_val:.4f}")
+
+                    if case_parts:
+                        case_sql = f"CASE {' '.join(case_parts)} ELSE 0.0 END"
+                        intent_boost_sql = f"%s * ({case_sql})"
+                    else:
+                        intent_boost_sql = "0.0"
+                        use_intent_boost = False
+
+                    logger.debug(f"[3D] Intent affinity boosts: {boost_map}")
                 else:
                     intent_boost_sql = "0.0"
 
@@ -675,10 +708,10 @@ def search_similar_behavior_3D(
                     HYBRID_SPARSE_WEIGHT,     # %s * ts_rank_cd(...) (sparse weight)
                     or_tsquery_str,           # to_tsquery('english', %s) (hybrid sparse)
                 ]
-                # Add intent boost params if applicable
+                # Add intent boost weight param if applicable
+                # (boost values per intent are baked into CASE — only weight is parameterized)
                 if use_intent_boost:
-                    select_params.append(HYBRID_INTENT_BOOST_WEIGHT)  # %s * CASE ...
-                    select_params.append(required_intents)             # ANY(%s)
+                    select_params.append(HYBRID_INTENT_BOOST_WEIGHT)  # %s * (CASE ...)
                 
                 params = select_params + where_params + [limit]
 
@@ -798,6 +831,22 @@ def search_similar_behavior_3D(
                     similarity_results = filtered_results
                     decay_updates = filtered_decay
                     accessed_behavior_ids = filtered_ids
+
+                # ----------------------------------------------------------
+                # Soft cap: limit maximum results to prevent over-retrieval
+                # for broad/vague queries where many behaviors cluster in a
+                # similar score range and gap cutoff alone can't separate them.
+                # ----------------------------------------------------------
+                if len(similarity_results) > MAX_RETRIEVAL_RESULTS:
+                    dropped_by_cap = len(similarity_results) - MAX_RETRIEVAL_RESULTS
+                    similarity_results = similarity_results[:MAX_RETRIEVAL_RESULTS]
+                    accessed_behavior_ids = accessed_behavior_ids[:MAX_RETRIEVAL_RESULTS]
+                    remaining_ids = set(accessed_behavior_ids)
+                    decay_updates = [d for d in decay_updates if d[2] in remaining_ids]
+                    logger.info(
+                        f"[3D] Soft cap applied: kept top {MAX_RETRIEVAL_RESULTS}, "
+                        f"dropped {dropped_by_cap} excess results"
+                    )
 
                 logger.info(
                     f"[3D] Hybrid search for user {user_id} in session {session_id}: "
