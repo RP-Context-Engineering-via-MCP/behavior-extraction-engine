@@ -401,7 +401,7 @@ def search_similar_behaviors(
         user_id: str, 
         query_embedding: List[float], 
         session_id: str = "default",
-        limit: int = 5
+        limit: int = 10
 ) -> List[SimilarityResult]:
     """
     Find behaviors similar to query embedding using cosine similarity.

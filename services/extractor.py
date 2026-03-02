@@ -1221,7 +1221,7 @@ def store_behavior(
                     user_id=user_id,
                     query_embedding=embedding_vector,
                     session_id=session_id,
-                    limit=5
+                    limit=10
                 )
                 logger.info(
                     f"Retrieved {len(candidates)} candidate(s) for "
