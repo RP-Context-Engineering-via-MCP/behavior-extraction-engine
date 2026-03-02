@@ -73,6 +73,14 @@ class ExtractionResult(BaseModel):
         ge=0.0,
         description="Time taken for extraction in milliseconds"
     )
+    standalone_query: Optional[str] = Field(
+        None,
+        description="Enriched standalone version of the prompt for similarity search (with conversation context resolved)"
+    )
+    required_intents: Optional[List[str]] = Field(
+        default=None,
+        description="LLM-predicted intent types relevant to the query for metadata pre-filtering (e.g., ['CONSTRAINT', 'PREFERENCE'])"
+    )
 
 
 class StoredBehavior(BaseModel):
@@ -338,6 +346,70 @@ class ExtractRequest(BaseModel):
             raise ValueError("Session ID can only contain alphanumeric characters, hyphens, and underscores")
         return sanitized
     
+class HistoryMessage(BaseModel):
+    """Represents a message in conversation history"""
+    role: Literal["user", "assistant"] = Field(
+        ...,
+        description="Role of the message sender (user or assistant)"
+    )
+    text: str = Field(
+        ...,
+        min_length=1,
+        description="Content of the message"
+    )
+    
+    @field_validator('text')
+    def validate_text(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Message text cannot be empty or whitespace only")
+        return v.strip()
+
+
+class ExtractRequestWithHistory(BaseModel):
+    prompt: str = Field(
+        ...,
+        description="User's natural language prompt"
+    )
+    user_id: str = Field(
+        ...,
+        description="User identifier for behavior extraction and storage"
+    )
+    session_id: str = Field(
+        default="default",
+        description="Optional session ID for session-specific behavior grouping within a user"
+    )
+    recent_history: Optional[List[HistoryMessage]] = Field(
+        default=None,
+        description="Optional recent conversation history for context"
+    )
+
+    @field_validator('prompt')
+    def validate_prompt(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Prompt cannot be empty or whitespace only")
+        return v.strip()
+    
+    @field_validator('user_id')
+    def validate_user_id(cls, v):
+        sanitized = v.strip()
+        if not sanitized:
+            raise ValueError("User ID cannot be empty")
+        # Allow only alphanumeric, hyphens, underscores
+        if not all(c.isalnum() or c in ['-', '_'] for c in sanitized):
+            raise ValueError("User ID can only contain alphanumeric characters, hyphens, and underscores")
+        return sanitized
+    
+    @field_validator('session_id')
+    def validate_session_id(cls, v):
+        sanitized = v.strip()
+        if not sanitized:
+            return "default"
+        # Allow only alphanumeric, hyphens, underscores
+        if not all(c.isalnum() or c in ['-', '_'] for c in sanitized):
+            raise ValueError("Session ID can only contain alphanumeric characters, hyphens, and underscores")
+        return sanitized
+
+
 class PromptSegment(BaseModel):
     """Represents a segment of user prompt to be stored"""
     user_id: str = Field(..., description="User who provided this segment")

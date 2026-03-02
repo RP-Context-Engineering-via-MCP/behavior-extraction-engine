@@ -77,3 +77,67 @@ CONFIRMATION_EXPIRATION_DAYS = 7
 CONFIRMATION_EXPIRATION_SECONDS = CONFIRMATION_EXPIRATION_DAYS * 24 * 60 * 60  # 604800 seconds
 
 SEMANTIC_RELEVANCE_THRESHOLD = 0.55
+RELATED_BEHAVIORS_DISTANCE_THRESHOLD = 0.72
+
+# ============================================================================
+# TGHR (Tuple-Guided Hybrid Retrieval) Configuration
+# Weights for combining dense (semantic) and sparse (BM25) search scores
+# hybrid_score = DENSE_W * semantic + SPARSE_W * bm25 + INTENT_BOOST * intent_match
+# ============================================================================
+
+# Dense score weight: Semantic similarity via cosine distance
+# Higher weight = more emphasis on meaning/synonym matching
+HYBRID_DENSE_WEIGHT = 0.55
+
+# Sparse score weight: BM25 lexical/keyword matching via tsvector
+# Higher weight = more emphasis on exact keyword overlap
+# Now uses OR-based tsquery so BM25 actually produces non-zero scores
+HYBRID_SPARSE_WEIGHT = 0.30
+
+# Intent boost weight: Soft boost when behavior intent matches LLM-predicted intents
+# This is NOT a hard filter — behaviors with non-matching intents still appear
+# if they score well on dense + sparse. Intent match just ranks them higher.
+HYBRID_INTENT_BOOST_WEIGHT = 0.15
+
+# Default limit for hybrid search results before threshold filtering
+HYBRID_SEARCH_LIMIT = 30
+
+# Minimum hybrid score threshold (below this, behaviors are considered irrelevant)
+# Score range: 0.0 (no match) to ~1.0 (perfect match on all 3 signals)
+HYBRID_SCORE_THRESHOLD = 0.10
+
+# Relevance gap cutoff: stop returning results when score drops more than
+# this fraction below the top result. E.g., 0.55 means if top score is 0.50,
+# any result below 0.50 * (1 - 0.55) = 0.225 is dropped.
+# Set higher than 0.40 because BM25 keyword matches create artificial spikes
+# in the top result — a 40% gap would kill equally relevant behaviors that
+# simply lack exact keyword overlap.
+RELEVANCE_GAP_DROP_RATIO = 0.55
+
+# Soft cap: maximum number of results returned after gap cutoff filtering.
+# Prevents over-retrieval for broad/vague queries where many behaviors
+# cluster in a similar score range and gap cutoff alone can't prune them.
+# Test 4 showed Phase 3 averaging 14.2 behaviors/query with peaks of 27.
+MAX_RETRIEVAL_RESULTS = 20
+
+# All known intent types for behavioral classification
+ALL_INTENT_TYPES = ["HABIT", "PREFERENCE", "CONSTRAINT", "SKILL", "COMMUNICATION"]
+
+# Intent affinity matrix: graduated boost for related (but non-matching) intents.
+# Key: frozenset of two intent types (symmetric relationship)
+# Value: affinity score 0.0-1.0 (how related the intents are)
+# Exact match always gets 1.0 (handled separately). These cover cross-intent relevance.
+# Example: A HABIT behavior about vitamins is relevant when searching for CONSTRAINTs
+#          about health, so HABIT<->CONSTRAINT affinity = 0.50.
+INTENT_AFFINITY = {
+    frozenset({"HABIT", "CONSTRAINT"}): 0.50,        # routines <-> restrictions (health, exercise)
+    frozenset({"HABIT", "PREFERENCE"}): 0.40,        # habits often reflect preferences
+    frozenset({"PREFERENCE", "CONSTRAINT"}): 0.35,   # preferences <-> restrictions overlap
+    frozenset({"COMMUNICATION", "PREFERENCE"}): 0.30,
+    frozenset({"COMMUNICATION", "HABIT"}): 0.20,
+    frozenset({"SKILL", "HABIT"}): 0.20,
+    frozenset({"SKILL", "PREFERENCE"}): 0.15,
+    frozenset({"SKILL", "CONSTRAINT"}): 0.10,
+    frozenset({"COMMUNICATION", "CONSTRAINT"}): 0.10,
+    frozenset({"COMMUNICATION", "SKILL"}): 0.10,
+}

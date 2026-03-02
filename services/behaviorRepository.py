@@ -1,6 +1,7 @@
 from db.connection import get_db_connection, get_db_pool_connection
 from datetime import datetime
 from typing import List, Tuple, Optional
+from dataclasses import dataclass, field
 from models.behavior import (
     PromptSegment, 
     SegmentInsertResult, 
@@ -18,6 +19,26 @@ import uuid
 import logging
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class HybridSearchResponse:
+    """
+    Response from search_similar_behavior_3D.
+    
+    Contains both the search results (returned immediately to the client)
+    and pending DB updates (processed asynchronously after response is sent).
+    
+    Attributes:
+        results: List of SimilarityResult objects sorted by hybrid_score
+        decay_updates: Tuples of (new_credibility, timestamp, behavior_id, user_id)
+                       for behaviors where lazy decay was applied in-memory
+        accessed_behavior_ids: All behavior_ids that were returned in results,
+                               used to update last_accessed_at timestamps
+    """
+    results: List[SimilarityResult] = field(default_factory=list)
+    decay_updates: List[tuple] = field(default_factory=list)
+    accessed_behavior_ids: List[str] = field(default_factory=list)
+
 def insert_behavior(payload: dict):
     """
     Insert a new behavior into the database.
@@ -34,6 +55,14 @@ def insert_behavior(payload: dict):
     # Ensure behavior_state is set (default to ACTIVE for new behaviors)
     if 'behavior_state' not in payload:
         payload['behavior_state'] = BehaviorState.ACTIVE.value
+    
+    # Build enriched search text for tsvector (behavior_text + target + context)
+    # Passed as a single parameter to avoid PostgreSQL type inference conflicts
+    # (varchar column params vs text in to_tsvector)
+    search_text = payload.get('behavior_text', '')
+    target_val = payload.get('target') or ''
+    context_val = payload.get('context') or ''
+    payload['search_text'] = f"{search_text} {target_val} {context_val}".strip()
     
     with get_db_pool_connection() as conn:
         with conn.cursor() as cur:
@@ -60,7 +89,8 @@ def insert_behavior(payload: dict):
                     intent,
                     target,
                     context,
-                    polarity
+                    polarity,
+                    search_vector
                 )
                 VALUES (
                     %(behavior_id)s,
@@ -83,7 +113,8 @@ def insert_behavior(payload: dict):
                     %(intent)s,
                     %(target)s,
                     %(context)s,
-                    %(polarity)s
+                    %(polarity)s,
+                    to_tsvector('english', %(search_text)s)
                 )
                 """
             , payload
@@ -370,7 +401,7 @@ def search_similar_behaviors(
         user_id: str, 
         query_embedding: List[float], 
         session_id: str = "default",
-        limit: int = 5
+        limit: int = 10
 ) -> List[SimilarityResult]:
     """
     Find behaviors similar to query embedding using cosine similarity.
@@ -488,6 +519,431 @@ def search_similar_behaviors(
     except Exception as e:
         logger.error(f"Failed to search similar behaviors: {str(e)}")
         return []
+
+
+def search_similar_behavior_3D(
+    user_id: str,
+    query_embedding: List[float],
+    query_text: str,
+    session_id: str = "default",
+    required_intents: Optional[List[str]] = None,
+    limit: int = None
+) -> HybridSearchResponse:
+    """
+    Tuple-Guided Hybrid Retrieval (TGHR) — 3-dimensional behavior search.
+    
+    Combines three retrieval signals in a single database query:
+      1. Dense retrieval  — cosine similarity via pgvector (semantic meaning)
+      2. Sparse retrieval — BM25 via PostgreSQL tsvector (exact keyword matching)
+      3. Metadata pre-filtering — intent-based filtering predicted by the LLM
+    
+    The dense and sparse scores are fused using a weighted linear combination:
+        hybrid_score = DENSE_WEIGHT * (1 - cosine_distance) + SPARSE_WEIGHT * bm25_rank
+    
+    This method is READ-ONLY at query time. It collects pending updates
+    (lazy decay + last_accessed_at) which the caller should persist
+    asynchronously via persist_retrieval_updates_batch().
+    
+    Args:
+        user_id: User identifier
+        query_embedding: Dense vector embedding of the standalone query
+        query_text: Plain text of the standalone query (used for BM25 sparse search)
+        session_id: Session identifier for isolation (defaults to "default")
+        required_intents: Optional list of intent types predicted by the LLM
+                          (e.g., ["CONSTRAINT", "PREFERENCE"]). If None or empty,
+                          no intent filtering is applied.
+        limit: Maximum number of results to return (defaults to HYBRID_SEARCH_LIMIT)
+    
+    Returns:
+        HybridSearchResponse containing:
+          - results: List of SimilarityResult objects (sorted by hybrid_score desc)
+          - decay_updates: Pending credibility updates for async persistence
+          - accessed_behavior_ids: IDs of all returned behaviors for last_accessed_at update
+    """
+    from config.configurations import (
+        HYBRID_DENSE_WEIGHT,
+        HYBRID_SPARSE_WEIGHT,
+        HYBRID_INTENT_BOOST_WEIGHT,
+        HYBRID_SEARCH_LIMIT,
+        HYBRID_SCORE_THRESHOLD,
+        RELEVANCE_GAP_DROP_RATIO,
+        MAX_RETRIEVAL_RESULTS,
+        ALL_INTENT_TYPES,
+        INTENT_AFFINITY
+    )
+    
+    if limit is None:
+        limit = HYBRID_SEARCH_LIMIT
+
+    # ----------------------------------------------------------
+    # Build OR-based tsquery from query text.
+    # plainto_tsquery uses AND between all terms, which produces 0
+    # when short behavior texts only partially overlap with long queries.
+    # OR-based matching gives partial credit for any keyword match.
+    # ----------------------------------------------------------
+    def _build_or_tsquery(text: str) -> str:
+        """Convert natural language text to OR-based tsquery string.
+        
+        'What foods should I eat before my morning run'
+        → 'food | eat | morn | run'  (after PostgreSQL stemming)
+        
+        We send the raw words joined by | and let to_tsquery('english', ...)
+        handle stemming. Stop words are kept but to_tsquery ignores them.
+        """
+        import re
+        # Extract alphanumeric words, skip very short ones (likely stop words)
+        words = re.findall(r'[a-zA-Z]{3,}', text.lower())
+        if not words:
+            return text  # fallback: let PostgreSQL handle it
+        return ' | '.join(words)
+
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                # ----------------------------------------------------------
+                # Build the WHERE clause dynamically based on intent filter
+                # ----------------------------------------------------------
+                base_conditions = """
+                    user_id = %s
+                    AND session_id = %s
+                    AND behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED')
+                """
+                where_params: list = [user_id, session_id]
+
+                # ----------------------------------------------------------
+                # Hybrid scoring query — 3 signals combined:
+                #   Signal 1: Dense score  = 1 - cosine_distance  (semantic)
+                #   Signal 2: Sparse score = ts_rank_cd / BM25    (keyword)
+                #   Signal 3: Intent boost = graduated affinity-based boost
+                #
+                # Intent is a GRADUATED SOFT BOOST via affinity matrix.
+                # Exact intent matches get full boost, related intents get
+                # partial boost (e.g., HABIT→CONSTRAINT = 0.50), unrelated
+                # intents get 0. This prevents "intent blind spots".
+                #
+                # IMPORTANT: params must be ordered to match %s appearance:
+                #   SELECT clause params → WHERE clause params → LIMIT
+                # ----------------------------------------------------------
+                
+                # Build intent boost SQL fragment (graduated via affinity matrix)
+                # Instead of binary 1.0/0.0, related intents get partial boost.
+                # This prevents "intent blind spots" where HABIT behaviors about
+                # health are invisible to CONSTRAINT/PREFERENCE queries.
+                use_intent_boost = required_intents and len(required_intents) > 0
+                if use_intent_boost:
+                    boost_map = {}
+                    for intent_type in ALL_INTENT_TYPES:
+                        if intent_type in required_intents:
+                            boost_map[intent_type] = 1.0
+                        else:
+                            max_affinity = 0.0
+                            for req in required_intents:
+                                key = frozenset({intent_type, req})
+                                affinity = INTENT_AFFINITY.get(key, 0.0)
+                                max_affinity = max(max_affinity, affinity)
+                            boost_map[intent_type] = max_affinity
+
+                    # Build graduated CASE — intent names are from ALL_INTENT_TYPES
+                    # (known enum, safe to interpolate). Only weight is parameterized.
+                    case_parts = []
+                    for intent_type, boost_val in boost_map.items():
+                        if boost_val > 0.0:
+                            case_parts.append(f"WHEN intent = '{intent_type}' THEN {boost_val:.4f}")
+
+                    if case_parts:
+                        case_sql = f"CASE {' '.join(case_parts)} ELSE 0.0 END"
+                        intent_boost_sql = f"%s * ({case_sql})"
+                    else:
+                        intent_boost_sql = "0.0"
+                        use_intent_boost = False
+
+                    logger.debug(f"[3D] Intent affinity boosts: {boost_map}")
+                else:
+                    intent_boost_sql = "0.0"
+
+                # Build OR-based tsquery string for BM25 sparse matching
+                or_tsquery_str = _build_or_tsquery(query_text)
+                logger.debug(f"[3D] OR tsquery: '{or_tsquery_str}'")
+
+                query = f"""
+                    SELECT
+                        behavior_id,
+                        behavior_text,
+                        embedding <=> %s::vector AS cosine_distance,
+                        ts_rank_cd(
+                            COALESCE(search_vector, to_tsvector('english', behavior_text || ' ' || COALESCE(target, '') || ' ' || COALESCE(context, ''))),
+                            to_tsquery('english', %s)
+                        ) AS bm25_score,
+                        credibility,
+                        last_seen_at,
+                        reinforcement_count,
+                        intent,
+                        target,
+                        context,
+                        polarity,
+                        decay_rate,
+                        last_decay_applied_at,
+                        (
+                            %s * (1.0 - (embedding <=> %s::vector))
+                            +
+                            %s * ts_rank_cd(
+                                COALESCE(search_vector, to_tsvector('english', behavior_text || ' ' || COALESCE(target, '') || ' ' || COALESCE(context, ''))),
+                                to_tsquery('english', %s)
+                            )
+                            +
+                            {intent_boost_sql}
+                        ) AS hybrid_score
+                    FROM behaviors
+                    WHERE {base_conditions}
+                    ORDER BY hybrid_score DESC
+                    LIMIT %s;
+                """
+                
+                # Build params in SQL %s appearance order: SELECT → WHERE → LIMIT
+                select_params = [
+                    query_embedding,          # embedding <=> %s::vector (cosine_distance)
+                    or_tsquery_str,           # to_tsquery('english', %s) (bm25_score)
+                    HYBRID_DENSE_WEIGHT,      # %s * (1.0 - ...) (dense weight)
+                    query_embedding,          # embedding <=> %s::vector (hybrid dense)
+                    HYBRID_SPARSE_WEIGHT,     # %s * ts_rank_cd(...) (sparse weight)
+                    or_tsquery_str,           # to_tsquery('english', %s) (hybrid sparse)
+                ]
+                # Add intent boost weight param if applicable
+                # (boost values per intent are baked into CASE — only weight is parameterized)
+                if use_intent_boost:
+                    select_params.append(HYBRID_INTENT_BOOST_WEIGHT)  # %s * (CASE ...)
+                
+                params = select_params + where_params + [limit]
+
+                cur.execute(query, params)
+                results = cur.fetchall()
+                current_time = int(time.time())
+
+                # ----------------------------------------------------------
+                # Build SimilarityResult objects with in-memory lazy decay
+                # Collect pending updates for async persistence
+                # ----------------------------------------------------------
+                similarity_results = []
+                decay_updates = []
+                accessed_behavior_ids = []
+                
+                for row in results:
+                    (
+                        behavior_id, behavior_text, cosine_distance, bm25_score,
+                        stored_credibility, last_seen_at, reinforcement_count,
+                        intent, target, context, polarity,
+                        decay_rate, last_decay_applied_at, hybrid_score
+                    ) = row
+
+                    # Skip results below the hybrid score threshold
+                    if float(hybrid_score) < HYBRID_SCORE_THRESHOLD:
+                        continue
+
+                    # Apply lazy decay in-memory (read-only, no DB update)
+                    new_credibility, decay_applied, days_elapsed = apply_lazy_decay(
+                        stored_credibility=float(stored_credibility),
+                        decay_rate=float(decay_rate),
+                        last_decay_applied_at=last_decay_applied_at,
+                        current_time=current_time
+                    )
+
+                    if decay_applied:
+                        logger.debug(
+                            f"[3D] Lazy decay (in-memory) for {behavior_id}: "
+                            f"{stored_credibility:.4f} → {new_credibility:.4f} "
+                            f"({days_elapsed} days)"
+                        )
+                        # Collect for async batch update
+                        decay_updates.append((
+                            new_credibility,
+                            current_time,
+                            behavior_id,
+                            user_id
+                        ))
+
+                    # Map hybrid_score → distance so lower = better (API consistency)
+                    # hybrid_score is 0..~1, so distance = 1 - hybrid_score
+                    effective_distance = max(0.0, 1.0 - float(hybrid_score))
+
+                    similarity_results.append(SimilarityResult(
+                        behavior_id=behavior_id,
+                        behavior_text=behavior_text,
+                        distance=effective_distance,
+                        credibility=new_credibility,
+                        last_seen_at=int(last_seen_at),
+                        reinforcement_count=int(reinforcement_count),
+                        intent=intent,
+                        target=target,
+                        context=context if context else "general",
+                        polarity=polarity
+                    ))
+                    
+                    # Track all returned behavior IDs for last_accessed_at update
+                    accessed_behavior_ids.append(behavior_id)
+
+                    # Log each matched behavior with scoring breakdown
+                    logger.info(
+                        f"[3D] MATCH #{len(similarity_results)}: "
+                        f"id={behavior_id} | intent={intent} | "
+                        f"dense={1.0 - float(cosine_distance):.4f} | "
+                        f"sparse={float(bm25_score):.4f} | "
+                        f"hybrid={float(hybrid_score):.4f} | "
+                        f"credibility={new_credibility:.4f} | "
+                        f"text='{behavior_text[:80]}...'"
+                    )
+
+                # ----------------------------------------------------------
+                # Apply relevance gap cutoff:
+                # If a result's score drops more than RELEVANCE_GAP_DROP_RATIO
+                # below the top result, stop including further results.
+                # This prevents low-quality tail noise from being returned.
+                # ----------------------------------------------------------
+                if similarity_results:
+                    top_score = float(1.0 - similarity_results[0].distance)  # convert back to hybrid score
+                    cutoff_score = top_score * (1.0 - RELEVANCE_GAP_DROP_RATIO)
+                    
+                    filtered_results = []
+                    filtered_decay = []
+                    filtered_ids = []
+                    
+                    for i, sr in enumerate(similarity_results):
+                        sr_score = 1.0 - sr.distance
+                        if sr_score < cutoff_score:
+                            break
+                        filtered_results.append(sr)
+                        # Keep corresponding decay update if it exists
+                        # decay_updates and accessed_behavior_ids align with similarity_results
+                        if sr.behavior_id in [d[2] for d in decay_updates]:
+                            for d in decay_updates:
+                                if d[2] == sr.behavior_id:
+                                    filtered_decay.append(d)
+                                    break
+                        filtered_ids.append(sr.behavior_id)
+                    
+                    dropped = len(similarity_results) - len(filtered_results)
+                    if dropped > 0:
+                        logger.info(
+                            f"[3D] Relevance gap cutoff: kept {len(filtered_results)}, "
+                            f"dropped {dropped} (top_score={top_score:.4f}, "
+                            f"cutoff={cutoff_score:.4f})"
+                        )
+                    
+                    similarity_results = filtered_results
+                    decay_updates = filtered_decay
+                    accessed_behavior_ids = filtered_ids
+
+                # ----------------------------------------------------------
+                # Soft cap: limit maximum results to prevent over-retrieval
+                # for broad/vague queries where many behaviors cluster in a
+                # similar score range and gap cutoff alone can't separate them.
+                # ----------------------------------------------------------
+                if len(similarity_results) > MAX_RETRIEVAL_RESULTS:
+                    dropped_by_cap = len(similarity_results) - MAX_RETRIEVAL_RESULTS
+                    similarity_results = similarity_results[:MAX_RETRIEVAL_RESULTS]
+                    accessed_behavior_ids = accessed_behavior_ids[:MAX_RETRIEVAL_RESULTS]
+                    remaining_ids = set(accessed_behavior_ids)
+                    decay_updates = [d for d in decay_updates if d[2] in remaining_ids]
+                    logger.info(
+                        f"[3D] Soft cap applied: kept top {MAX_RETRIEVAL_RESULTS}, "
+                        f"dropped {dropped_by_cap} excess results"
+                    )
+
+                logger.info(
+                    f"[3D] Hybrid search for user {user_id} in session {session_id}: "
+                    f"{len(similarity_results)} results "
+                    f"(dense_w={HYBRID_DENSE_WEIGHT}, sparse_w={HYBRID_SPARSE_WEIGHT}, "
+                    f"intent_boost_w={HYBRID_INTENT_BOOST_WEIGHT}, "
+                    f"intents_boost={required_intents or 'NONE'}, "
+                    f"decay_pending={len(decay_updates)}, "
+                    f"query='{query_text[:60]}...')"
+                )
+                return HybridSearchResponse(
+                    results=similarity_results,
+                    decay_updates=decay_updates,
+                    accessed_behavior_ids=accessed_behavior_ids
+                )
+
+    except Exception as e:
+        logger.error(f"[3D] Failed to search similar behaviors: {str(e)}")
+        return HybridSearchResponse()
+
+
+def persist_retrieval_updates_batch(
+    decay_updates: List[tuple],
+    accessed_behavior_ids: List[str],
+    user_id: str
+) -> None:
+    """
+    Persist pending updates from a hybrid search in a single batch transaction.
+    
+    Called asynchronously (via BackgroundTasks) after the v2/extract response
+    has already been sent to the client. Performs two operations:
+    
+    1. Credibility decay persistence — for behaviors where lazy decay was applied
+       in-memory during retrieval, persist the new credibility + last_decay_applied_at.
+    2. Access timestamp update — for ALL behaviors returned in the search results,
+       update last_accessed_at to mark they were used for prompt enrichment.
+    
+    Both operations run in a single transaction for efficiency.
+    
+    Args:
+        decay_updates: List of (new_credibility, timestamp, behavior_id, user_id)
+                       tuples from HybridSearchResponse.decay_updates
+        accessed_behavior_ids: List of behavior_id strings from
+                               HybridSearchResponse.accessed_behavior_ids
+        user_id: User identifier (for logging and WHERE clause)
+    """
+    if not decay_updates and not accessed_behavior_ids:
+        logger.debug("[3D-ASYNC] No pending updates to persist, skipping")
+        return
+
+    try:
+        current_time = int(time.time())
+        
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                # ---------------------------------------------------------
+                # 1. Batch update: credibility decay persistence
+                # ---------------------------------------------------------
+                if decay_updates:
+                    cur.executemany(
+                        """
+                        UPDATE behaviors
+                        SET credibility = %s,
+                            last_decay_applied_at = %s
+                        WHERE behavior_id = %s AND user_id = %s
+                        """,
+                        decay_updates
+                    )
+                    logger.info(
+                        f"[3D-ASYNC] Persisted lazy decay for "
+                        f"{len(decay_updates)} behaviors (user: {user_id})"
+                    )
+
+                # ---------------------------------------------------------
+                # 2. Batch update: last_accessed_at for all returned behaviors
+                # ---------------------------------------------------------
+                if accessed_behavior_ids:
+                    cur.execute(
+                        """
+                        UPDATE behaviors
+                        SET last_accessed_at = %s
+                        WHERE user_id = %s
+                        AND behavior_id = ANY(%s)
+                        """,
+                        (current_time, user_id, accessed_behavior_ids)
+                    )
+                    logger.info(
+                        f"[3D-ASYNC] Updated last_accessed_at for "
+                        f"{len(accessed_behavior_ids)} behaviors (user: {user_id})"
+                    )
+
+                conn.commit()
+
+    except Exception as e:
+        logger.error(
+            f"[3D-ASYNC] Failed to persist retrieval updates for user {user_id}: {str(e)}"
+        )
         
 
 def insert_behavior_batch(payloads: List[dict]):

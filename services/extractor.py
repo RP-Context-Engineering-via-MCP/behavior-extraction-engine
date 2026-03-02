@@ -18,7 +18,7 @@ from models.behavior import (
     BehaviorFlowInfo,
     DetailedExtractionResult
 )
-from services.openAiClient import extract_behavior, embed_text, analyze_conflict
+from services.openAiClient import extract_behavior, embed_text, analyze_conflict, extract_behavior_with_history
 from services.credibilityCalculator import calculate_initial_credibility, should_store_behavior, get_decay_rate
 from services.behaviorRepository import (
     insert_behavior, 
@@ -171,6 +171,7 @@ def run_behavior_extraction(prompt: str) -> ExtractionResult:
     
     except KeyError as e:
         # Missing required field in response
+        logger.error(f"Invalid response structure: missing field {str(e)}")
         return ExtractionResult(
             segments=[],
             success=False,
@@ -180,11 +181,138 @@ def run_behavior_extraction(prompt: str) -> ExtractionResult:
     
     except Exception as e:
         # Pydantic validation error or other unexpected error
+        logger.error(f"Failed to validate extraction result: {str(e)}")
         return ExtractionResult(
             segments=[],
             success=False,
             error=f"Failed to validate extraction result: {str(e)}",
             extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0)
+        )
+
+
+def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]) -> ExtractionResult:
+    """
+    Extract behaviors from a user prompt with conversation history and enrich prompt for similarity search.
+    
+    This method performs TWO key tasks:
+    1. Extracts behaviors from the prompt
+    2. Enriches the prompt to a standalone query by resolving references using conversation history
+    
+    The standalone query is useful for similarity search when the prompt contains references
+    like "it", "that", "the above options" which depend on conversation context.
+    
+    Args:
+        prompt: User's natural language prompt (may contain contextual references)
+        recent_history: List of recent conversation messages [{"role": "user"/"assistant", "text": "..."}]
+        
+    Returns:
+        ExtractionResult object with:
+            - segments: Extracted behavior segments
+            - standalone_query: Enriched standalone version of prompt for similarity search
+            - success: Boolean indicating success
+            - error: Error message if failed
+            - extraction_time: Time taken in milliseconds
+        
+    Workflow:
+        1. Call GPT-4 via openAiClient.extract_behavior_with_history()
+        2. Validate response structure
+        3. Convert to Pydantic models for type safety
+        4. Return ExtractionResult with standalone_query
+        
+    Example:
+        >>> history = [
+        ...     {"role": "user", "text": "I like Python and JavaScript"},
+        ...     {"role": "assistant", "text": "Both are great choices!"}
+        ... ]
+        >>> result = run_behavior_extraction_with_history("which one is better for backend?", history)
+        >>> result.standalone_query
+        "which is better for backend development: Python or JavaScript?"
+    """
+    raw_response = extract_behavior_with_history(prompt, recent_history)
+    
+    if not raw_response.get("success", False):
+        return ExtractionResult(
+            segments=[],
+            success=False,
+            error=raw_response.get("error", "Unknown extraction error"),
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            standalone_query=None
+        )
+    
+    try:
+        validated_segments = []
+        
+        for segment_data in raw_response.get("segments", []):
+            segment_text = segment_data["text"]
+
+            # Convert each behavior dict to ExtractedBehavior model
+            validated_behaviors = []
+            
+            for behavior_data in segment_data.get("behaviors", []):
+                # Pydantic will validate ranges and types automatically
+                validated_behavior = ExtractedBehavior(
+                    description=behavior_data["description"],
+                    confidence=behavior_data["confidence"],
+                    clarity=behavior_data["clarity"],
+                    linguistic_strength=behavior_data["linguistic_strength"],
+                    extracted_at=datetime.now().isoformat(),
+                    # Canonical fields for structured reasoning
+                    intent=behavior_data.get("intent"),
+                    target=behavior_data.get("target"),
+                    context=behavior_data.get("context", "general"),
+                    polarity=behavior_data.get("polarity")
+                )
+                validated_behaviors.append(validated_behavior)
+            
+            # Create validated segment with validated behaviors only
+            validated_segment = BehaviorSegment(
+                text=segment_text,
+                behaviors=validated_behaviors
+            )
+            validated_segments.append(validated_segment)
+        
+        # Extract standalone query from response
+        standalone_query = raw_response.get("standalone_query")
+        if not standalone_query or not standalone_query.strip():
+            logger.warning("No standalone_query in response, using original prompt")
+            standalone_query = prompt
+        
+        # Extract required_intents for hybrid retrieval (3D search)
+        required_intents = raw_response.get("required_intents")
+        if not required_intents or not isinstance(required_intents, list):
+            logger.warning("No required_intents in response, using default [PREFERENCE, CONSTRAINT]")
+            required_intents = ["PREFERENCE", "CONSTRAINT"]
+        
+        # Return successful extraction result with standalone query and required intents
+        return ExtractionResult(
+            segments=validated_segments,
+            success=True,
+            error=None,
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            standalone_query=standalone_query.strip(),
+            required_intents=required_intents
+        )
+    
+    except KeyError as e:
+        # Missing required field in response
+        logger.error(f"Invalid response structure: missing field {str(e)}")
+        return ExtractionResult(
+            segments=[],
+            success=False,
+            error=f"Invalid response structure: missing field {str(e)}",
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            standalone_query=None
+        )
+    
+    except Exception as e:
+        # Pydantic validation error or other unexpected error
+        logger.error(f"Failed to validate extraction result: {e}")
+        return ExtractionResult(
+            segments=[],
+            success=False,
+            error=f"Failed to validate extraction result: {str(e)}",
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            standalone_query=None
         )
 
 
@@ -1093,7 +1221,7 @@ def store_behavior(
                     user_id=user_id,
                     query_embedding=embedding_vector,
                     session_id=session_id,
-                    limit=5
+                    limit=10
                 )
                 logger.info(
                     f"Retrieved {len(candidates)} candidate(s) for "

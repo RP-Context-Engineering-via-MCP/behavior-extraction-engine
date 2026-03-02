@@ -1,11 +1,12 @@
-from fastapi import FastAPI, status, Query
+from fastapi import FastAPI, status, Query, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from services.extractor import run_behavior_extraction, store_behavior, store_behavior_with_tracking
-from services.behaviorRepository import insert_behavior, search_similar_behaviors, get_behaviors_by_user, get_user_conflicts, resolve_conflict
-from models.behavior import ExtractRequest
+from services.extractor import run_behavior_extraction, run_behavior_extraction_with_history, store_behavior, store_behavior_with_tracking
+from services.behaviorRepository import insert_behavior, search_similar_behaviors, search_similar_behavior_3D, persist_retrieval_updates_batch, get_behaviors_by_user, get_user_conflicts, resolve_conflict
+from models.behavior import ExtractRequest, ExtractRequestWithHistory, HistoryMessage
 from db.connection import close_db_pool, init_db_pool
+from config.configurations import RELATED_BEHAVIORS_DISTANCE_THRESHOLD, HYBRID_SCORE_THRESHOLD
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -67,7 +68,7 @@ app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="front
     
 @app.post(
     "/extract",
-    summary="Extract b ehaviors from prompt",
+    summary="Extract behaviors from prompt",
     description="Analyzes a natural language prompt and extracts user behaviors, preferences, and patterns",
     response_description="Extraction result with segmented behaviors"
 )
@@ -212,118 +213,118 @@ def health_check():
     return {"status": "healthy", "service": "behavior_extraction"}
 
 
-@app.post(
-    "/extract-detailed",
-    summary="Extract behaviors with detailed flow tracking",
-    description="Analyzes a natural language prompt and extracts behaviors with detailed information about what happened to each behavior (duplicate, conflict, new, etc.)",
-    response_description="Detailed extraction result with flow tracking for UI display"
-)
-def extract_behaviors_detailed(request: ExtractRequest):
-    """
-    Enhanced extraction endpoint that returns detailed flow information for each behavior.
-    This is specifically designed for the frontend UI to show the processing path.
-    """
-    try:
-        logger.info(f"Received detailed extraction request for user: {request.user_id}")
+# @app.post(
+#     "/extract-detailed",
+#     summary="Extract behaviors with detailed flow tracking",
+#     description="Analyzes a natural language prompt and extracts behaviors with detailed information about what happened to each behavior (duplicate, conflict, new, etc.)",
+#     response_description="Detailed extraction result with flow tracking for UI display"
+# )
+# def extract_behaviors_detailed(request: ExtractRequest):
+    # """
+    # Enhanced extraction endpoint that returns detailed flow information for each behavior.
+    # This is specifically designed for the frontend UI to show the processing path.
+    # """
+    # try:
+    #     logger.info(f"Received detailed extraction request for user: {request.user_id}")
 
-        # Run extraction
-        extraction_result = run_behavior_extraction(request.prompt)
+    #     # Run extraction
+    #     extraction_result = run_behavior_extraction(request.prompt)
 
-        if not extraction_result.success:
-            logger.error(f"Extraction failed: {extraction_result.error}")
-            return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                content={
-                    "success": False,
-                    "data": None,
-                    "error": extraction_result.error or "Extraction failed"
-                }
-            )
+    #     if not extraction_result.success:
+    #         logger.error(f"Extraction failed: {extraction_result.error}")
+    #         return JSONResponse(
+    #             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+    #             content={
+    #                 "success": False,
+    #                 "data": None,
+    #                 "error": extraction_result.error or "Extraction failed"
+    #             }
+    #         )
         
-        # Store with detailed tracking
-        try:
-            detailed_result = store_behavior_with_tracking(
-                extraction_result,
-                user_id=request.user_id,
-                session_id=request.session_id
-            )
+    #     # Store with detailed tracking
+    #     try:
+    #         detailed_result = store_behavior_with_tracking(
+    #             extraction_result,
+    #             user_id=request.user_id,
+    #             session_id=request.session_id
+    #         )
 
-            logger.info(
-                f"Processing complete: {detailed_result.total_stored} stored, "
-                f"{detailed_result.total_reinforced} reinforced, "
-                f"{detailed_result.total_conflicts} conflicts, "
-                f"{detailed_result.total_pruned} pruned"
-            )
-        except Exception as e:
-            logger.error(f"Failed to store behaviors: {str(e)}")
-            return JSONResponse(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                content={
-                    "success": False,
-                    "data": None,
-                    "error": f"Storage error: {str(e)}"
-                }
-            )
+    #         logger.info(
+    #             f"Processing complete: {detailed_result.total_stored} stored, "
+    #             f"{detailed_result.total_reinforced} reinforced, "
+    #             f"{detailed_result.total_conflicts} conflicts, "
+    #             f"{detailed_result.total_pruned} pruned"
+    #         )
+    #     except Exception as e:
+    #         logger.error(f"Failed to store behaviors: {str(e)}")
+    #         return JSONResponse(
+    #             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    #             content={
+    #                 "success": False,
+    #                 "data": None,
+    #                 "error": f"Storage error: {str(e)}"
+    #             }
+    #         )
         
-        # Format flow info for frontend
-        flow_info_formatted = []
-        for flow in detailed_result.flow_info:
-            flow_dict = {
-                "behavior_description": flow.behavior_description,
-                "action": flow.action.value,
-                "credibility": round(flow.credibility, 3),
-                "canonical": flow.canonical,
-                "matched_behavior_id": flow.matched_behavior_id,
-                "matched_behavior_text": flow.matched_behavior_text,
-                "distance": round(flow.distance, 4) if flow.distance is not None else None,
-                "conflict_info": flow.conflict_info,
-                "stored_behavior_id": flow.stored_behavior_id,
-                "details": flow.details
-            }
-            flow_info_formatted.append(flow_dict)
+    #     # Format flow info for frontend
+    #     flow_info_formatted = []
+    #     for flow in detailed_result.flow_info:
+    #         flow_dict = {
+    #             "behavior_description": flow.behavior_description,
+    #             "action": flow.action.value,
+    #             "credibility": round(flow.credibility, 3),
+    #             "canonical": flow.canonical,
+    #             "matched_behavior_id": flow.matched_behavior_id,
+    #             "matched_behavior_text": flow.matched_behavior_text,
+    #             "distance": round(flow.distance, 4) if flow.distance is not None else None,
+    #             "conflict_info": flow.conflict_info,
+    #             "stored_behavior_id": flow.stored_behavior_id,
+    #             "details": flow.details
+    #         }
+    #         flow_info_formatted.append(flow_dict)
         
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={
-                "success": True,
-                "data": {
-                    "extraction": {
-                        "extraction_time_ms": extraction_result.extraction_time,
-                        "total_segments": len(extraction_result.segments),
-                    },
-                    "processing": {
-                        "total_extracted": detailed_result.total_extracted,
-                        "total_stored": detailed_result.total_stored,
-                        "total_reinforced": detailed_result.total_reinforced,
-                        "total_conflicts": detailed_result.total_conflicts,
-                        "total_pruned": detailed_result.total_pruned
-                    },
-                    "flow_info": flow_info_formatted,
-                    "user_id": request.user_id
-                },
-                "error": None
-            }
-        )
-    except ValueError as e:
-        logger.warning(f"Validation error: {str(e)}")
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "success": False,
-                "data": None,
-                "error": f"Validation error: {str(e)}"
-            }
-        )
-    except Exception as e:
-        logger.exception("Unexpected error during detailed extraction")
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "data": None,
-                "error": f"Internal server error: {str(e)}"
-            }
-        )
+    #     return JSONResponse(
+    #         status_code=status.HTTP_200_OK,
+    #         content={
+    #             "success": True,
+    #             "data": {
+    #                 "extraction": {
+    #                     "extraction_time_ms": extraction_result.extraction_time,
+    #                     "total_segments": len(extraction_result.segments),
+    #                 },
+    #                 "processing": {
+    #                     "total_extracted": detailed_result.total_extracted,
+    #                     "total_stored": detailed_result.total_stored,
+    #                     "total_reinforced": detailed_result.total_reinforced,
+    #                     "total_conflicts": detailed_result.total_conflicts,
+    #                     "total_pruned": detailed_result.total_pruned
+    #                 },
+    #                 "flow_info": flow_info_formatted,
+    #                 "user_id": request.user_id
+    #             },
+    #             "error": None
+    #         }
+    #     )
+    # except ValueError as e:
+    #     logger.warning(f"Validation error: {str(e)}")
+    #     return JSONResponse(
+    #         status_code=status.HTTP_400_BAD_REQUEST,
+    #         content={
+    #             "success": False,
+    #             "data": None,
+    #             "error": f"Validation error: {str(e)}"
+    #         }
+    #     )
+    # except Exception as e:
+    #     logger.exception("Unexpected error during detailed extraction")
+    #     return JSONResponse(
+    #         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    #         content={
+    #             "success": False,
+    #             "data": None,
+    #             "error": f"Internal server error: {str(e)}"
+    #         }
+    #     )
 
 
 @app.get(
@@ -564,6 +565,205 @@ def resolve_behavior_conflict(request: ConflictResolutionRequest):
                 "error": f"Internal server error: {str(e)}"
             }
         )
+
+def _store_behaviors_async(extraction_result, user_id: str, session_id: str):
+    """
+    Background task for storing behaviors with conflict detection and reinforcement.
+    This runs asynchronously after the response has been sent to the client.
+    """
+    try:
+        stored_behaviors = store_behavior(
+            extraction_result,
+            user_id=user_id,
+            session_id=session_id
+        )
+        logger.info(f"[ASYNC] Successfully stored {len(stored_behaviors)} behaviors for user: {user_id}")
+    except Exception as e:
+        logger.error(f"[ASYNC] Failed to store behaviors for user {user_id}: {str(e)}")
+
+
+@app.post(
+    "/v2/extract",
+    summary="Extract behaviors with conversation history and retrieve related behaviors (optimized)",
+    description="""
+    Optimized endpoint that prioritizes fast response with related behaviors.
+    
+    Workflow:
+    1. Extract behaviors from prompt with conversation history
+    2. Enrich prompt to standalone query for similarity search
+    3. Search and return related behaviors IMMEDIATELY
+    4. Store extracted behaviors asynchronously in background (conflict detection, reinforcement)
+    
+    This endpoint resolves contextual references (e.g., "it", "that", "the above") 
+    using the recent conversation history, making the prompt fully self-contained 
+    for better semantic search against stored behaviors.
+    
+    Response contains ONLY related behaviors from the database, optimized for speed.
+    """,
+    response_description="Related behaviors from similarity search (fast response)"
+)
+def extract_behaviors_with_history(request: ExtractRequestWithHistory, background_tasks: BackgroundTasks):
+    """
+    Extract behaviors from a prompt with conversation history and return related behaviors quickly.
+    
+    Optimized for speed by:
+    - Returning related behaviors immediately after similarity search
+    - Running behavior storage (conflict detection, reinforcement) asynchronously
+    - Excluding extracted/stored behavior details from response
+    
+    This endpoint is useful when:
+    - The prompt contains references like "it", "that", "those", "the above"
+    - The prompt depends on previous conversation context
+    - You need a standalone query for similarity search
+    - You need the fastest possible response with related behaviors
+    
+    Example payload:
+    {
+      "prompt": "among above what is the sweetest food",
+      "recent_history": [
+         {"role": "user", "text": "I like healthy breakfast options like oatmeal and fruits."},
+         {"role": "assistant", "text": "Great! Oatmeal with berries, or a banana smoothie are excellent choices."}
+      ],
+      "user_id": "sample_user_01",
+      "session_id": "test_session_002"
+    }
+    """
+    try:
+        logger.info(f"Received extraction request with history for user: {request.user_id}")
+        
+        # Convert Pydantic HistoryMessage objects to dicts for the extractor
+        history_dicts = []
+        if request.recent_history:
+            history_dicts = [
+                {"role": msg.role, "text": msg.text} 
+                for msg in request.recent_history
+            ]
+        
+        # STEP 1: Extract behaviors and get standalone query (LLM call - cannot optimize)
+        extraction_result = run_behavior_extraction_with_history(
+            prompt=request.prompt,
+            recent_history=history_dicts
+        )
+
+        if not extraction_result.success:
+            logger.error(f"Extraction failed: {extraction_result.error}")
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={
+                    "success": False,
+                    "data": None,
+                    "error": extraction_result.error or "Extraction failed"
+                }
+            )
+        
+        logger.info(f"Extraction process is successful. extracted results : {extraction_result.model_dump_json(indent=2)}")
+
+        # STEP 2: Search for related behaviors using 3D hybrid retrieval (FAST - priority)
+        related_behaviors = []
+        hybrid_response = None
+        if extraction_result.standalone_query:
+            try:
+                from services.openAiClient import embed_text
+                
+                # Use the enriched standalone query for similarity search
+                query_embedding = embed_text(extraction_result.standalone_query)
+                
+                # 3D Hybrid Search: Dense (semantic) + Sparse (BM25) + Metadata (intent filter)
+                hybrid_response = search_similar_behavior_3D(
+                    user_id=request.user_id,
+                    query_embedding=query_embedding,
+                    query_text=extraction_result.standalone_query,
+                    session_id=request.session_id,
+                    required_intents=extraction_result.required_intents
+                )
+                logger.info(f"[3D] Found {len(hybrid_response.results)} similar behaviors for standalone query: '{extraction_result.standalone_query}'")
+                logger.info(f"[3D] Required intents boost: {extraction_result.required_intents}")
+
+                logger.info(
+                    f"[3D] Hybrid search returned {len(hybrid_response.results)} results, "
+                    f"{len(hybrid_response.decay_updates)} pending decay updates, "
+                    f"{len(hybrid_response.accessed_behavior_ids)} access timestamps to update"
+                )
+                
+                # Filter by relevance threshold
+                related_behaviors = [
+                    {
+                        "behavior_id": b.behavior_id,
+                        "behavior_text": b.behavior_text,
+                        "distance": b.distance,
+                        "intent": b.intent,
+                        "target": b.target,
+                        "context": b.context,
+                        "polarity": b.polarity,
+                        "credibility": b.credibility,
+                    }
+                    for b in hybrid_response.results
+                    if b.distance <= RELATED_BEHAVIORS_DISTANCE_THRESHOLD
+                ]
+                
+                logger.info(
+                    f"[3D] Returning {len(related_behaviors)} related behaviors "
+                    f"(filtered {len(hybrid_response.results) - len(related_behaviors)} below threshold, "
+                    f"distance_threshold: {RELATED_BEHAVIORS_DISTANCE_THRESHOLD})"
+                )
+            except Exception as e:
+                logger.error(f"Failed to search related behaviors: {str(e)}")
+        
+        # STEP 3: Schedule behavior storage in background (ASYNC - non-blocking)
+        background_tasks.add_task(
+            _store_behaviors_async,
+            extraction_result,
+            request.user_id,
+            request.session_id
+        )
+        logger.info(f"Scheduled async storage of behaviors for user: {request.user_id}")
+        
+        # STEP 3b: Schedule retrieval updates in background (decay persistence + last_accessed_at)
+        if hybrid_response and (hybrid_response.decay_updates or hybrid_response.accessed_behavior_ids):
+            background_tasks.add_task(
+                persist_retrieval_updates_batch,
+                hybrid_response.decay_updates,
+                hybrid_response.accessed_behavior_ids,
+                request.user_id
+            )
+            logger.info(
+                f"Scheduled async retrieval updates: "
+                f"{len(hybrid_response.decay_updates)} decay updates, "
+                f"{len(hybrid_response.accessed_behavior_ids)} access timestamps"
+            )
+
+        # STEP 4: Return response IMMEDIATELY with related behaviors only
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "data": {
+                    "standalone_query": extraction_result.standalone_query,
+                    "required_intents": extraction_result.required_intents,
+                    "original_prompt": request.prompt,
+                    "related_behaviors": related_behaviors,
+                    "extraction_time_ms": extraction_result.extraction_time,
+                    "user_id": request.user_id
+                },
+                "error": None
+            }
+        )
+    
+    except ValueError as e:
+        # Validation error (e.g., invalid input)
+        logger.exception("Validation error during extraction with history")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "success": False,
+                "data": None,
+                "error": f"Validation error: {str(e)}"
+            }
+        )
+    
+    except Exception as e:
+        # Unexpected error
+        logger.exception("Unexpected error during extraction with history")
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
