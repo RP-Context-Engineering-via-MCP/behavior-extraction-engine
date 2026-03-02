@@ -484,9 +484,25 @@ def _flag_and_create_conflict(
     user_id: str,
     stored: StoredBehavior,
     similarity_distance: float,
-    llm_explanation: str
+    llm_explanation: str,
+    old_polarity: Optional[str] = None,
+    new_polarity: Optional[str] = None,
+    old_target: Optional[str] = None,
+    new_target: Optional[str] = None
 ) -> None:
-    """Flag both behaviors and create a conflict record."""
+    """Flag both behaviors and create a conflict record.
+    
+    Args:
+        existing_behavior_id: ID of the existing behavior
+        user_id: User ID
+        stored: New StoredBehavior to insert
+        similarity_distance: Distance between behaviors
+        llm_explanation: LLM analysis of the conflict
+        old_polarity: Polarity of existing behavior (for drift detection)
+        new_polarity: Polarity of new behavior (for drift detection)
+        old_target: Target of existing behavior (for drift detection)
+        new_target: Target of new behavior (for drift detection)
+    """
     update_behavior_state(
         behavior_id=existing_behavior_id,
         user_id=user_id,
@@ -503,7 +519,11 @@ def _flag_and_create_conflict(
         behavior_id_2=stored.behavior_id,
         conflict_type=ConflictType.USER_DECISION_NEEDED,
         similarity_distance=similarity_distance,
-        llm_analysis=llm_explanation
+        llm_analysis=llm_explanation,
+        old_polarity=old_polarity,
+        new_polarity=new_polarity,
+        old_target=old_target,
+        new_target=new_target
     )
 
 
@@ -575,7 +595,11 @@ def _handle_llm_conflict_analysis(
             user_id=user_id,
             stored=stored,
             similarity_distance=existing.distance,
-            llm_explanation=conflict_analysis.explanation
+            llm_explanation=conflict_analysis.explanation,
+            old_polarity=existing.polarity,
+            new_polarity=canonical.polarity,
+            old_target=existing.target,
+            new_target=canonical.target
         )
         stored_behaviors.append(stored)
         return (True, True)
@@ -587,7 +611,11 @@ def _handle_llm_conflict_analysis(
             user_id=user_id,
             stored=stored,
             similarity_distance=existing.distance,
-            llm_explanation=conflict_analysis.explanation
+            llm_explanation=conflict_analysis.explanation,
+            old_polarity=existing.polarity,
+            new_polarity=canonical.polarity,
+            old_target=existing.target,
+            new_target=canonical.target
         )
         stored_behaviors.append(stored)
         return (True, True)
@@ -748,7 +776,11 @@ def _handle_potential_conflict(
             user_id=user_id,
             stored=stored,
             similarity_distance=existing.distance,
-            llm_explanation=conflict_analysis.explanation
+            llm_explanation=conflict_analysis.explanation,
+            old_polarity=existing.polarity,
+            new_polarity=canonical.polarity,
+            old_target=existing.target,
+            new_target=canonical.target
         )
         stored_behaviors.append(stored)
         return (True, True)
@@ -789,7 +821,11 @@ def _handle_potential_conflict(
                 user_id=user_id,
                 stored=stored,
                 similarity_distance=existing.distance,
-                llm_explanation=conflict_analysis.explanation
+                llm_explanation=conflict_analysis.explanation,
+                old_polarity=existing.polarity,
+                new_polarity=canonical.polarity,
+                old_target=existing.target,
+                new_target=canonical.target
             )
             stored_behaviors.append(stored)
             return (True, True)
@@ -1671,7 +1707,11 @@ def _process_candidate_with_tracking(
                     user_id=user_id,
                     stored=stored,
                     similarity_distance=existing.distance,
-                    llm_explanation=conflict_analysis.explanation
+                    llm_explanation=conflict_analysis.explanation,
+                    old_polarity=existing.polarity,
+                    new_polarity=canonical.polarity,
+                    old_target=existing.target,
+                    new_target=canonical.target
                 )
                 stored_behaviors.append(stored)
                 
@@ -1756,7 +1796,11 @@ def _process_candidate_with_tracking(
                 user_id=user_id,
                 stored=stored,
                 similarity_distance=existing.distance,
-                llm_explanation=conflict_analysis.explanation
+                llm_explanation=conflict_analysis.explanation,
+                old_polarity=existing.polarity,
+                new_polarity=canonical.polarity,
+                old_target=existing.target,
+                new_target=canonical.target
             )
             stored_behaviors.append(stored)
             
@@ -1838,7 +1882,11 @@ def _process_candidate_with_tracking(
                     user_id=user_id,
                     stored=stored,
                     similarity_distance=existing.distance,
-                    llm_explanation=conflict_analysis.explanation
+                    llm_explanation=conflict_analysis.explanation,
+                    old_polarity=existing.polarity,
+                    new_polarity=canonical.polarity,
+                    old_target=existing.target,
+                    new_target=canonical.target
                 )
                 stored_behaviors.append(stored)
                 

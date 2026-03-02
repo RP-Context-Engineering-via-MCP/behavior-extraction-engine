@@ -13,6 +13,7 @@ from models.behavior import (
     BehaviorState
 )
 from services.credibilityCalculator import calculate_reinforcement_boost, apply_lazy_decay
+from services.eventPublisher import get_event_publisher
 from config.configurations import DECAY_GRACE_PERIOD_SECONDS
 import time
 import uuid
@@ -120,6 +121,25 @@ def insert_behavior(payload: dict):
             , payload
             )
         conn.commit()
+    
+    # Publish behavior.created event for drift detection
+    try:
+        publisher = get_event_publisher()
+        publisher.publish_behavior_created(
+            user_id=payload.get('user_id'),
+            behavior_id=payload.get('behavior_id'),
+            target=payload.get('target') or '',
+            intent=payload.get('intent') or '',
+            context=payload.get('context') or '',
+            polarity=payload.get('polarity') or '',
+            credibility=payload.get('credibility', 0.0),
+            reinforcement_count=payload.get('reinforcement_count', 1),
+            state=payload.get('behavior_state', 'ACTIVE'),
+            created_at=payload.get('created_at', int(time.time())),
+            last_seen_at=payload.get('last_seen_at', int(time.time()))
+        )
+    except Exception as e:
+        logger.warning(f"Failed to publish behavior.created event: {e}")
 
 def insert_prompt_segment(segment_text: str, user_id: str) -> SegmentInsertResult:
     """
@@ -285,6 +305,19 @@ def reinforce_behavior(
                     f"credibility {current_credibility:.3f} → {new_credibility:.3f}, "
                     f"count {current_count} → {new_count}"
                 )
+                
+                # Publish behavior.reinforced event for drift detection
+                try:
+                    publisher = get_event_publisher()
+                    publisher.publish_behavior_reinforced(
+                        user_id=user_id,
+                        behavior_id=behavior_id,
+                        reinforcement_count=new_count,
+                        credibility=new_credibility,
+                        last_seen_at=current_timestamp
+                    )
+                except Exception as pub_error:
+                    logger.warning(f"Failed to publish behavior.reinforced event: {pub_error}")
                 
                 return ReinforcementResult(
                     success=True,
@@ -965,7 +998,11 @@ def insert_conflict(
     behavior_id_2: str,
     conflict_type: ConflictType,
     similarity_distance: float,
-    llm_analysis: Optional[str] = None
+    llm_analysis: Optional[str] = None,
+    old_polarity: Optional[str] = None,
+    new_polarity: Optional[str] = None,
+    old_target: Optional[str] = None,
+    new_target: Optional[str] = None
 ) -> str:
     """
     Store a detected conflict between two behaviors in the database.
@@ -976,14 +1013,19 @@ def insert_conflict(
     - Type of conflict (resolvable vs needs user input)
     - LLM's analysis and reasoning
     - Resolution status and outcome
+    - Polarity and target information for drift detection
     
     Args:
         user_id: User whose behaviors conflict
-        behavior_id_1: First behavior ID
-        behavior_id_2: Second behavior ID
+        behavior_id_1: First behavior ID (existing/old behavior)
+        behavior_id_2: Second behavior ID (new behavior)
         conflict_type: RESOLVABLE or USER_DECISION_NEEDED
         similarity_distance: Embedding distance between behaviors
         llm_analysis: Optional LLM explanation of the conflict
+        old_polarity: Polarity of existing behavior (POSITIVE/NEGATIVE)
+        new_polarity: Polarity of new behavior (POSITIVE/NEGATIVE)
+        old_target: Target of existing behavior
+        new_target: Target of new behavior
         
     Returns:
         conflict_id: UUID of the created conflict record
@@ -995,7 +1037,9 @@ def insert_conflict(
         >>> conflict_id = insert_conflict(
         ...     "user123", "beh_abc", "beh_xyz",
         ...     ConflictType.RESOLVABLE, 0.22,
-        ...     "Behaviors contradict in same domain"
+        ...     "Behaviors contradict in same domain",
+        ...     old_polarity="POSITIVE", new_polarity="NEGATIVE",
+        ...     old_target="python", new_target="python"
         ... )
     """
     try:
@@ -1015,9 +1059,13 @@ def insert_conflict(
                         similarity_distance,
                         llm_analysis,
                         resolution_status,
-                        created_at
+                        created_at,
+                        old_polarity,
+                        new_polarity,
+                        old_target,
+                        new_target
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         conflict_id,
@@ -1028,15 +1076,39 @@ def insert_conflict(
                         similarity_distance,
                         llm_analysis,
                         ResolutionStatus.PENDING.value,
-                        current_timestamp
+                        current_timestamp,
+                        old_polarity,
+                        new_polarity,
+                        old_target,
+                        new_target
                     )
                 )
                 conn.commit()
         
         logger.info(
             f"Stored conflict {conflict_id}: {behavior_id_1} <-> {behavior_id_2} "
-            f"(distance: {similarity_distance:.3f}, type: {conflict_type.value})"
+            f"(distance: {similarity_distance:.3f}, type: {conflict_type.value}, "
+            f"polarity: {old_polarity}→{new_polarity}, target: {old_target}→{new_target})"
         )
+        
+        # Publish behavior.conflict.resolved event for drift detection
+        try:
+            publisher = get_event_publisher()
+            publisher.publish_conflict_resolved(
+                user_id=user_id,
+                conflict_id=conflict_id,
+                behavior_id_1=behavior_id_1,
+                behavior_id_2=behavior_id_2,
+                conflict_type=conflict_type.value,
+                resolution_status=ResolutionStatus.PENDING.value,
+                old_polarity=old_polarity,
+                new_polarity=new_polarity,
+                old_target=old_target,
+                new_target=new_target,
+                created_at=current_timestamp
+            )
+        except Exception as pub_error:
+            logger.warning(f"Failed to publish behavior.conflict.resolved event: {pub_error}")
         
         return conflict_id
         
@@ -1175,6 +1247,18 @@ def supersede_behavior(
                     f"Superseded behavior {old_behavior_id} with {new_behavior_id} "
                     f"(last_accessed_at updated)"
                 )
+                
+                # Publish behavior.superseded event for drift detection
+                try:
+                    publisher = get_event_publisher()
+                    publisher.publish_behavior_superseded(
+                        user_id=user_id,
+                        behavior_id=old_behavior_id,
+                        superseded_by=new_behavior_id
+                    )
+                except Exception as pub_error:
+                    logger.warning(f"Failed to publish behavior.superseded event: {pub_error}")
+                
                 return True
                 
     except Exception as e:

@@ -19,5 +19,8 @@ python-dotenv==1.0.1
 # HTTP Client (dependency for openai/supabase)
 httpx==0.28.1
 
+# Redis (for event publishing to Drift Detection Service)
+redis==5.0.1
+
 # Utility
 typing-extensions==4.12.2

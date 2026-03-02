@@ -230,8 +230,8 @@ class BehaviorConflict(BaseModel):
         description="Unique identifier for the conflict"
     )
     user_id: str = Field(..., description="User whose behaviors conflict")
-    behavior_id_1: str = Field(..., description="First conflicting behavior ID")
-    behavior_id_2: str = Field(..., description="Second conflicting behavior ID")
+    behavior_id_1: str = Field(..., description="First conflicting behavior ID (existing/old)")
+    behavior_id_2: str = Field(..., description="Second conflicting behavior ID (new)")
     conflict_type: ConflictType = Field(..., description="Type of conflict detected")
     similarity_distance: float = Field(..., ge=0.0, description="Embedding distance between behaviors")
     llm_analysis: Optional[str] = Field(None, description="LLM's explanation of the conflict")
@@ -245,6 +245,11 @@ class BehaviorConflict(BaseModel):
         default_factory=lambda: int(time.time()),
         description="Timestamp when conflict was detected"
     )
+    # Drift detection fields - track polarity/target changes for preference reversal detection
+    old_polarity: Optional[str] = Field(None, description="Polarity of existing behavior (POSITIVE/NEGATIVE)")
+    new_polarity: Optional[str] = Field(None, description="Polarity of new behavior (POSITIVE/NEGATIVE)")
+    old_target: Optional[str] = Field(None, description="Target of existing behavior")
+    new_target: Optional[str] = Field(None, description="Target of new behavior")
 
 
 class ConflictAnalysisType(str, Enum):

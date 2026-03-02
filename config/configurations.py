@@ -141,3 +141,18 @@ INTENT_AFFINITY = {
     frozenset({"COMMUNICATION", "CONSTRAINT"}): 0.10,
     frozenset({"COMMUNICATION", "SKILL"}): 0.10,
 }
+
+# ============================================================================
+# Redis Configuration (for Drift Detection Service integration)
+# Events are published to Redis Streams for real-time drift detection
+# ============================================================================
+
+# Redis connection URL (default: local Redis on port 6379)
+# Format: redis://[username:password@]host:port/db
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# Redis Stream name for behavior events
+REDIS_STREAM_NAME = os.getenv("REDIS_STREAM_NAME", "behavior.events")
+
+# Whether event publishing is enabled (disable for testing without Redis)
+REDIS_EVENTS_ENABLED = os.getenv("REDIS_EVENTS_ENABLED", "true").lower() == "true"
