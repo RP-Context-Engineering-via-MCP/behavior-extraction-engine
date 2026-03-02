@@ -79,25 +79,38 @@ SEMANTIC_RELEVANCE_THRESHOLD: float = 0.55
 # Maximum cosine *distance* value used by the /v2/extract endpoint to
 # decide which retrieved behaviors are returned to the caller as "related".
 # (distance = 1 - hybrid_score, so lower is closer)
-RELATED_BEHAVIORS_DISTANCE_THRESHOLD: float = 0.72
+# 0.73 provides a small safety margin for behaviors whose densely-computed
+# distance lands just above 0.72 after intent boosting.
+RELATED_BEHAVIORS_DISTANCE_THRESHOLD: float = 0.73
 
 # ---------------------------------------------------------------------------
 # TGHR – Tuple-Guided Hybrid Retrieval (3D search) configuration
 # ---------------------------------------------------------------------------
 # hybrid_score = DENSE_W * semantic + SPARSE_W * bm25 + INTENT_BOOST_W * intent_match
+#
+# Weight rationale (must sum to 1.0):
+#   Dense  0.50 — primary relevance signal (semantic similarity)
+#   Sparse 0.25 — keyword overlap bonus (BM25 via tsvector)
+#   Intent 0.25 — LLM-predicted intent is a high-quality signal; giving it
+#                 more weight anchors retrieval to the semantic "type" of the
+#                 query, preventing fringe behaviors from crowding out
+#                 intent-matched ones that sit slightly further in dense space.
 
 # Dense (semantic / cosine) signal weight.
-HYBRID_DENSE_WEIGHT: float = 0.55
+HYBRID_DENSE_WEIGHT: float = 0.50
 
 # Sparse (BM25 / tsvector) signal weight.
-HYBRID_SPARSE_WEIGHT: float = 0.30
+HYBRID_SPARSE_WEIGHT: float = 0.25
 
 # Intent-match soft boost weight.
 # NOT a hard filter — non-matching intents still appear if dense+sparse score well.
-HYBRID_INTENT_BOOST_WEIGHT: float = 0.15
+HYBRID_INTENT_BOOST_WEIGHT: float = 0.25
 
 # Maximum results fetched from DB before threshold / gap filtering.
-HYBRID_SEARCH_LIMIT: int = 30
+# 40 provides enough headroom for users with ~50-100 stored behaviors without
+# over-querying in production (where the partitioned table keeps per-user counts
+# well below a few hundred in typical use).
+HYBRID_SEARCH_LIMIT: int = 40
 
 # Results whose hybrid_score falls below this value are treated as irrelevant.
 HYBRID_SCORE_THRESHOLD: float = 0.10
@@ -130,10 +143,14 @@ ALL_INTENT_TYPES: list[str] = [
 # Value: affinity 0.0-1.0 (exact match handled separately as 1.0).
 #
 # Example: a HABIT behavior about vitamins is relevant when searching for
-# CONSTRAINT behaviors about health → HABIT↔CONSTRAINT affinity = 0.50.
+# CONSTRAINT behaviors about health → HABIT↔CONSTRAINT affinity = 0.65.
 INTENT_AFFINITY: dict[frozenset, float] = {
-    frozenset({"HABIT", "CONSTRAINT"}): 0.50,
-    frozenset({"HABIT", "PREFERENCE"}): 0.40,
+    # HABIT behaviors are frequently the stored equivalent of PREFERENCE /
+    # CONSTRAINT statements ("always uses dark mode" ≡ "prefers dark mode").
+    # Raising these affinities ensures HABIT behaviors surface when a user
+    # queries for their preferences or constraints, and vice-versa.
+    frozenset({"HABIT", "CONSTRAINT"}): 0.65,   # was 0.50
+    frozenset({"HABIT", "PREFERENCE"}): 0.60,   # was 0.40
     frozenset({"PREFERENCE", "CONSTRAINT"}): 0.35,
     frozenset({"COMMUNICATION", "PREFERENCE"}): 0.30,
     frozenset({"COMMUNICATION", "HABIT"}): 0.20,

@@ -86,7 +86,7 @@ def extract_behaviors(request: ExtractRequest):
         if not extraction_result.success:
             logger.error(f"Extraction failed: {extraction_result.error}")
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_502_BAD_GATEWAY,
                 content={
                     "success": False,
                     "data": None,
@@ -330,7 +330,7 @@ def calculate_similarity(request: BehaviorSimilarityRequest):
                 f"Failed to generate embedding for behavior1: {str(e)}"
             )
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_502_BAD_GATEWAY,
                 content={
                     "success": False,
                     "data": None,
@@ -346,7 +346,7 @@ def calculate_similarity(request: BehaviorSimilarityRequest):
                 f"Failed to generate embedding for behavior2: {str(e)}"
             )
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_502_BAD_GATEWAY,
                 content={
                     "success": False,
                     "data": None,
@@ -366,7 +366,7 @@ def calculate_similarity(request: BehaviorSimilarityRequest):
         except Exception as e:
             logger.error(f"Failed to calculate distance: {str(e)}")
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_502_BAD_GATEWAY,
                 content={
                     "success": False,
                     "data": None,
@@ -519,7 +519,7 @@ def extract_behaviors_with_history(
         if not extraction_result.success:
             logger.error(f"Extraction failed: {extraction_result.error}")
             return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_502_BAD_GATEWAY,
                 content={
                     "success": False,
                     "data": None,
