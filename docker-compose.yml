@@ -1,0 +1,38 @@
+services:
+  # FastAPI Application
+  app:
+    build: .
+    container_name: behavior-extraction-engine
+    ports:
+      - "8001:8001"
+    environment:
+      # Database Configuration (using Supabase from .env)
+      DATABASE_URL: ${DATABASE_URL}
+      
+      # Redis Configuration (using shared Redis)
+      REDIS_URL: redis://shared-redis:6379/0
+      REDIS_STREAM_NAME: behavior.events
+      REDIS_EVENTS_ENABLED: "true"
+      
+      # Azure OpenAI Configuration (set these in .env file)
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
+      
+      # Application Configuration
+      SAMPLE_USERID: ${SAMPLE_USERID:-user_12345}
+      PROFILE_SERVICE_BASE_URL: ${PROFILE_SERVICE_BASE_URL:-http://localhost:8001}
+      PROFILE_SIGNALS_DEFAULT_LIMIT: ${PROFILE_SIGNALS_DEFAULT_LIMIT:-10}
+      PROFILE_SIGNALS_MAX_LIMIT: ${PROFILE_SIGNALS_MAX_LIMIT:-50}
+    
+    volumes:
+      - ./:/app
+    
+    networks:
+      - shared-network
+    
+    restart: unless-stopped
+
+networks:
+  shared-network:
+    external: true
+    name: shared-network

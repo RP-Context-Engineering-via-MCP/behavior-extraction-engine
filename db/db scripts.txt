@@ -20,3 +20,21 @@ CREATE INDEX behaviors_credibility_idx
   ON public.behaviors (credibility DESC);
 
 alter table behaviors add column last_accessed_at bigint
+
+-- ============================================================================
+-- Profile Signals Table (for Profile Service Integration)
+-- Stores profile_signals extracted from each prompt for cold-start and drift fallback
+-- ============================================================================
+
+CREATE TABLE user_profile_signals (
+    id              UUID    DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id         TEXT    NOT NULL,
+    prompt_id       TEXT    NOT NULL,
+    profile_signals JSONB   NOT NULL,
+    extracted_at    BIGINT  NOT NULL,
+    UNIQUE (user_id, prompt_id)
+);
+
+-- Index for efficient retrieval of recent signals per user (used by drift fallback)
+CREATE INDEX idx_user_profile_signals_user_extracted
+    ON user_profile_signals (user_id, extracted_at DESC);

@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 # Lifespan — startup / shutdown
 # ---------------------------------------------------------------------------
 
+class BehaviorsByIdsRequest(BaseModel):
+    """Request model for retrieving specific behaviors by IDs"""
+    user_id: str = Field(..., description="User ID who owns the behaviors")
+    behavior_ids: list[str] = Field(..., description="List of behavior IDs to retrieve")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Initializing database connection pool")

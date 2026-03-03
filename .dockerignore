@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Documentation
+*.md
+response.md
+seed_prompts_ordered.md
+
+# Environment
+.env
+.env.local
+
+# Database scripts (not needed in container)
+db/setup_profile_signals_table.ps1
+db/setup_profile_signals_table.sh
+db/db\ scripts.txt
+db/existing_db_scripts.txt
+
+# Test files
+tests/
+test_*.py
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+
+# Development scripts
+check_db.py
+check_redis.py
+populate_data.py
+run.py
+test_extraction.py
