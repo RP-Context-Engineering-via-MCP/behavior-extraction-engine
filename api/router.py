@@ -12,20 +12,27 @@ Registered in app.py via:
 from fastapi import APIRouter, BackgroundTasks, Query, status
 from fastapi.responses import JSONResponse
 
-from api.schemas import BehaviorSimilarityRequest, ConflictResolutionRequest
+from api.schemas import (
+    BehaviorSimilarityRequest,
+    BehaviorsByIdsRequest,
+    ConflictResolutionRequest,
+)
 from config.configurations import RELATED_BEHAVIORS_DISTANCE_THRESHOLD
 from models.behavior import ExtractRequest, ExtractRequestWithHistory
 from services.behaviorRepository import (
+    get_behaviors_by_ids,
     get_behaviors_by_user,
     get_user_conflicts,
     persist_retrieval_updates_batch,
     resolve_conflict,
     search_similar_behavior_3D,
 )
+from services.profileSignalRepository import get_profile_signal_repository
 from services.extractor import (
     run_behavior_extraction,
     run_behavior_extraction_with_history,
     store_behavior,
+    dispatch_profile_signals_sync,
 )
 from utils.embedding_utils import get_behavior_embedding
 from utils.similarity_utils import calculate_behavior_distance
@@ -61,6 +68,18 @@ def _store_behaviors_async(extraction_result, user_id: str, session_id: str) -> 
         logger.error(
             f"[ASYNC] Failed to store behaviors for user {user_id}: {str(e)}"
         )
+    
+    # Dispatch profile signals asynchronously
+    if hasattr(extraction_result, 'profile_signals') and extraction_result.profile_signals:
+        try:
+            dispatch_profile_signals_sync(
+                user_id=user_id,
+                prompt_id=session_id,
+                profile_signals=extraction_result.profile_signals
+            )
+            logger.info(f"[ASYNC] Profile signals dispatched for user: {user_id}")
+        except Exception as e:
+            logger.warning(f"[ASYNC] Failed to dispatch profile signals: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +126,18 @@ def extract_behaviors(request: ExtractRequest):
         except Exception as e:
             logger.error(f"Failed to store behaviors: {str(e)}")
             # stored_behaviors remains empty if storage fails
+
+        # Dispatch profile signals for Profile Service integration
+        if extraction_result.profile_signals:
+            try:
+                dispatch_profile_signals_sync(
+                    user_id=request.user_id,
+                    prompt_id=request.session_id,
+                    profile_signals=extraction_result.profile_signals
+                )
+                logger.info(f"Profile signals dispatched for user: {request.user_id}")
+            except Exception as e:
+                logger.warning(f"Failed to dispatch profile signals: {str(e)}")
 
         total_behaviors = sum(
             len(seg.behaviors) for seg in extraction_result.segments
@@ -650,4 +681,145 @@ def extract_behaviors_with_history(
                 "data": None,
                 "error": f"Internal server error: {str(e)}",
             },
+        )
+
+
+# ==============================================================================
+# PROFILE SERVICE INTEGRATION ENDPOINTS
+# ==============================================================================
+
+@router.post(
+    "/api/behaviors/by-ids",
+    summary="Get specific behaviors by IDs for a user",
+    description="Retrieves specific user behaviors by their behavior IDs. Returns behaviors with all details including canonical structure.",
+    response_description="List of behaviors matching the requested IDs"
+)
+def get_behaviors_by_ids_endpoint(request: BehaviorsByIdsRequest):
+    """
+    Get specific behaviors by their IDs for a user.
+    
+    This endpoint retrieves specific user behaviors by their behavior IDs,
+    allowing clients to fetch particular behaviors they need.
+    
+    Args:
+        request: BehaviorsByIdsRequest containing user_id and behavior_ids list
+        
+    Returns:
+        JSON with user_id, count, and list of matching behaviors
+    """
+    try:
+        logger.info(f"Fetching behaviors by IDs for user={request.user_id}, IDs={request.behavior_ids}")
+        
+        behaviors = get_behaviors_by_ids(
+            user_id=request.user_id,
+            behavior_ids=request.behavior_ids
+        )
+        
+        logger.info(f"Retrieved {len(behaviors)} behaviors for user={request.user_id}")
+        
+        # Return direct array as per original endpoint format
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=behaviors
+        )
+        
+    except Exception as e:
+        logger.exception(f"Error fetching behaviors by IDs for user={request.user_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=[]
+        )
+
+
+@router.get(
+    "/api/behaviors/{user_id}/signals/count",
+    summary="Get profile signal count for a user",
+    description="Returns the total count of stored profile signals for a user.",
+    response_description="Count of profile signals"
+)
+def get_profile_signal_count(user_id: str):
+    """
+    Get the total count of stored profile signals for a user.
+    
+    Useful for determining if enough signals have been collected
+    for profile assignment or drift detection.
+    
+    Args:
+        user_id: Unique user identifier
+        
+    Returns:
+        JSON with user_id and total count
+    """
+    try:
+        signal_repo = get_profile_signal_repository()
+        count = signal_repo.get_count(user_id=user_id)
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "user_id": user_id,
+                "count": count
+            }
+        )
+        
+    except Exception as e:
+        logger.exception(f"Error fetching profile signal count for user={user_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "user_id": user_id,
+                "count": 0,
+                "error": f"Failed to retrieve signal count: {str(e)}"
+            }
+        )
+
+
+@router.get(
+    "/api/behaviors/{user_id}/recent",
+    summary="Get recent profile signals for a user",
+    description="Returns the most recent profile signals for a user. Used by Profile Service during drift fallback.",
+    response_description="List of recent profile signals"
+)
+def get_recent_profile_signals(
+    user_id: str,
+    limit: int = Query(default=10, ge=1, le=50, description="Maximum number of recent signals to return")
+):
+    """
+    Get the most recent profile signals for a user.
+    
+    This endpoint is called by the Profile Service during drift fallback
+    to retrieve historical behavior patterns for profile re-matching.
+    
+    Args:
+        user_id: Unique user identifier
+        limit: Maximum number of recent signals (default: 10, max: 50)
+        
+    Returns:
+        JSON with user_id, count, and list of recent profile signals
+    """
+    try:
+        signal_repo = get_profile_signal_repository()
+        behaviors = signal_repo.get_recent(user_id=user_id, limit=limit)
+        
+        logger.info(f"Retrieved {len(behaviors)} recent profile signals for user={user_id}")
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "user_id": user_id,
+                "count": len(behaviors),
+                "behaviors": behaviors
+            }
+        )
+        
+    except Exception as e:
+        logger.exception(f"Error fetching recent profile signals for user={user_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "user_id": user_id,
+                "count": 0,
+                "behaviors": [],
+                "error": f"Failed to retrieve recent signals: {str(e)}"
+            }
         )

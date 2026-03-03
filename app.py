@@ -12,7 +12,9 @@ Route handlers live in api/router.py.
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,11 +30,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Lifespan — startup / shutdown
 # ---------------------------------------------------------------------------
-
-class BehaviorsByIdsRequest(BaseModel):
-    """Request model for retrieving specific behaviors by IDs"""
-    user_id: str = Field(..., description="User ID who owns the behaviors")
-    behavior_ids: list[str] = Field(..., description="List of behavior IDs to retrieve")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -67,8 +64,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static frontend assets
-app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
+# Static frontend assets (optional - only mount if directory exists)
+frontend_dir = Path("frontend")
+if frontend_dir.exists() and frontend_dir.is_dir():
+    app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
+    logger.info("Mounted frontend static files at /frontend")
+else:
+    logger.info("Frontend directory not found, skipping static files mount")
 
 # Register all API routes
 app.include_router(router)

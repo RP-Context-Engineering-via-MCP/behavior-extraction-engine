@@ -289,6 +289,33 @@ class BehaviorEventPublisher:
         }
         return self._publish_event(event_type, event_id, published_at, payload)
     
+    def publish_profile_signals(
+        self,
+        user_id: str,
+        profile_signals: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Publish profile_signals.extracted event.
+        
+        Called when a user is in COLD_START mode and profile signals are extracted.
+        This event is consumed by the Profile Service for cold-start profiling.
+        
+        Args:
+            user_id: User identifier
+            profile_signals: Extracted profile signals dictionary
+        
+        Returns:
+            Message ID if successful, None if failed
+        """
+        event_type = "profile_signals.extracted"
+        event_id = self._generate_event_id()
+        published_at = self._get_timestamp()
+        payload = {
+            "user_id": user_id,
+            "profile_signals": profile_signals
+        }
+        return self._publish_event(event_type, event_id, published_at, payload)
+    
     def is_connected(self) -> bool:
         """Check if Redis connection is active."""
         if not self.enabled or self.client is None:

@@ -345,6 +345,21 @@ def reinforce_behavior(
                     cur, behavior_id, user_id, segment_id, current_timestamp
                 )
                 conn.commit()
+                
+                # Publish behavior.reinforced event for drift detection
+                if reinforce_result.success:
+                    try:
+                        publisher = get_event_publisher()
+                        publisher.publish_behavior_reinforced(
+                            user_id=user_id,
+                            behavior_id=behavior_id,
+                            reinforcement_count=reinforce_result.new_reinforcement_count,
+                            credibility=reinforce_result.new_credibility,
+                            last_seen_at=current_timestamp
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to publish behavior.reinforced event: {e}")
+                
                 return reinforce_result
 
     except Exception as e:
@@ -1284,6 +1299,19 @@ def supersede_behavior(
                     cur, old_behavior_id, new_behavior_id, user_id, current_timestamp
                 )
                 conn.commit()
+                
+                # Publish behavior.superseded event for drift detection
+                if success:
+                    try:
+                        publisher = get_event_publisher()
+                        publisher.publish_behavior_superseded(
+                            user_id=user_id,
+                            behavior_id=old_behavior_id,
+                            superseded_by=new_behavior_id
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to publish behavior.superseded event: {e}")
+                
                 return success
 
     except Exception as e:

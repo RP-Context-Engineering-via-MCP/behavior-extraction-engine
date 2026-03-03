@@ -1,187 +1,168 @@
 """
-Profile Service Client
+User Management Service Client
 
-HTTP client that communicates with the Profile Service for:
-1. Cold-start profile assignment (POST /api/predefined-profiles/assign-profile)
-2. Checking user profile status (GET /api/predefined-profiles/user/{user_id})
+HTTP client that communicates with the User Management Service for:
+1. Fetching user information (GET /api/users/{user_id})
+2. Updating user profiles (PUT /api/users/{user_id})
+3. Managing fallback profiles (POST /api/users/{user_id}/fallback/activate|deactivate)
+
+Note: Profile assignment features have been decoupled from this service.
 """
 
 import httpx
 import logging
 from typing import Dict, Any, Optional
 
-from config.configurations import PROFILE_SERVICE_BASE_URL
+from config.configurations import USER_MANAGEMENT_SERVICE_BASE_URL
 
 logger = logging.getLogger(__name__)
 
 
-class ProfileServiceClient:
+class UserManagementServiceClient:
     """
-    HTTP client for Profile Service API communication.
+    HTTP client for User Management Service API communication.
     
-    Handles cold-start profile assignment and user status checks.
+    Handles user data retrieval and profile management.
     All methods are designed to be fault-tolerant - they return None
     on failure rather than raising exceptions, allowing the main
-    extraction pipeline to continue even if Profile Service is unavailable.
+    extraction pipeline to continue even if the service is unavailable.
     """
     
     def __init__(self, base_url: Optional[str] = None, timeout: float = 10.0):
         """
-        Initialize the Profile Service client.
+        Initialize the User Management Service client.
         
         Args:
-            base_url: Profile Service base URL (defaults to config value)
+            base_url: User Management Service base URL (defaults to config value)
             timeout: HTTP request timeout in seconds
         """
-        self.base_url = base_url or PROFILE_SERVICE_BASE_URL
+        self.base_url = base_url or USER_MANAGEMENT_SERVICE_BASE_URL
         self.timeout = timeout
         
-    async def assign_profile(
+    async def get_user(
         self, 
-        user_id: str, 
-        profile_signals: Dict[str, Any]
+        user_id: str
     ) -> Optional[Dict[str, Any]]:
         """
-        Request profile assignment for a cold-start user.
+        Fetch user information from User Management Service.
         
-        Calls POST /api/predefined-profiles/assign-profile with the
-        extracted profile signals. The Profile Service will either:
-        - Return PENDING if more prompts needed for confident assignment
-        - Return ASSIGNED with assigned_profile_id if threshold reached
+        Calls GET /api/users/{user_id} to retrieve user profile data.
         
         Args:
             user_id: Unique user identifier
-            profile_signals: Validated profile signals from extraction
             
         Returns:
-            Response dict with status and optional profile assignment,
-            or None if request failed
+            User data dict, or None if user not found or request failed
             
         Example response:
             {
-                "status": "PENDING",
-                "prompts_collected": 3,
-                "prompts_required": 5
-            }
-            or
-            {
-                "status": "ASSIGNED",
-                "assigned_profile_id": "tech_enthusiast_v1",
-                "confidence": 0.87
+                "user_id": "user_123",
+                "username": "john_doe",
+                "email": "john@example.com",
+                "profile_data": {...}
             }
         """
-        url = f"{self.base_url}/api/predefined-profiles/assign-profile"
-        payload = {
-            "user_id": user_id,
-            "mode": "COLD_START",
-            "extracted_behavior": profile_signals
-        }
+        url = f"{self.base_url}/api/users/{user_id}"
         
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(url, json=payload)
+                response = await client.get(url)
+                
+                # 404 means user doesn't exist
+                if response.status_code == 404:
+                    logger.debug(f"User {user_id} not found in User Management Service")
+                    return None
+                    
                 response.raise_for_status()
                 result = response.json()
                 
-                logger.info(
-                    f"Profile assignment response for user={user_id}: "
-                    f"status={result.get('status')}"
-                )
+                logger.debug(f"Retrieved user data for user={user_id}")
                 return result
                 
         except httpx.HTTPStatusError as e:
             logger.warning(
-                f"Profile Service HTTP error for user={user_id}: "
+                f"User Management Service HTTP error for user={user_id}: "
                 f"{e.response.status_code} - {e.response.text}"
             )
             return None
             
         except httpx.TimeoutException:
             logger.warning(
-                f"Profile Service timeout for user={user_id} after {self.timeout}s"
+                f"User Management Service timeout for user={user_id} after {self.timeout}s"
             )
             return None
             
         except httpx.RequestError as e:
             logger.warning(
-                f"Profile Service request error for user={user_id}: {e}"
+                f"User Management Service request error for user={user_id}: {e}"
             )
             return None
             
         except Exception as e:
             logger.error(
-                f"Unexpected error calling Profile Service for user={user_id}: {e}"
+                f"Unexpected error calling User Management Service for user={user_id}: {e}"
             )
             return None
     
-    async def get_user_profile_status(
-        self, 
+    async def activate_fallback_profile(
+        self,
         user_id: str
-    ) -> Optional[Dict[str, Any]]:
+    ) -> bool:
         """
-        Get the current profile status for a user.
+        Activate fallback profile for a user.
         
-        Calls GET /api/predefined-profiles/user/{user_id} to check:
-        - Whether user exists in Profile Service
-        - Current user_mode (COLD_START, ACTIVE, etc.)
-        - Whether a profile has been assigned
+        Calls POST /api/users/{user_id}/fallback/activate
         
         Args:
             user_id: Unique user identifier
             
         Returns:
-            User status dict, or None if user not found or request failed
-            
-        Example response:
-            {
-                "user_id": "user_123",
-                "user_mode": "COLD_START",
-                "assigned_profile_id": null,
-                "prompts_collected": 2
-            }
+            True if successful, False otherwise
         """
-        url = f"{self.base_url}/api/predefined-profiles/user/{user_id}"
+        url = f"{self.base_url}/api/users/{user_id}/fallback/activate"
         
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(url)
-                
-                # 404 means user doesn't exist yet - this is expected for new users
-                if response.status_code == 404:
-                    logger.debug(f"User {user_id} not found in Profile Service")
-                    return None
-                    
+                response = await client.post(url)
                 response.raise_for_status()
-                return response.json()
+                logger.info(f"Activated fallback profile for user={user_id}")
+                return True
                 
-        except httpx.HTTPStatusError as e:
-            logger.warning(
-                f"Profile Service HTTP error checking user={user_id}: "
-                f"{e.response.status_code}"
-            )
-            return None
-            
-        except httpx.TimeoutException:
-            logger.warning(
-                f"Profile Service timeout checking user={user_id}"
-            )
-            return None
-            
-        except httpx.RequestError as e:
-            logger.warning(
-                f"Profile Service request error checking user={user_id}: {e}"
-            )
-            return None
-            
         except Exception as e:
-            logger.error(
-                f"Unexpected error checking Profile Service for user={user_id}: {e}"
-            )
-            return None
+            logger.warning(f"Failed to activate fallback profile for user={user_id}: {e}")
+            return False
+    
+    async def deactivate_fallback_profile(
+        self,
+        user_id: str
+    ) -> bool:
+        """
+        Deactivate fallback profile for a user.
+        
+        Calls POST /api/users/{user_id}/fallback/deactivate
+        
+        Args:
+            user_id: Unique user identifier
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        url = f"{self.base_url}/api/users/{user_id}/fallback/deactivate"
+        
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(url)
+                response.raise_for_status()
+                logger.info(f"Deactivated fallback profile for user={user_id}")
+                return True
+                
+        except Exception as e:
+            logger.warning(f"Failed to deactivate fallback profile for user={user_id}: {e}")
+            return False
     
     async def health_check(self) -> bool:
         """
-        Check if Profile Service is reachable and healthy.
+        Check if User Management Service is reachable and healthy.
         
         Returns:
             True if service is healthy, False otherwise
@@ -197,12 +178,18 @@ class ProfileServiceClient:
 
 
 # Singleton instance for convenience
-_client_instance: Optional[ProfileServiceClient] = None
+_client_instance: Optional[UserManagementServiceClient] = None
 
 
-def get_profile_service_client() -> ProfileServiceClient:
-    """Get or create the singleton ProfileServiceClient instance."""
+def get_user_management_client() -> UserManagementServiceClient:
+    """Get or create the singleton UserManagementServiceClient instance."""
     global _client_instance
     if _client_instance is None:
-        _client_instance = ProfileServiceClient()
+        _client_instance = UserManagementServiceClient()
     return _client_instance
+
+
+# Backward compatibility alias
+def get_profile_service_client() -> UserManagementServiceClient:
+    """Deprecated: Use get_user_management_client() instead."""
+    return get_user_management_client()

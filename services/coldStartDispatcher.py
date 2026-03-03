@@ -1,53 +1,47 @@
 """
 Cold Start Dispatcher
 
-Orchestrates the cold-start profiling flow after each extraction:
-1. Always saves profile_signals (needed for drift fallback regardless of mode)
-2. Checks if user is still in COLD_START mode via Profile Service
-3. If COLD_START, sends profile_signals to Profile Service for assignment
+Dispatcher that saves profile signals locally and publishes events for users in COLD_START mode.
+
+This dispatcher:
+1. Saves profile_signals locally for drift fallback
+2. Checks user's profile_mode from User Management Service
+3. If profile_mode is COLD_START, publishes profile_signals event to Redis
+4. Maintains backward compatibility with existing extraction pipeline
 """
 
 import logging
 from typing import Dict, Any, Optional
 
-from services.profileServiceClient import (
-    ProfileServiceClient, 
-    get_profile_service_client
-)
 from services.profileSignalRepository import (
     ProfileSignalRepository,
     get_profile_signal_repository
 )
+from services.profileServiceClient import get_user_management_client
+from services.eventPublisher import get_event_publisher
 
 logger = logging.getLogger(__name__)
 
 
 class ColdStartDispatcher:
     """
-    Dispatcher that handles cold-start profile assignment flow.
+    Simplified dispatcher that persists profile signals locally.
     
-    This component runs after every extraction to:
-    1. Persist profile_signals locally (for drift fallback)
-    2. Forward signals to Profile Service if user is in COLD_START mode
-    
-    The Profile Service is the single source of truth for user mode.
-    We check it each time rather than caching, as mode can change
-    after any prompt (when profile gets assigned).
+    This component runs after every extraction to persist profile_signals
+    for drift detection and fallback scenarios. Profile assignment logic
+    has been decoupled from this service.
     """
     
     def __init__(
         self,
-        profile_client: Optional[ProfileServiceClient] = None,
         signal_repo: Optional[ProfileSignalRepository] = None
     ):
         """
-        Initialize the dispatcher with its dependencies.
+        Initialize the dispatcher with signal repository.
         
         Args:
-            profile_client: HTTP client for Profile Service (uses singleton if None)
             signal_repo: Repository for profile signals (uses singleton if None)
         """
-        self._profile_client = profile_client or get_profile_service_client()
         self._signal_repo = signal_repo or get_profile_signal_repository()
     
     async def dispatch(
@@ -57,11 +51,14 @@ class ColdStartDispatcher:
         profile_signals: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """
-        Process profile signals after extraction.
+        Save profile signals locally and publish event if user is in COLD_START mode.
         
         This is the main entry point called by the extraction pipeline.
-        It always saves signals locally, then conditionally forwards to
-        Profile Service based on user's current mode.
+        
+        Flow:
+        1. Save profile_signals locally for drift detection
+        2. Check user's profile_mode from User Management Service
+        3. If profile_mode == "COLD_START", publish profile_signals event
         
         Args:
             user_id: Unique user identifier
@@ -69,9 +66,9 @@ class ColdStartDispatcher:
             profile_signals: Validated profile signals from extraction
             
         Returns:
-            Profile Service response if called, None otherwise
+            None (profile assignment removed)
         """
-        # 1. Always save locally - needed for drift fallback regardless of mode
+        # 1. Save profile signals locally for drift detection
         try:
             self._signal_repo.save(user_id, prompt_id, profile_signals)
             logger.debug(
@@ -81,90 +78,43 @@ class ColdStartDispatcher:
             logger.error(
                 f"Failed to save profile_signals for user={user_id}: {e}"
             )
-            # Continue even if save fails - try to call Profile Service
         
-        # 2. Check if user still needs cold-start profiling
-        is_cold_start = await self._is_cold_start_user(user_id)
-        
-        if not is_cold_start:
-            logger.debug(
-                f"User {user_id} not in COLD_START mode, skipping Profile Service call"
-            )
-            return None
-        
-        # 3. Call Profile Service for assignment
-        result = await self._profile_client.assign_profile(user_id, profile_signals)
-        
-        if result:
-            status = result.get("status")
-            profile_id = result.get("assigned_profile_id")
-            
-            logger.info(
-                f"Cold-start dispatch for user={user_id}: "
-                f"status={status}, profile={profile_id}"
-            )
-            
-            # Log when profile is actually assigned
-            if status == "ASSIGNED" and profile_id:
-                logger.info(
-                    f"Profile assigned for user={user_id}: {profile_id} "
-                    f"(confidence={result.get('confidence', 'N/A')})"
-                )
-        else:
-            logger.warning(
-                f"Cold-start dispatch failed for user={user_id} - "
-                f"Profile Service unavailable or returned error"
-            )
-        
-        return result
-    
-    async def _is_cold_start_user(self, user_id: str) -> bool:
-        """
-        Check if user is currently in COLD_START mode.
-        
-        Queries the Profile Service (single source of truth) to determine
-        if the user still needs cold-start profiling. Returns True for:
-        - New users (404 from Profile Service)
-        - Users with user_mode == "COLD_START" and no assigned_profile_id
-        
-        Args:
-            user_id: Unique user identifier
-            
-        Returns:
-            True if user needs cold-start profiling, False otherwise
-        """
+        # 2. Check if user is in COLD_START mode
         try:
-            status = await self._profile_client.get_user_profile_status(user_id)
+            user_client = get_user_management_client()
+            user_data = await user_client.get_user(user_id)
             
-            # New user - not yet in Profile Service
-            if status is None:
-                logger.debug(f"User {user_id} is new, needs cold-start profiling")
-                return True
-            
-            # Already has an assigned profile - cold start is complete
-            if status.get("assigned_profile_id"):
-                logger.debug(
-                    f"User {user_id} already has profile "
-                    f"{status.get('assigned_profile_id')}, cold start complete"
+            if user_data and user_data.get("profile_mode") == "COLD_START":
+                logger.info(f"User {user_id} is in COLD_START mode, publishing profile_signals event")
+                
+                # 3. Publish profile_signals event to Redis
+                event_publisher = get_event_publisher()
+                message_id = event_publisher.publish_profile_signals(
+                    user_id=user_id,
+                    profile_signals=profile_signals
                 )
-                return False
-            
-            # Check explicit user_mode
-            user_mode = status.get("user_mode")
-            is_cold_start = user_mode == "COLD_START"
-            
-            logger.debug(
-                f"User {user_id} mode={user_mode}, is_cold_start={is_cold_start}"
-            )
-            return is_cold_start
-            
+                
+                if message_id:
+                    logger.info(
+                        f"Published profile_signals event for user={user_id} "
+                        f"(message_id: {message_id})"
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to publish profile_signals event for user={user_id}"
+                    )
+            else:
+                profile_mode = user_data.get("profile_mode", "UNKNOWN") if user_data else "UNKNOWN"
+                logger.debug(
+                    f"User {user_id} profile_mode={profile_mode}, skipping event publishing"
+                )
+                
         except Exception as e:
-            logger.error(
-                f"Could not check cold-start mode for user={user_id}: {e}"
+            logger.warning(
+                f"Failed to check user profile_mode or publish event for user={user_id}: {e}"
             )
-            # Fail safe: don't call Profile Service if we can't verify mode
-            # This prevents duplicate calls for already-profiled users
-            return False
+        
+        return None
     
     async def dispatch_sync_wrapper(
         self,

@@ -50,6 +50,12 @@ __all__ = [
     "SUPABASE_KEY",
     "DATABASE_URL",
     "SAMPLE_USERID",
+    "REDIS_URL",
+    "REDIS_STREAM_NAME",
+    "REDIS_EVENTS_ENABLED",
+    "USER_MANAGEMENT_SERVICE_BASE_URL",
+    "PROFILE_SIGNALS_DEFAULT_LIMIT",
+    "PROFILE_SIGNALS_MAX_LIMIT",
     # --- algorithm constants (re-exported from constants.py) --------------
     "ALL_INTENT_TYPES",
     "BASE_REINFORCEMENT_BOOST",
@@ -110,6 +116,16 @@ class Settings(BaseSettings):
     supabase_url: Optional[str] = None
     supabase_key: Optional[str] = None
 
+    # Redis (for Drift Detection Service integration) ----------------------------
+    redis_url: str = "redis://localhost:6379/0"
+    redis_stream_name: str = "behavior.events"
+    redis_events_enabled: bool = True
+
+    # User Management Service Integration ----------------------------------------
+    user_management_service_base_url: str = "http://user-management-service:8080"
+    profile_signals_default_limit: int = 10
+    profile_signals_max_limit: int = 50
+
     # Misc -----------------------------------------------------------------------
     sample_userid: str = "user_12345"
 
@@ -137,5 +153,13 @@ DATABASE_URL: str = _s.database_url
 
 SUPABASE_URL: Optional[str] = _s.supabase_url
 SUPABASE_KEY: Optional[str] = _s.supabase_key
+
+REDIS_URL: str = _s.redis_url
+REDIS_STREAM_NAME: str = _s.redis_stream_name
+REDIS_EVENTS_ENABLED: bool = _s.redis_events_enabled
+
+USER_MANAGEMENT_SERVICE_BASE_URL: str = _s.user_management_service_base_url
+PROFILE_SIGNALS_DEFAULT_LIMIT: int = _s.profile_signals_default_limit
+PROFILE_SIGNALS_MAX_LIMIT: int = _s.profile_signals_max_limit
 
 SAMPLE_USERID: str = _s.sample_userid
