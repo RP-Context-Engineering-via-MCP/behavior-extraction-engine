@@ -176,6 +176,118 @@ def insert_prompt_segment(segment_text: str, user_id: str) -> SegmentInsertResul
         )
 
 
+def _reinforce_behavior_on_cursor(
+    cur,
+    behavior_id: str,
+    user_id: str,
+    segment_id: Optional[str] = None,
+    current_timestamp: Optional[int] = None,
+) -> ReinforcementResult:
+    """
+    Internal helper — execute all reinforcement SQL on an **existing** cursor.
+
+    Does NOT commit; the caller is responsible for committing (or rolling back).
+    This allows the reinforcement to participate in the caller's transaction.
+
+    Args:
+        cur: An open psycopg cursor (must be inside an active connection).
+        behavior_id: ID of the behavior to reinforce.
+        user_id: User identifier (for the WHERE clause).
+        segment_id: Optional segment ID to append to prompt_history_ids.
+        current_timestamp: Unix timestamp to use; defaults to now.
+
+    Returns:
+        ReinforcementResult with success status and updated values.
+    """
+    if current_timestamp is None:
+        current_timestamp = int(time.time())
+
+    # Step 1: Fetch current behavior data
+    cur.execute(
+        """
+        SELECT 
+            credibility,
+            reinforcement_count,
+            prompt_history_ids
+        FROM behaviors
+        WHERE behavior_id = %s AND user_id = %s;
+        """,
+        (behavior_id, user_id)
+    )
+
+    result = cur.fetchone()
+
+    if not result:
+        logger.error(f"Behavior {behavior_id} not found for user {user_id}")
+        return ReinforcementResult(
+            success=False,
+            behavior_id=behavior_id,
+            new_credibility=0.0,
+            new_reinforcement_count=0,
+            credibility_boost=0.0,
+            segment_id_added=None,
+            error=f"Behavior not found: {behavior_id}"
+        )
+
+    current_credibility, current_count, prompt_history_ids = result
+
+    # Step 2: Calculate credibility boost with diminishing returns
+    boost = calculate_reinforcement_boost(
+        float(current_credibility),
+        int(current_count)
+    )
+    new_credibility = min(1.0, float(current_credibility) + boost)
+    new_count = int(current_count) + 1
+
+    # Step 3: Prepare updated prompt_history_ids
+    updated_history_ids = list(prompt_history_ids) if prompt_history_ids else []
+    if segment_id and segment_id not in updated_history_ids:
+        updated_history_ids.append(segment_id)
+
+    # Step 4: Update behavior in database
+    # Reset last_decay_applied_at to current time when reinforced.
+    # Set last_accessed_at to mark this behavior as actively used.
+    cur.execute(
+        """
+        UPDATE behaviors
+        SET 
+            credibility = %s,
+            reinforcement_count = %s,
+            last_seen_at = %s,
+            last_decay_applied_at = %s,
+            last_accessed_at = %s,
+            prompt_history_ids = %s
+        WHERE behavior_id = %s AND user_id = %s;
+        """,
+        (
+            new_credibility,
+            new_count,
+            current_timestamp,
+            current_timestamp,
+            current_timestamp,
+            updated_history_ids,
+            behavior_id,
+            user_id
+        )
+    )
+
+    logger.info(
+        f"Reinforced behavior {behavior_id}: "
+        f"credibility {current_credibility:.3f} → {new_credibility:.3f}, "
+        f"count {current_count} → {new_count}"
+    )
+
+    return ReinforcementResult(
+        success=True,
+        behavior_id=behavior_id,
+        new_credibility=new_credibility,
+        new_reinforcement_count=new_count,
+        credibility_boost=boost,
+        segment_id_added=segment_id if segment_id else None,
+        error=None
+    )
+
+
 def reinforce_behavior(
     behavior_id: str,
     user_id: str,
@@ -184,18 +296,18 @@ def reinforce_behavior(
     """
     Reinforce an existing behavior by incrementing reinforcement count,
     boosting credibility, updating timestamp, and optionally adding segment reference.
-    
+
     This is called when a duplicate or highly similar behavior is detected,
     instead of inserting a new behavior.
-    
+
     Args:
         behavior_id: ID of the behavior to reinforce
         user_id: User identifier (for validation)
         segment_id: Optional segment ID to add to prompt_history_ids
-        
+
     Returns:
         ReinforcementResult with success status and updated values
-        
+
     Process:
         1. Fetch current behavior data
         2. Calculate credibility boost (diminishing returns)
@@ -206,96 +318,15 @@ def reinforce_behavior(
     """
     try:
         current_timestamp = int(time.time())
-        
+
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
-                # Step 1: Fetch current behavior data
-                cur.execute(
-                    """
-                    SELECT 
-                        credibility,
-                        reinforcement_count,
-                        prompt_history_ids
-                    FROM behaviors
-                    WHERE behavior_id = %s AND user_id = %s;
-                    """,
-                    (behavior_id, user_id)
+                reinforce_result = _reinforce_behavior_on_cursor(
+                    cur, behavior_id, user_id, segment_id, current_timestamp
                 )
-                
-                result = cur.fetchone()
-                
-                if not result:
-                    logger.error(f"Behavior {behavior_id} not found for user {user_id}")
-                    return ReinforcementResult(
-                        success=False,
-                        behavior_id=behavior_id,
-                        new_credibility=0.0,
-                        new_reinforcement_count=0,
-                        credibility_boost=0.0,
-                        segment_id_added=None,
-                        error=f"Behavior not found: {behavior_id}"
-                    )
-                
-                current_credibility, current_count, prompt_history_ids = result
-                
-                # Step 2: Calculate credibility boost with diminishing returns
-                boost = calculate_reinforcement_boost(
-                    float(current_credibility),
-                    int(current_count)
-                )
-                new_credibility = min(1.0, float(current_credibility) + boost)
-                new_count = int(current_count) + 1
-                
-                # Step 3: Prepare updated prompt_history_ids
-                updated_history_ids = list(prompt_history_ids) if prompt_history_ids else []
-                if segment_id and segment_id not in updated_history_ids:
-                    updated_history_ids.append(segment_id)
-                
-                # Step 4: Update behavior in database
-                # Reset last_decay_applied_at to current time when reinforced
-                # Set last_accessed_at to mark this behavior as actively used
-                cur.execute(
-                    """
-                    UPDATE behaviors
-                    SET 
-                        credibility = %s,
-                        reinforcement_count = %s,
-                        last_seen_at = %s,
-                        last_decay_applied_at = %s,
-                        last_accessed_at = %s,
-                        prompt_history_ids = %s
-                    WHERE behavior_id = %s AND user_id = %s;
-                    """,
-                    (
-                        new_credibility,
-                        new_count,
-                        current_timestamp,
-                        current_timestamp,
-                        current_timestamp,
-                        updated_history_ids,
-                        behavior_id,
-                        user_id
-                    )
-                )
-                
                 conn.commit()
-                
-                logger.info(
-                    f"Reinforced behavior {behavior_id}: "
-                    f"credibility {current_credibility:.3f} → {new_credibility:.3f}, "
-                    f"count {current_count} → {new_count}"
-                )
-                
-                return ReinforcementResult(
-                    success=True,
-                    behavior_id=behavior_id,
-                    new_credibility=new_credibility,
-                    new_reinforcement_count=new_count,
-                    credibility_boost=boost,
-                    segment_id_added=segment_id if segment_id else None,
-                    error=None
-                )
-                
+                return reinforce_result
+
     except Exception as e:
         logger.error(f"Failed to reinforce behavior {behavior_id}: {str(e)}")
         return ReinforcementResult(
@@ -946,19 +977,6 @@ def persist_retrieval_updates_batch(
         )
         
 
-def insert_behavior_batch(payloads: List[dict]):
-    "insert multiple behaviors in one single transaction"
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            for payload in payloads:
-                cur.execute(
-                    """INSERT INTO behaviors (...) VALUES (...)"""
-                , payload
-                )
-        conn.commit()
-    logger.info(f"Inserted batch of {len(payloads)} behaviors into database")
-
-
 def insert_conflict(
     user_id: str,
     behavior_id_1: str,
@@ -1106,6 +1124,67 @@ def update_behavior_state(
         raise Exception(f"Database error updating behavior state: {str(e)}")
 
 
+def _supersede_behavior_on_cursor(
+    cur,
+    old_behavior_id: str,
+    new_behavior_id: str,
+    user_id: str,
+    current_timestamp: Optional[int] = None,
+) -> bool:
+    """
+    Internal helper — execute the supersede UPDATE on an **existing** cursor.
+
+    Does NOT commit; the caller is responsible for committing (or rolling back).
+    This allows the update to participate in the caller's transaction.
+
+    Args:
+        cur: An open psycopg cursor (must be inside an active connection).
+        old_behavior_id: Behavior being superseded.
+        new_behavior_id: Behavior that supersedes it.
+        user_id: User ID (required for the partitioned table WHERE clause).
+        current_timestamp: Unix timestamp to use; defaults to now.
+
+    Returns:
+        True if the UPDATE touched at least one row, False otherwise.
+    """
+    if current_timestamp is None:
+        current_timestamp = int(time.time())
+
+    # Update old behavior to SUPERSEDED state and link to new one.
+    # Set last_accessed_at to mark it was actively used in conflict resolution.
+    cur.execute(
+        """
+        UPDATE behaviors
+        SET 
+            behavior_state = %s,
+            superseded_by_id = %s,
+            last_accessed_at = %s
+        WHERE behavior_id = %s AND user_id = %s
+        """,
+        (
+            BehaviorState.SUPERSEDED.value,
+            new_behavior_id,
+            current_timestamp,
+            old_behavior_id,
+            user_id
+        )
+    )
+
+    rows_affected = cur.rowcount
+
+    if rows_affected == 0:
+        logger.warning(
+            f"No behavior found to supersede: {old_behavior_id} for user {user_id}"
+        )
+        return False
+
+    logger.info(
+        f"Superseded behavior {old_behavior_id} with {new_behavior_id} "
+        f"(last_accessed_at updated)"
+    )
+    return True
+
+
 def supersede_behavior(
     old_behavior_id: str,
     new_behavior_id: str,
@@ -1113,7 +1192,7 @@ def supersede_behavior(
 ) -> bool:
     """
     Mark an old behavior as SUPERSEDED by a new one.
-    
+
     This creates a link between the old and new behaviors, preserving history
     while indicating which behavior is currently active. The old behavior:
     - State changed to SUPERSEDED
@@ -1121,62 +1200,33 @@ def supersede_behavior(
     - last_accessed_at updated (behavior was actively used in conflict resolution)
     - No longer used for personalization
     - Kept in database for historical analysis
-    
+
     Args:
         old_behavior_id: Behavior being superseded
         new_behavior_id: Behavior that supersedes it
         user_id: User ID (required for partitioned table)
-        
+
     Returns:
         True if update succeeded, False otherwise
-        
+
     Raises:
         Exception: If database update fails
-        
+
     Example:
         >>> supersede_behavior("beh_old123", "beh_new456", "user_xyz")
         True
     """
     try:
         current_timestamp = int(time.time())
-        
+
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
-                # Update old behavior to SUPERSEDED state and link to new one
-                # Set last_accessed_at to mark it was actively used in conflict resolution
-                cur.execute(
-                    """
-                    UPDATE behaviors
-                    SET 
-                        behavior_state = %s,
-                        superseded_by_id = %s,
-                        last_accessed_at = %s
-                    WHERE behavior_id = %s AND user_id = %s
-                    """,
-                    (
-                        BehaviorState.SUPERSEDED.value,
-                        new_behavior_id,
-                        current_timestamp,
-                        old_behavior_id,
-                        user_id
-                    )
+                success = _supersede_behavior_on_cursor(
+                    cur, old_behavior_id, new_behavior_id, user_id, current_timestamp
                 )
-                
-                rows_affected = cur.rowcount
                 conn.commit()
-                
-                if rows_affected == 0:
-                    logger.warning(
-                        f"No behavior found to supersede: {old_behavior_id} for user {user_id}"
-                    )
-                    return False
-                
-                logger.info(
-                    f"Superseded behavior {old_behavior_id} with {new_behavior_id} "
-                    f"(last_accessed_at updated)"
-                )
-                return True
-                
+                return success
+
     except Exception as e:
         logger.error(f"Failed to supersede behavior: {str(e)}")
         raise Exception(f"Database error superseding behavior: {str(e)}")
@@ -1531,19 +1581,21 @@ def resolve_conflict(
                     f"{behavior_id_1} vs {behavior_id_2} -> {resolution_choice}"
                 )
                 
-                # Step 2: Handle resolution based on user's choice
+                # ------------------------------------------------------------------
+                # Step 2: Handle resolution — all SQL runs on the same cursor so
+                # everything commits or rolls back as a single unit of work.
+                # ------------------------------------------------------------------
                 if resolution_choice == "OLD_WINS":
-                    # Reinforce old behavior (increases credibility, updates timestamps)
-                    reinforce_result = reinforce_behavior(
-                        behavior_id=behavior_id_1,
-                        user_id=user_id,
-                        segment_id=None
+                    # Reinforce old behavior within this transaction
+                    reinforce_result = _reinforce_behavior_on_cursor(
+                        cur, behavior_id_1, user_id, segment_id=None,
+                        current_timestamp=current_timestamp
                     )
-                    
+
                     if not reinforce_result.success:
                         raise Exception(f"Failed to reinforce old behavior: {reinforce_result.error}")
-                    
-                    # Update old behavior state to ACTIVE and last_accessed_at
+
+                    # Ensure old behavior is ACTIVE and refresh last_accessed_at
                     cur.execute(
                         """
                         UPDATE behaviors
@@ -1554,9 +1606,8 @@ def resolve_conflict(
                         """,
                         (BehaviorState.ACTIVE.value, current_timestamp, behavior_id_1, user_id)
                     )
-                    
-                    # Invalidate new behavior by setting credibility to 0.0
-                    # User confirmed new behavior is incorrect, so mark it for pruning
+
+                    # Invalidate new behavior — credibility → 0.0 so it is pruned
                     cur.execute(
                         """
                         UPDATE behaviors
@@ -1568,14 +1619,14 @@ def resolve_conflict(
                         """,
                         (BehaviorState.SUPERSEDED.value, current_timestamp, behavior_id_2, user_id)
                     )
-                    
+
                     logger.info(
                         f"OLD_WINS: Reinforced {behavior_id_1} (set to ACTIVE), "
                         f"invalidated {behavior_id_2} (credibility set to 0.0 for pruning)"
                     )
-                
+
                 elif resolution_choice == "NEW_WINS":
-                    # Set new behavior to ACTIVE
+                    # Set new behavior to ACTIVE first
                     cur.execute(
                         """
                         UPDATE behaviors
@@ -1586,42 +1637,39 @@ def resolve_conflict(
                         """,
                         (BehaviorState.ACTIVE.value, current_timestamp, behavior_id_2, user_id)
                     )
-                    
-                    # Supersede old behavior (sets state to SUPERSEDED, links to new, updates last_accessed_at)
-                    supersede_success = supersede_behavior(
-                        old_behavior_id=behavior_id_1,
-                        new_behavior_id=behavior_id_2,
-                        user_id=user_id
+
+                    # Supersede old behavior within this same transaction
+                    supersede_success = _supersede_behavior_on_cursor(
+                        cur, behavior_id_1, behavior_id_2, user_id,
+                        current_timestamp=current_timestamp
                     )
-                    
+
                     if not supersede_success:
                         raise Exception(f"Failed to supersede old behavior {behavior_id_1}")
-                    
+
                     logger.info(
                         f"NEW_WINS: Set {behavior_id_2} to ACTIVE, "
                         f"superseded {behavior_id_1}"
                     )
-                
+
                 elif resolution_choice == "BOTH_CORRECT":
-                    # Reinforce both behaviors
-                    reinforce_result_1 = reinforce_behavior(
-                        behavior_id=behavior_id_1,
-                        user_id=user_id,
-                        segment_id=None
+                    # Reinforce both behaviors within this transaction
+                    reinforce_result_1 = _reinforce_behavior_on_cursor(
+                        cur, behavior_id_1, user_id, segment_id=None,
+                        current_timestamp=current_timestamp
                     )
-                    
+
                     if not reinforce_result_1.success:
                         raise Exception(f"Failed to reinforce behavior 1: {reinforce_result_1.error}")
-                    
-                    reinforce_result_2 = reinforce_behavior(
-                        behavior_id=behavior_id_2,
-                        user_id=user_id,
-                        segment_id=None
+
+                    reinforce_result_2 = _reinforce_behavior_on_cursor(
+                        cur, behavior_id_2, user_id, segment_id=None,
+                        current_timestamp=current_timestamp
                     )
-                    
+
                     if not reinforce_result_2.success:
                         raise Exception(f"Failed to reinforce behavior 2: {reinforce_result_2.error}")
-                    
+
                     # Set both to ACTIVE and update last_accessed_at
                     cur.execute(
                         """
@@ -1639,7 +1687,7 @@ def resolve_conflict(
                             user_id
                         )
                     )
-                    
+
                     logger.info(
                         f"BOTH_CORRECT: Reinforced both {behavior_id_1} and {behavior_id_2}, "
                         f"set both to ACTIVE"
