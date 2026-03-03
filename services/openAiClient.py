@@ -1,6 +1,6 @@
 import json
 from time import time
-from typing import List
+from typing import Any, Dict, List
 from openai import AzureOpenAI
 from config.configurations import(
     AZURE_OPENAI_ENDPOINT,
@@ -24,7 +24,7 @@ client = AzureOpenAI(
 MAX_PROMPT_LENGTH = 8000 
 MIN_PROMPT_LENGTH = 3
 
-def extract_behavior(prompt: str) -> dict[str, any]:
+def extract_behavior(prompt: str) -> Dict[str, Any]:
     
     if not prompt or not prompt.strip():
         return {
@@ -358,7 +358,7 @@ PROFILE_SIGNALS OUTPUT (include in JSON response):
         }
 
 
-def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> dict[str, any]:
+def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Dict[str, Any]:
     """
     Extract behaviors from a prompt AND enrich it to a standalone query using conversation history.
     

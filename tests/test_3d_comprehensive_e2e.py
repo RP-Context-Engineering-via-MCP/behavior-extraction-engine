@@ -84,15 +84,34 @@ def warn(msg):
 
 
 # ─── API Helpers ─────────────────────────────────────────────────────────────
-def call_v1_extract(prompt: str) -> dict:
-    """POST /extract — synchronous extraction + storage."""
-    resp = requests.post(
-        f"{BASE_URL}/extract",
-        json={"prompt": prompt, "user_id": USER_ID, "session_id": SESSION_ID},
-        timeout=60,
-    )
-    resp.raise_for_status()
-    return resp.json()
+def call_v1_extract(prompt: str, max_retries: int = 3) -> dict:
+    """POST /extract — synchronous extraction + storage, with retry on transient errors."""
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/extract",
+                json={"prompt": prompt, "user_id": USER_ID, "session_id": SESSION_ID},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            status_code = e.response.status_code if e.response is not None else 0
+            # Retry on server-side errors (5xx) and 422 (often transient LLM failures)
+            if status_code in (422, 500, 502, 503, 504):
+                warn(f"Attempt {attempt}/{max_retries} failed ({status_code}), retrying in 3s...")
+                time.sleep(3)
+                continue
+            raise  # Non-retryable HTTP error (400, 404, etc.)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_error = e
+            warn(f"Attempt {attempt}/{max_retries} failed ({type(e).__name__}), retrying in 3s...")
+            time.sleep(3)
+            continue
+    # All retries exhausted
+    raise last_error
 
 
 def call_v2_extract(prompt: str, recent_history: list = None) -> dict:

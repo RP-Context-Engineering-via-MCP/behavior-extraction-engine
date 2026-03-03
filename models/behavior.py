@@ -1,7 +1,6 @@
-from urllib import response
 from pydantic import BaseModel,Field,field_validator
 from typing import List, Optional, Literal
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import time
 import uuid
@@ -36,7 +35,7 @@ class ExtractedBehavior(BaseModel):
         le=1.0,
         description="Linguistic strength score (0.0-1.0) - how strongly the user expressed the behavior")
     extracted_at: str = Field(
-        default_factory=lambda: datetime.now(datetime.timezone.utc).isoformat(),
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
         description="Timestamp of extraction in UTC")
     
     # Canonical fields for structured reasoning
