@@ -1795,3 +1795,99 @@ def resolve_conflict(
         logger.error(f"Failed to resolve conflict {conflict_id}: {str(e)}")
         raise Exception(f"Database error resolving conflict: {str(e)}")
 
+
+def get_behaviors_by_ids(user_id: str, behavior_ids: List[str]) -> List[dict]:
+    """
+    Retrieve specific behaviors by their IDs for a given user.
+    
+    Args:
+        user_id: The user ID who owns the behaviors
+        behavior_ids: List of behavior IDs to retrieve
+        
+    Returns:
+        List of behavior dictionaries with all fields including canonical structure
+    """
+    if not behavior_ids:
+        return []
+    
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                # Build parameterized query for multiple behavior IDs
+                placeholders = ','.join(['%s'] * len(behavior_ids))
+                
+                cur.execute(
+                    f"""
+                    SELECT 
+                        behavior_id,
+                        user_id,
+                        session_id,
+                        behavior_text,
+                        credibility,
+                        reinforcement_count,
+                        decay_rate,
+                        created_at,
+                        last_seen_at,
+                        prompt_history_ids,
+                        clarity_score,
+                        extraction_confidence,
+                        linguistic_strength,
+                        behavior_state,
+                        superseded_by_id,
+                        related_behaviors,
+                        last_decay_applied_at,
+                        context_notes,
+                        last_accessed_at,
+                        intent,
+                        target,
+                        context,
+                        polarity
+                    FROM behaviors
+                    WHERE user_id = %s 
+                    AND behavior_id IN ({placeholders})
+                    ORDER BY last_seen_at DESC
+                    """,
+                    [user_id] + behavior_ids
+                )
+                
+                rows = cur.fetchall()
+        
+        behaviors = []
+        for row in rows:
+            behavior = {
+                "behavior_id": row[0],
+                "user_id": row[1],
+                "session_id": row[2],
+                "behavior_text": row[3],
+                "credibility": float(row[4]) if row[4] is not None else 0.0,
+                "reinforcement_count": row[5] or 0,
+                "decay_rate": float(row[6]) if row[6] is not None else 0.0,
+                "created_at": row[7],
+                "last_seen_at": row[8],
+                "prompt_history_ids": row[9] or [],
+                "clarity_score": float(row[10]) if row[10] is not None else 0.0,
+                "extraction_confidence": float(row[11]) if row[11] is not None else 0.0,
+                "linguistic_strength": float(row[12]) if row[12] is not None else 0.0,
+                "behavior_state": row[13],
+                "superseded_by_id": row[14],
+                "related_behaviors": row[15] or [],
+                "last_decay_applied_at": row[16],
+                "context_notes": row[17],
+                "last_accessed_at": row[18],
+                # Canonical fields
+                "canonical": {
+                    "intent": row[19],
+                    "target": row[20],
+                    "context": row[21],
+                    "polarity": row[22]
+                }
+            }
+            behaviors.append(behavior)
+        
+        logger.info(f"Retrieved {len(behaviors)} behaviors for user={user_id} with IDs={behavior_ids}")
+        return behaviors
+        
+    except Exception as e:
+        logger.error(f"Failed to retrieve behaviors by IDs for user={user_id}: {str(e)}")
+        raise
+

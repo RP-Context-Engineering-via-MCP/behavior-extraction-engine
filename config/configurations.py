@@ -156,3 +156,17 @@ REDIS_STREAM_NAME = os.getenv("REDIS_STREAM_NAME", "behavior.events")
 
 # Whether event publishing is enabled (disable for testing without Redis)
 REDIS_EVENTS_ENABLED = os.getenv("REDIS_EVENTS_ENABLED", "true").lower() == "true"
+
+# ============================================================================
+# Profile Service Integration Configuration
+# Used for cold-start profiling and drift fallback communication
+# ============================================================================
+
+# Profile Service base URL for API calls
+PROFILE_SERVICE_BASE_URL = os.getenv("PROFILE_SERVICE_BASE_URL", "http://localhost:8001")
+
+# Default number of recent profile signals to return
+PROFILE_SIGNALS_DEFAULT_LIMIT = int(os.getenv("PROFILE_SIGNALS_DEFAULT_LIMIT", "10"))
+
+# Maximum number of recent profile signals allowed per request
+PROFILE_SIGNALS_MAX_LIMIT = int(os.getenv("PROFILE_SIGNALS_MAX_LIMIT", "50"))

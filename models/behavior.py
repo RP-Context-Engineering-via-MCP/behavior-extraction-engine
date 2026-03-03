@@ -81,6 +81,10 @@ class ExtractionResult(BaseModel):
         default=None,
         description="LLM-predicted intent types relevant to the query for metadata pre-filtering (e.g., ['CONSTRAINT', 'PREFERENCE'])"
     )
+    profile_signals: Optional[dict] = Field(
+        default=None,
+        description="Profile signals extracted for Profile Service integration (intents, interests, behavior_level, signals, complexity, consistency)"
+    )
 
 
 class StoredBehavior(BaseModel):

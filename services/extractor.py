@@ -30,6 +30,7 @@ from services.behaviorRepository import (
     update_behavior_state,
     update_behavior_access_time
 )
+from services.profileSignalExtractor import ProfileSignalExtractor
 from datetime import datetime
 import time
 from config.configurations import (
@@ -45,6 +46,8 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# Profile Signal Extractor instance for validating GPT-4 profile_signals output
+_profile_signal_extractor = ProfileSignalExtractor()
 
 # ==============================================================================
 # INTENT CONFLICT RULES
@@ -161,12 +164,26 @@ def run_behavior_extraction(prompt: str) -> ExtractionResult:
             )
             validated_segments.append(validated_segment)
         
+        # Validate and extract profile_signals for Profile Service integration
+        validated_profile_signals = None
+        raw_profile_signals = raw_response.get("profile_signals")
+        if raw_profile_signals:
+            try:
+                validated_profile_signals = _profile_signal_extractor.parse_and_validate(raw_profile_signals)
+                logger.debug(f"Validated profile_signals: {validated_profile_signals}")
+            except ValueError as e:
+                logger.warning(f"Profile signals validation failed: {e}")
+                # Continue without profile_signals - not critical for extraction
+        else:
+            logger.debug("No profile_signals in GPT response")
+        
         # Return successful extraction result
         return ExtractionResult(
             segments=validated_segments,
             success=True,
             error=None,
-            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0)
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            profile_signals=validated_profile_signals
         )
     
     except KeyError as e:
@@ -283,6 +300,19 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
             logger.warning("No required_intents in response, using default [PREFERENCE, CONSTRAINT]")
             required_intents = ["PREFERENCE", "CONSTRAINT"]
         
+        # Validate and extract profile_signals for Profile Service integration
+        validated_profile_signals = None
+        raw_profile_signals = raw_response.get("profile_signals")
+        if raw_profile_signals:
+            try:
+                validated_profile_signals = _profile_signal_extractor.parse_and_validate(raw_profile_signals)
+                logger.debug(f"Validated profile_signals: {validated_profile_signals}")
+            except ValueError as e:
+                logger.warning(f"Profile signals validation failed: {e}")
+                # Continue without profile_signals - not critical for extraction
+        else:
+            logger.debug("No profile_signals in GPT response")
+        
         # Return successful extraction result with standalone query and required intents
         return ExtractionResult(
             segments=validated_segments,
@@ -290,7 +320,8 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
             error=None,
             extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
             standalone_query=standalone_query.strip(),
-            required_intents=required_intents
+            required_intents=required_intents,
+            profile_signals=validated_profile_signals
         )
     
     except KeyError as e:
@@ -1914,6 +1945,86 @@ def _process_candidate_with_tracking(
     return (False, None)
 
 
+# ==============================================================================
+# PROFILE SIGNALS DISPATCH (for Profile Service Integration)
+# ==============================================================================
 
+async def dispatch_profile_signals(
+    user_id: str,
+    prompt_id: str,
+    profile_signals: Optional[dict]
+) -> Optional[dict]:
+    """
+    Dispatch profile signals to the Profile Service for cold-start profiling.
+    
+    This function should be called after each extraction to:
+    1. Save profile_signals locally (for drift fallback)
+    2. Forward to Profile Service if user is in COLD_START mode
+    
+    Args:
+        user_id: Unique user identifier
+        prompt_id: Unique prompt/request identifier (e.g., UUID or segment_id)
+        profile_signals: Validated profile signals from extraction result
+        
+    Returns:
+        Profile Service response if dispatched, None otherwise
+    """
+    if not profile_signals:
+        logger.debug(f"No profile_signals to dispatch for user={user_id}")
+        return None
+    
+    try:
+        from services.coldStartDispatcher import get_cold_start_dispatcher
+        
+        dispatcher = get_cold_start_dispatcher()
+        result = await dispatcher.dispatch(user_id, prompt_id, profile_signals)
+        
+        if result:
+            logger.info(
+                f"Profile signals dispatched for user={user_id}: "
+                f"status={result.get('status')}"
+            )
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to dispatch profile_signals for user={user_id}: {e}")
+        return None
+
+
+def dispatch_profile_signals_sync(
+    user_id: str,
+    prompt_id: str,
+    profile_signals: Optional[dict]
+) -> Optional[dict]:
+    """
+    Synchronous wrapper for dispatch_profile_signals.
+    
+    For use in synchronous contexts where async/await is not available.
+    """
+    import asyncio
+    
+    if not profile_signals:
+        return None
+    
+    try:
+        # Try to get existing event loop
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, create a task
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(
+                    asyncio.run,
+                    dispatch_profile_signals(user_id, prompt_id, profile_signals)
+                )
+                return future.result(timeout=15)
+        except RuntimeError:
+            # No running event loop, safe to use asyncio.run
+            return asyncio.run(
+                dispatch_profile_signals(user_id, prompt_id, profile_signals)
+            )
+    except Exception as e:
+        logger.error(f"Sync dispatch failed for user={user_id}: {e}")
+        return None
 
     

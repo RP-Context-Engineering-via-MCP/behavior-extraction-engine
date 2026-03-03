@@ -2,17 +2,20 @@ from fastapi import FastAPI, status, Query, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from services.extractor import run_behavior_extraction, run_behavior_extraction_with_history, store_behavior, store_behavior_with_tracking
-from services.behaviorRepository import insert_behavior, search_similar_behaviors, search_similar_behavior_3D, persist_retrieval_updates_batch, get_behaviors_by_user, get_user_conflicts, resolve_conflict
+from services.extractor import run_behavior_extraction, run_behavior_extraction_with_history, store_behavior, store_behavior_with_tracking, dispatch_profile_signals_sync
+from services.behaviorRepository import insert_behavior, search_similar_behaviors, search_similar_behavior_3D, persist_retrieval_updates_batch, get_behaviors_by_user, get_user_conflicts, resolve_conflict, get_behaviors_by_ids
+from services.profileSignalRepository import get_profile_signal_repository
 from models.behavior import ExtractRequest, ExtractRequestWithHistory, HistoryMessage
 from db.connection import close_db_pool, init_db_pool
-from config.configurations import RELATED_BEHAVIORS_DISTANCE_THRESHOLD, HYBRID_SCORE_THRESHOLD
+from config.configurations import RELATED_BEHAVIORS_DISTANCE_THRESHOLD, HYBRID_SCORE_THRESHOLD, PROFILE_SIGNALS_DEFAULT_LIMIT, PROFILE_SIGNALS_MAX_LIMIT
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from typing import Literal
 from utils.embedding_utils import get_behavior_embedding
 from utils.similarity_utils import calculate_behavior_distance
 import logging
+import uuid
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,6 +37,11 @@ class ConflictResolutionRequest(BaseModel):
         ...,
         description="User's decision: OLD_WINS (keep existing), NEW_WINS (replace with new), BOTH_CORRECT (keep both)"
     )
+
+class BehaviorsByIdsRequest(BaseModel):
+    """Request model for retrieving specific behaviors by IDs"""
+    user_id: str = Field(..., description="User ID who owns the behaviors")
+    behavior_ids: list[str] = Field(..., description="List of behavior IDs to retrieve")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -63,8 +71,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount frontend static files
-app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
+# Mount frontend static files (optional - only if directory exists)
+if os.path.exists("frontend") and os.path.isdir("frontend"):
+    app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
+    logger.info("Frontend static files mounted at /frontend")
+else:
+    logger.warning("Frontend directory not found - API running without frontend")
     
 @app.post(
     "/extract",
@@ -101,7 +113,20 @@ def extract_behaviors(request: ExtractRequest):
         except Exception as e:
             logger.error(f"Failed to store behaviors: {str(e)}")
             # stored_behaviors remains as empty list if error occurs
-            
+        
+        # Dispatch profile signals to Profile Service (for cold-start profiling)
+        if extraction_result.profile_signals:
+            try:
+                prompt_id = f"prompt_{uuid.uuid4().hex[:12]}"
+                dispatch_profile_signals_sync(
+                    user_id=request.user_id,
+                    prompt_id=prompt_id,
+                    profile_signals=extraction_result.profile_signals
+                )
+                logger.debug(f"Profile signals dispatched for prompt={prompt_id}")
+            except Exception as e:
+                logger.error(f"Failed to dispatch profile signals: {e}")
+                # Continue - profile signal dispatch failure is not critical
         
         total_behaviors = sum(len(seg.behaviors) for seg in extraction_result.segments)
         logger.info(
@@ -213,118 +238,118 @@ def health_check():
     return {"status": "healthy", "service": "behavior_extraction"}
 
 
-# @app.post(
-#     "/extract-detailed",
-#     summary="Extract behaviors with detailed flow tracking",
-#     description="Analyzes a natural language prompt and extracts behaviors with detailed information about what happened to each behavior (duplicate, conflict, new, etc.)",
-#     response_description="Detailed extraction result with flow tracking for UI display"
-# )
-# def extract_behaviors_detailed(request: ExtractRequest):
-    # """
-    # Enhanced extraction endpoint that returns detailed flow information for each behavior.
-    # This is specifically designed for the frontend UI to show the processing path.
-    # """
-    # try:
-    #     logger.info(f"Received detailed extraction request for user: {request.user_id}")
+@app.post(
+    "/extract-detailed",
+    summary="Extract behaviors with detailed flow tracking",
+    description="Analyzes a natural language prompt and extracts behaviors with detailed information about what happened to each behavior (duplicate, conflict, new, etc.)",
+    response_description="Detailed extraction result with flow tracking for UI display"
+)
+def extract_behaviors_detailed(request: ExtractRequest):
+    """
+    Enhanced extraction endpoint that returns detailed flow information for each behavior.
+    This is specifically designed for the frontend UI to show the processing path.
+    """
+    try:
+        logger.info(f"Received detailed extraction request for user: {request.user_id}")
 
-    #     # Run extraction
-    #     extraction_result = run_behavior_extraction(request.prompt)
+        # Run extraction
+        extraction_result = run_behavior_extraction(request.prompt)
 
-    #     if not extraction_result.success:
-    #         logger.error(f"Extraction failed: {extraction_result.error}")
-    #         return JSONResponse(
-    #             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-    #             content={
-    #                 "success": False,
-    #                 "data": None,
-    #                 "error": extraction_result.error or "Extraction failed"
-    #             }
-    #         )
+        if not extraction_result.success:
+            logger.error(f"Extraction failed: {extraction_result.error}")
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={
+                    "success": False,
+                    "data": None,
+                    "error": extraction_result.error or "Extraction failed"
+                }
+            )
         
-    #     # Store with detailed tracking
-    #     try:
-    #         detailed_result = store_behavior_with_tracking(
-    #             extraction_result,
-    #             user_id=request.user_id,
-    #             session_id=request.session_id
-    #         )
+        # Store with detailed tracking
+        try:
+            detailed_result = store_behavior_with_tracking(
+                extraction_result,
+                user_id=request.user_id,
+                session_id=request.session_id
+            )
 
-    #         logger.info(
-    #             f"Processing complete: {detailed_result.total_stored} stored, "
-    #             f"{detailed_result.total_reinforced} reinforced, "
-    #             f"{detailed_result.total_conflicts} conflicts, "
-    #             f"{detailed_result.total_pruned} pruned"
-    #         )
-    #     except Exception as e:
-    #         logger.error(f"Failed to store behaviors: {str(e)}")
-    #         return JSONResponse(
-    #             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-    #             content={
-    #                 "success": False,
-    #                 "data": None,
-    #                 "error": f"Storage error: {str(e)}"
-    #             }
-    #         )
+            logger.info(
+                f"Processing complete: {detailed_result.total_stored} stored, "
+                f"{detailed_result.total_reinforced} reinforced, "
+                f"{detailed_result.total_conflicts} conflicts, "
+                f"{detailed_result.total_pruned} pruned"
+            )
+        except Exception as e:
+            logger.error(f"Failed to store behaviors: {str(e)}")
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={
+                    "success": False,
+                    "data": None,
+                    "error": f"Storage error: {str(e)}"
+                }
+            )
         
-    #     # Format flow info for frontend
-    #     flow_info_formatted = []
-    #     for flow in detailed_result.flow_info:
-    #         flow_dict = {
-    #             "behavior_description": flow.behavior_description,
-    #             "action": flow.action.value,
-    #             "credibility": round(flow.credibility, 3),
-    #             "canonical": flow.canonical,
-    #             "matched_behavior_id": flow.matched_behavior_id,
-    #             "matched_behavior_text": flow.matched_behavior_text,
-    #             "distance": round(flow.distance, 4) if flow.distance is not None else None,
-    #             "conflict_info": flow.conflict_info,
-    #             "stored_behavior_id": flow.stored_behavior_id,
-    #             "details": flow.details
-    #         }
-    #         flow_info_formatted.append(flow_dict)
+        # Format flow info for frontend
+        flow_info_formatted = []
+        for flow in detailed_result.flow_info:
+            flow_dict = {
+                "behavior_description": flow.behavior_description,
+                "action": flow.action.value,
+                "credibility": round(flow.credibility, 3),
+                "canonical": flow.canonical,
+                "matched_behavior_id": flow.matched_behavior_id,
+                "matched_behavior_text": flow.matched_behavior_text,
+                "distance": round(flow.distance, 4) if flow.distance is not None else None,
+                "conflict_info": flow.conflict_info,
+                "stored_behavior_id": flow.stored_behavior_id,
+                "details": flow.details
+            }
+            flow_info_formatted.append(flow_dict)
         
-    #     return JSONResponse(
-    #         status_code=status.HTTP_200_OK,
-    #         content={
-    #             "success": True,
-    #             "data": {
-    #                 "extraction": {
-    #                     "extraction_time_ms": extraction_result.extraction_time,
-    #                     "total_segments": len(extraction_result.segments),
-    #                 },
-    #                 "processing": {
-    #                     "total_extracted": detailed_result.total_extracted,
-    #                     "total_stored": detailed_result.total_stored,
-    #                     "total_reinforced": detailed_result.total_reinforced,
-    #                     "total_conflicts": detailed_result.total_conflicts,
-    #                     "total_pruned": detailed_result.total_pruned
-    #                 },
-    #                 "flow_info": flow_info_formatted,
-    #                 "user_id": request.user_id
-    #             },
-    #             "error": None
-    #         }
-    #     )
-    # except ValueError as e:
-    #     logger.warning(f"Validation error: {str(e)}")
-    #     return JSONResponse(
-    #         status_code=status.HTTP_400_BAD_REQUEST,
-    #         content={
-    #             "success": False,
-    #             "data": None,
-    #             "error": f"Validation error: {str(e)}"
-    #         }
-    #     )
-    # except Exception as e:
-    #     logger.exception("Unexpected error during detailed extraction")
-    #     return JSONResponse(
-    #         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-    #         content={
-    #             "success": False,
-    #             "data": None,
-    #             "error": f"Internal server error: {str(e)}"
-    #         }
-    #     )
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "data": {
+                    "extraction": {
+                        "extraction_time_ms": extraction_result.extraction_time,
+                        "total_segments": len(extraction_result.segments),
+                    },
+                    "processing": {
+                        "total_extracted": detailed_result.total_extracted,
+                        "total_stored": detailed_result.total_stored,
+                        "total_reinforced": detailed_result.total_reinforced,
+                        "total_conflicts": detailed_result.total_conflicts,
+                        "total_pruned": detailed_result.total_pruned
+                    },
+                    "flow_info": flow_info_formatted,
+                    "user_id": request.user_id
+                },
+                "error": None
+            }
+        )
+    except ValueError as e:
+        logger.warning(f"Validation error: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "success": False,
+                "data": None,
+                "error": f"Validation error: {str(e)}"
+            }
+        )
+    except Exception as e:
+        logger.exception("Unexpected error during detailed extraction")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "success": False,
+                "data": None,
+                "error": f"Internal server error: {str(e)}"
+            }
+        )
 
 
 @app.get(
@@ -570,6 +595,7 @@ def _store_behaviors_async(extraction_result, user_id: str, session_id: str):
     """
     Background task for storing behaviors with conflict detection and reinforcement.
     This runs asynchronously after the response has been sent to the client.
+    Also dispatches profile signals to Profile Service for cold-start profiling.
     """
     try:
         stored_behaviors = store_behavior(
@@ -578,6 +604,21 @@ def _store_behaviors_async(extraction_result, user_id: str, session_id: str):
             session_id=session_id
         )
         logger.info(f"[ASYNC] Successfully stored {len(stored_behaviors)} behaviors for user: {user_id}")
+        
+        # Dispatch profile signals to Profile Service (for cold-start profiling)
+        if extraction_result.profile_signals:
+            try:
+                prompt_id = f"prompt_{uuid.uuid4().hex[:12]}"
+                dispatch_profile_signals_sync(
+                    user_id=user_id,
+                    prompt_id=prompt_id,
+                    profile_signals=extraction_result.profile_signals
+                )
+                logger.debug(f"[ASYNC] Profile signals dispatched for user={user_id}, prompt={prompt_id}")
+            except Exception as e:
+                logger.error(f"[ASYNC] Failed to dispatch profile signals for user {user_id}: {e}")
+                # Continue - profile signal dispatch failure is not critical
+                
     except Exception as e:
         logger.error(f"[ASYNC] Failed to store behaviors for user {user_id}: {str(e)}")
 
@@ -770,5 +811,94 @@ def extract_behaviors_with_history(request: ExtractRequestWithHistory, backgroun
                 "success": False,
                 "data": None,
                 "error": f"Internal server error: {str(e)}"
+            }
+        )
+
+# ==============================================================================
+# PROFILE SERVICE INTEGRATION ENDPOINTS
+# ==============================================================================
+
+@app.post(
+    "/api/behaviors/by-ids",
+    summary="Get specific behaviors by IDs for a user",
+    description="Retrieves specific user behaviors by their behavior IDs. Returns behaviors with all details including canonical structure.",
+    response_description="List of behaviors matching the requested IDs"
+)
+def get_behaviors_by_ids_endpoint(request: BehaviorsByIdsRequest):
+    """
+    Get specific behaviors by their IDs for a user.
+    
+    This endpoint retrieves specific user behaviors by their behavior IDs,
+    allowing clients to fetch particular behaviors they need.
+    
+    Args:
+        request: BehaviorsByIdsRequest containing user_id and behavior_ids list
+        
+    Returns:
+        JSON with user_id, count, and list of matching behaviors
+    """
+    try:
+        logger.info(f"Fetching behaviors by IDs for user={request.user_id}, IDs={request.behavior_ids}")
+        
+        behaviors = get_behaviors_by_ids(
+            user_id=request.user_id,
+            behavior_ids=request.behavior_ids
+        )
+        
+        logger.info(f"Retrieved {len(behaviors)} behaviors for user={request.user_id}")
+        
+        # Return direct array as per original endpoint format
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=behaviors
+        )
+        
+    except Exception as e:
+        logger.exception(f"Error fetching behaviors by IDs for user={request.user_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=[]
+        )
+
+
+@app.get(
+    "/api/behaviors/{user_id}/signals/count",
+    summary="Get profile signal count for a user",
+    description="Returns the total count of stored profile signals for a user.",
+    response_description="Count of profile signals"
+)
+def get_profile_signal_count(user_id: str):
+    """
+    Get the total count of stored profile signals for a user.
+    
+    Useful for determining if enough signals have been collected
+    for profile assignment or drift detection.
+    
+    Args:
+        user_id: Unique user identifier
+        
+    Returns:
+        JSON with user_id and total count
+    """
+    try:
+        signal_repo = get_profile_signal_repository()
+        count = signal_repo.get_count(user_id=user_id)
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "user_id": user_id,
+                "count": count
+            }
+        )
+        
+    except Exception as e:
+        logger.exception(f"Error fetching profile signal count for user={user_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "user_id": user_id,
+                "count": 0,
+                "error": f"Failed to retrieve signal count: {str(e)}"
             }
         )
