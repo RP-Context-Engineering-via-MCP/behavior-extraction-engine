@@ -91,6 +91,7 @@ class ColdStartDispatcher:
                 event_publisher = get_event_publisher()
                 message_id = event_publisher.publish_profile_signals(
                     user_id=user_id,
+                    prompt_id=prompt_id,
                     profile_signals=profile_signals
                 )
                 

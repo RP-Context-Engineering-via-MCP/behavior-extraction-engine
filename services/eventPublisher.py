@@ -292,6 +292,7 @@ class BehaviorEventPublisher:
     def publish_profile_signals(
         self,
         user_id: str,
+        prompt_id: str,
         profile_signals: Dict[str, Any]
     ) -> Optional[str]:
         """
@@ -302,6 +303,7 @@ class BehaviorEventPublisher:
         
         Args:
             user_id: User identifier
+            prompt_id: Prompt/request identifier
             profile_signals: Extracted profile signals dictionary
         
         Returns:
@@ -312,6 +314,7 @@ class BehaviorEventPublisher:
         published_at = self._get_timestamp()
         payload = {
             "user_id": user_id,
+            "prompt_id": prompt_id,
             "profile_signals": profile_signals
         }
         return self._publish_event(event_type, event_id, published_at, payload)
