@@ -29,7 +29,8 @@ class ProfileSignalRepository:
         self, 
         user_id: str, 
         prompt_id: str, 
-        profile_signals: Dict[str, Any]
+        profile_signals: Dict[str, Any],
+        behavior_id: Optional[str] = None
     ) -> None:
         """
         Save or update profile signals for a user's prompt.
@@ -41,28 +42,67 @@ class ProfileSignalRepository:
             user_id: Unique user identifier
             prompt_id: Unique prompt/request identifier
             profile_signals: Validated profile signals dict
+            behavior_id: Optional behavior ID to link these signals to a specific behavior
+            
+        Raises:
+            ValueError: If profile_signals has invalid format (e.g., canonical behavior format)
         """
+        # Validate profile_signals format before saving
+        required_fields = {'intents', 'interests', 'behavior_level'}
+        if not required_fields.issubset(set(profile_signals.keys())):
+            raise ValueError(
+                f"Invalid profile_signals format. Missing required fields: "
+                f"{required_fields - set(profile_signals.keys())}. "
+                f"Got keys: {profile_signals.keys()}"
+            )
+        
+        # Check for canonical behavior format (data corruption prevention)
+        canonical_fields = {'intent', 'target', 'context', 'polarity'}
+        if canonical_fields.issubset(set(profile_signals.keys())):
+            raise ValueError(
+                f"Canonical behavior format detected! Cannot save canonical behaviors "
+                f"as profile signals. This indicates a programming error in the caller."
+            )
+        
         extracted_at = int(time.time())
         signals_json = json.dumps(profile_signals)
         
         try:
             with get_db_pool_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO user_profile_signals
-                            (user_id, prompt_id, profile_signals, extracted_at)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (user_id, prompt_id) DO UPDATE
-                            SET profile_signals = EXCLUDED.profile_signals,
-                                extracted_at    = EXCLUDED.extracted_at
-                        """,
-                        (user_id, prompt_id, signals_json, extracted_at)
-                    )
+                    if behavior_id:
+                        # When behavior_id is provided, insert a new row (no UPSERT)
+                        # This allows multiple behaviors from the same prompt to have separate records
+                        cur.execute(
+                            """
+                            INSERT INTO user_profile_signals
+                                (user_id, prompt_id, profile_signals, extracted_at, behavior_id)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (user_id, prompt_id) DO UPDATE
+                                SET profile_signals = EXCLUDED.profile_signals,
+                                    extracted_at    = EXCLUDED.extracted_at,
+                                    behavior_id     = EXCLUDED.behavior_id
+                            """,
+                            (user_id, prompt_id, signals_json, extracted_at, behavior_id)
+                        )
+                    else:
+                        # Legacy path: no behavior_id (for backward compatibility)
+                        cur.execute(
+                            """
+                            INSERT INTO user_profile_signals
+                                (user_id, prompt_id, profile_signals, extracted_at)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (user_id, prompt_id) DO UPDATE
+                                SET profile_signals = EXCLUDED.profile_signals,
+                                    extracted_at    = EXCLUDED.extracted_at
+                            """,
+                            (user_id, prompt_id, signals_json, extracted_at)
+                        )
                 conn.commit()
             
             logger.info(
                 f"Saved profile_signals for user={user_id}, prompt={prompt_id}"
+                + (f", behavior={behavior_id}" if behavior_id else "")
             )
         except Exception as e:
             logger.error(
@@ -245,6 +285,67 @@ class ProfileSignalRepository:
         except Exception as e:
             logger.error(
                 f"Failed to delete old profile_signals for user={user_id}: {e}"
+            )
+            raise
+    
+    def get_by_behavior_ids(
+        self,
+        user_id: str,
+        behavior_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve profile signals for specific behavior IDs.
+        
+        This method is used by the /api/behaviors/by-ids endpoint to return
+        profile signals associated with specific behaviors.
+        
+        Args:
+            user_id: Unique user identifier
+            behavior_ids: List of behavior IDs to retrieve signals for
+            
+        Returns:
+            List of profile_signals dicts with behavior_id included
+        """
+        if not behavior_ids:
+            return []
+        
+        try:
+            with get_db_pool_connection() as conn:
+                with conn.cursor() as cur:
+                    # Use ANY for PostgreSQL array comparison
+                    cur.execute(
+                        """
+                        SELECT profile_signals, behavior_id, extracted_at
+                        FROM user_profile_signals
+                        WHERE user_id = %s AND behavior_id = ANY(%s)
+                        ORDER BY extracted_at DESC
+                        """,
+                        (user_id, behavior_ids)
+                    )
+                    rows = cur.fetchall()
+            
+            results = []
+            for row in rows:
+                # Handle both string JSON and already-parsed dict
+                signals = row[0]
+                if isinstance(signals, str):
+                    signals = json.loads(signals)
+                
+                # Add behavior_id to the result
+                result = signals.copy()
+                result['behavior_id'] = row[1]
+                result['extracted_at'] = row[2]
+                results.append(result)
+            
+            logger.info(
+                f"Retrieved {len(results)} profile_signals for user={user_id} "
+                f"with {len(behavior_ids)} behavior_ids"
+            )
+            return results
+            
+        except Exception as e:
+            logger.error(
+                f"Failed to get profile_signals by behavior_ids for user={user_id}: {e}"
             )
             raise
 

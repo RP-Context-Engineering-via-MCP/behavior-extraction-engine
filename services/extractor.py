@@ -170,12 +170,20 @@ def run_behavior_extraction(prompt: str) -> ExtractionResult:
         if raw_profile_signals:
             try:
                 validated_profile_signals = _profile_signal_extractor.parse_and_validate(raw_profile_signals)
-                logger.debug(f"Validated profile_signals: {validated_profile_signals}")
+                logger.info(
+                    f"Validated profile_signals: behavior_level={validated_profile_signals.get('behavior_level')}, "
+                    f"intents={list(validated_profile_signals.get('intents', {}).keys())}, "
+                    f"interests={list(validated_profile_signals.get('interests', {}).keys())}"
+                )
             except ValueError as e:
-                logger.warning(f"Profile signals validation failed: {e}")
+                logger.error(f"Profile signals validation failed: {e}. Raw data: {raw_profile_signals}")
                 # Continue without profile_signals - not critical for extraction
         else:
-            logger.debug("No profile_signals in GPT response")
+            logger.warning(
+                "No profile_signals in GPT response. Profile Service integration will not be triggered. "
+                "This may be because the GPT prompt did not generate profile_signals, or the user's prompt "
+                "did not contain enough information to generate a behavioral profile."
+            )
         
         # Return successful extraction result
         return ExtractionResult(
@@ -306,12 +314,20 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
         if raw_profile_signals:
             try:
                 validated_profile_signals = _profile_signal_extractor.parse_and_validate(raw_profile_signals)
-                logger.debug(f"Validated profile_signals: {validated_profile_signals}")
+                logger.info(
+                    f"Validated profile_signals: behavior_level={validated_profile_signals.get('behavior_level')}, "
+                    f"intents={list(validated_profile_signals.get('intents', {}).keys())}, "
+                    f"interests={list(validated_profile_signals.get('interests', {}).keys())}"
+                )
             except ValueError as e:
-                logger.warning(f"Profile signals validation failed: {e}")
+                logger.error(f"Profile signals validation failed: {e}. Raw data: {raw_profile_signals}")
                 # Continue without profile_signals - not critical for extraction
         else:
-            logger.debug("No profile_signals in GPT response")
+            logger.warning(
+                "No profile_signals in GPT response. Profile Service integration will not be triggered. "
+                "This may be because the GPT prompt did not generate profile_signals, or the user's prompt "
+                "did not contain enough information to generate a behavioral profile."
+            )
         
         # Return successful extraction result with standalone query and required intents
         return ExtractionResult(
@@ -2026,5 +2042,60 @@ def dispatch_profile_signals_sync(
     except Exception as e:
         logger.error(f"Sync dispatch failed for user={user_id}: {e}")
         return None
+
+
+def save_profile_signals_per_behavior(
+    user_id: str,
+    prompt_id: str,
+    profile_signals: Optional[dict],
+    stored_behaviors: List
+) -> None:
+    """
+    Save profile signals for each stored behavior.
+    
+    This function links profile signals to specific behavior IDs, enabling
+    the /api/behaviors/by-ids endpoint to return profile signals for
+    specific behaviors.
+    
+    Args:
+        user_id: Unique user identifier
+        prompt_id: Unique prompt/request identifier
+        profile_signals: Validated profile signals from extraction
+        stored_behaviors: List of StoredBehavior objects with behavior_ids
+    """
+    if not profile_signals or not stored_behaviors:
+        return
+    
+    try:
+        from services.profileSignalRepository import get_profile_signal_repository
+        
+        signal_repo = get_profile_signal_repository()
+        
+        for behavior in stored_behaviors:
+            try:
+                # Save profile signals with behavior_id link
+                signal_repo.save(
+                    user_id=user_id,
+                    prompt_id=f"{prompt_id}_{behavior.behavior_id}",  # Unique prompt_id per behavior
+                    profile_signals=profile_signals,
+                    behavior_id=behavior.behavior_id
+                )
+                logger.debug(
+                    f"Saved profile_signals for behavior_id={behavior.behavior_id}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to save profile_signals for behavior_id={behavior.behavior_id}: {e}"
+                )
+        
+        logger.info(
+            f"Saved profile_signals for {len(stored_behaviors)} behaviors "
+            f"(user={user_id})"
+        )
+        
+    except Exception as e:
+        logger.error(
+            f"Failed to save profile_signals per behavior for user={user_id}: {e}"
+        )
 
     

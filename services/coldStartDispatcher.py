@@ -56,9 +56,10 @@ class ColdStartDispatcher:
         This is the main entry point called by the extraction pipeline.
         
         Flow:
-        1. Save profile_signals locally for drift detection
-        2. Check user's profile_mode from User Management Service
-        3. If profile_mode == "COLD_START", publish profile_signals event
+        1. Validate profile_signals format
+        2. Save profile_signals locally for drift detection
+        3. Check user's profile_mode from User Management Service
+        4. If profile_mode == "COLD_START", publish profile_signals event
         
         Args:
             user_id: Unique user identifier
@@ -68,16 +69,35 @@ class ColdStartDispatcher:
         Returns:
             None (profile assignment removed)
         """
+        # 0. Validate profile signals format
+        if not profile_signals:
+            logger.warning(f"Received empty profile_signals for user={user_id}")
+            return None
+        
+        # Verify this is profile_signals format, not canonical behavior
+        required_fields = {'intents', 'interests', 'behavior_level'}
+        if not required_fields.issubset(set(profile_signals.keys())):
+            logger.error(
+                f"Invalid profile_signals format for user={user_id}. "
+                f"Missing required fields: {required_fields - set(profile_signals.keys())}. "
+                f"Got keys: {profile_signals.keys()}"
+            )
+            return None
+        
         # 1. Save profile signals locally for drift detection
         try:
             self._signal_repo.save(user_id, prompt_id, profile_signals)
-            logger.debug(
-                f"Saved profile_signals for user={user_id}, prompt={prompt_id}"
+            logger.info(
+                f"Saved profile_signals for user={user_id}, prompt={prompt_id} "
+                f"(behavior_level={profile_signals.get('behavior_level')}, "
+                f"intent_count={len(profile_signals.get('intents', {}))}, "
+                f"interest_count={len(profile_signals.get('interests', {}))})"
             )
         except Exception as e:
             logger.error(
                 f"Failed to save profile_signals for user={user_id}: {e}"
             )
+            return None
         
         # 2. Check if user is in COLD_START mode
         try:

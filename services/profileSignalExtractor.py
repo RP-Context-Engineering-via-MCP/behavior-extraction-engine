@@ -80,10 +80,22 @@ class ProfileSignalExtractor:
             }
             
         Raises:
-            ValueError: If no valid intents or interests are found
+            ValueError: If no valid intents or interests are found, or if canonical behavior format detected
         """
         if not raw:
             raise ValueError("profile_signals cannot be empty or None")
+        
+        # CRITICAL: Check if this is accidentally canonical behavior format
+        # Canonical behaviors have: intent, target, context, polarity
+        # Profile signals have: intents, interests, behavior_level, signals
+        canonical_fields = {'intent', 'target', 'context', 'polarity'}
+        profile_fields = {'intents', 'interests', 'behavior_level', 'signals'}
+        
+        if canonical_fields.issubset(set(raw.keys())):
+            raise ValueError(
+                f"Canonical behavior format detected (has {canonical_fields}). "
+                f"Expected profile_signals format with {profile_fields}."
+            )
         
         # Extract and validate intents
         intents = self._extract_scored_dict(

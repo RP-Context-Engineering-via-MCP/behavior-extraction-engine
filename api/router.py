@@ -20,7 +20,6 @@ from api.schemas import (
 from config.configurations import RELATED_BEHAVIORS_DISTANCE_THRESHOLD
 from models.behavior import ExtractRequest, ExtractRequestWithHistory
 from services.behaviorRepository import (
-    get_behaviors_by_ids,
     get_behaviors_by_user,
     get_user_conflicts,
     persist_retrieval_updates_batch,
@@ -33,6 +32,7 @@ from services.extractor import (
     run_behavior_extraction_with_history,
     store_behavior,
     dispatch_profile_signals_sync,
+    save_profile_signals_per_behavior,
 )
 from utils.embedding_utils import get_behavior_embedding
 from utils.similarity_utils import calculate_behavior_distance
@@ -54,6 +54,7 @@ def _store_behaviors_async(extraction_result, user_id: str, session_id: str) -> 
     Background task: store behaviors with conflict detection and reinforcement.
     Runs after the response has already been sent to the client.
     """
+    stored_behaviors = []
     try:
         stored_behaviors = store_behavior(
             extraction_result,
@@ -69,15 +70,24 @@ def _store_behaviors_async(extraction_result, user_id: str, session_id: str) -> 
             f"[ASYNC] Failed to store behaviors for user {user_id}: {str(e)}"
         )
     
-    # Dispatch profile signals asynchronously
+    # Save profile signals per behavior and dispatch
     if hasattr(extraction_result, 'profile_signals') and extraction_result.profile_signals:
         try:
+            # Save profile signals linked to each behavior
+            save_profile_signals_per_behavior(
+                user_id=user_id,
+                prompt_id=session_id,
+                profile_signals=extraction_result.profile_signals,
+                stored_behaviors=stored_behaviors
+            )
+            
+            # Also dispatch to Profile Service (cold start flow)
             dispatch_profile_signals_sync(
                 user_id=user_id,
                 prompt_id=session_id,
                 profile_signals=extraction_result.profile_signals
             )
-            logger.info(f"[ASYNC] Profile signals dispatched for user: {user_id}")
+            logger.info(f"[ASYNC] Profile signals saved and dispatched for user: {user_id}")
         except Exception as e:
             logger.warning(f"[ASYNC] Failed to dispatch profile signals: {str(e)}")
 
@@ -130,14 +140,23 @@ def extract_behaviors(request: ExtractRequest):
         # Dispatch profile signals for Profile Service integration
         if extraction_result.profile_signals:
             try:
+                # Save profile signals linked to each behavior
+                save_profile_signals_per_behavior(
+                    user_id=request.user_id,
+                    prompt_id=request.session_id,
+                    profile_signals=extraction_result.profile_signals,
+                    stored_behaviors=stored_behaviors
+                )
+                
+                # Also dispatch to Profile Service (cold start flow)
                 dispatch_profile_signals_sync(
                     user_id=request.user_id,
                     prompt_id=request.session_id,
                     profile_signals=extraction_result.profile_signals
                 )
-                logger.info(f"Profile signals dispatched for user: {request.user_id}")
+                logger.info(f"Profile signals saved and dispatched for user: {request.user_id}")
             except Exception as e:
-                logger.warning(f"Failed to dispatch profile signals: {str(e)}")
+                logger.warning(f"Failed to save/dispatch profile signals: {str(e)}")
 
         total_behaviors = sum(
             len(seg.behaviors) for seg in extraction_result.segments
@@ -253,10 +272,14 @@ def health_check():
     "/behaviors/{user_id}",
     summary="Get all behaviors for a user",
     description=(
-        "Retrieve all stored behaviors for a specific user. "
-        "Optionally filter by session_id."
+        "Retrieve all stored CANONICAL BEHAVIORS for a specific user. "
+        "Optionally filter by session_id. "
+        "\n\n⚠️ IMPORTANT: This endpoint returns canonical behaviors with fields like "
+        "'intent', 'target', 'context', 'polarity'. "
+        "\n\nFor PROFILE SIGNALS (used by Profile Service), use '/api/behaviors/{user_id}/recent' instead, "
+        "which returns profile_signals with 'intents', 'interests', 'behavior_level', 'signals', etc."
     ),
-    response_description="List of behaviors with all details",
+    response_description="List of canonical behaviors with all details",
 )
 def get_user_behaviors(
     user_id: str,
@@ -691,40 +714,70 @@ def extract_behaviors_with_history(
 @router.post(
     "/api/behaviors/by-ids",
     summary="Get specific behaviors by IDs for a user",
-    description="Retrieves specific user behaviors by their behavior IDs. Returns behaviors with all details including canonical structure.",
-    response_description="List of behaviors matching the requested IDs"
+    description=(
+        "Retrieves specific PROFILE SIGNALS by their behavior IDs. "
+        "Returns profile signals with fields like 'intents', 'interests', 'behavior_level', 'signals', etc. "
+        "\n\n⚠️ IMPORTANT: This endpoint returns PROFILE SIGNALS format, not canonical behaviors. "
+        "\n\nFor canonical behaviors, use '/behaviors/{user_id}' instead."
+    ),
+    response_description="List of profile signals matching the requested behavior IDs"
 )
 def get_behaviors_by_ids_endpoint(request: BehaviorsByIdsRequest):
     """
-    Get specific behaviors by their IDs for a user.
+    Get specific profile signals by their behavior IDs for a user.
     
-    This endpoint retrieves specific user behaviors by their behavior IDs,
-    allowing clients to fetch particular behaviors they need.
+    This endpoint retrieves profile signals associated with specific behavior IDs,
+    allowing the Profile Service to fetch behavioral profiles for specific behaviors.
     
     Args:
         request: BehaviorsByIdsRequest containing user_id and behavior_ids list
         
     Returns:
-        JSON with user_id, count, and list of matching behaviors
+        JSON array of profile signals with behavior_ids
     """
     try:
-        logger.info(f"Fetching behaviors by IDs for user={request.user_id}, IDs={request.behavior_ids}")
+        logger.info(f"Fetching profile signals by IDs for user={request.user_id}, IDs={request.behavior_ids}")
         
-        behaviors = get_behaviors_by_ids(
+        signal_repo = get_profile_signal_repository()
+        profile_signals = signal_repo.get_by_behavior_ids(
             user_id=request.user_id,
             behavior_ids=request.behavior_ids
         )
         
-        logger.info(f"Retrieved {len(behaviors)} behaviors for user={request.user_id}")
+        logger.info(f"Retrieved {len(profile_signals)} profile signals for user={request.user_id}")
+        
+        # Validate that returned data has profile_signals structure
+        if profile_signals:
+            first_signal = profile_signals[0]
+            required_fields = {'intents', 'interests', 'behavior_level'}
+            
+            # Warn if canonical behavior format detected (data corruption)
+            canonical_fields = {'intent', 'target', 'context', 'polarity'}
+            if canonical_fields.issubset(set(first_signal.keys())):
+                logger.error(
+                    f"CRITICAL: Canonical behavior format detected in profile_signals for user={request.user_id}! "
+                    f"This indicates data corruption."
+                )
+                return JSONResponse(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    content=[]
+                )
+            
+            # Check for required profile_signals fields
+            missing_fields = required_fields - set(first_signal.keys())
+            if missing_fields:
+                logger.warning(
+                    f"Profile signals for user={request.user_id} are missing required fields: {missing_fields}"
+                )
         
         # Return direct array as per original endpoint format
         return JSONResponse(
             status_code=status.HTTP_200_OK,
-            content=behaviors
+            content=profile_signals
         )
         
     except Exception as e:
-        logger.exception(f"Error fetching behaviors by IDs for user={request.user_id}")
+        logger.exception(f"Error fetching profile signals by IDs for user={request.user_id}")
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content=[]
@@ -777,7 +830,14 @@ def get_profile_signal_count(user_id: str):
 @router.get(
     "/api/behaviors/{user_id}/recent",
     summary="Get recent profile signals for a user",
-    description="Returns the most recent profile signals for a user. Used by Profile Service during drift fallback.",
+    description=(
+        "Returns the most recent PROFILE SIGNALS for a user. "
+        "Used by Profile Service during drift fallback. "
+        "\n\n⚠️ IMPORTANT: This endpoint returns profile_signals with fields like "
+        "'intents' (dict), 'interests' (dict), 'behavior_level', 'signals', 'complexity', 'consistency'. "
+        "\n\nFor canonical behaviors, use '/behaviors/{user_id}' instead, "
+        "which returns behaviors with 'intent', 'target', 'context', 'polarity'."
+    ),
     response_description="List of recent profile signals"
 )
 def get_recent_profile_signals(
@@ -802,6 +862,42 @@ def get_recent_profile_signals(
         behaviors = signal_repo.get_recent(user_id=user_id, limit=limit)
         
         logger.info(f"Retrieved {len(behaviors)} recent profile signals for user={user_id}")
+        
+        # Validate that returned behaviors have profile_signals structure
+        if behaviors:
+            # Check first behavior to ensure it has the expected structure
+            first_behavior = behaviors[0]
+            required_fields = {'intents', 'interests', 'behavior_level'}
+            
+            # Warn if canonical behavior format detected
+            canonical_fields = {'intent', 'target', 'context', 'polarity'}
+            if canonical_fields.issubset(set(first_behavior.keys())):
+                logger.error(
+                    f"CRITICAL: Canonical behavior format detected in profile_signals table for user={user_id}! "
+                    f"This indicates data corruption. Expected profile_signals format with {required_fields}, "
+                    f"but found canonical fields {canonical_fields}. "
+                    f"The database may contain incorrect data."
+                )
+                return JSONResponse(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    content={
+                        "user_id": user_id,
+                        "count": 0,
+                        "behaviors": [],
+                        "error": (
+                            "Data format error: Expected profile_signals but found canonical behaviors. "
+                            "The database may need to be migrated or cleaned."
+                        )
+                    }
+                )
+            
+            # Check for required profile_signals fields
+            missing_fields = required_fields - set(first_behavior.keys())
+            if missing_fields:
+                logger.warning(
+                    f"Profile signals for user={user_id} are missing required fields: {missing_fields}. "
+                    f"Present fields: {first_behavior.keys()}"
+                )
         
         return JSONResponse(
             status_code=status.HTTP_200_OK,
