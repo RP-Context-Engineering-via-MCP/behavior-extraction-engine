@@ -29,6 +29,7 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
     if not prompt or not prompt.strip():
         return {
             "segments": [],
+            "profile_signals": None,
             "success": False,
             "error": "Prompt cannot be empty",
             "metadata": {"prompt_length": 0, "extraction_time_ms": 0, "tokens_used": 0}
@@ -39,6 +40,7 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
     if len(prompt) < MIN_PROMPT_LENGTH:
         return {
             "segments": [],
+            "profile_signals": None,
             "success": False,
             "error": f"Prompt too short (min {MIN_PROMPT_LENGTH} chars)",
             "metadata": {"prompt_length": len(prompt), "extraction_time_ms": 0, "tokens_used": 0}
@@ -47,6 +49,7 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
     if len(prompt) > MAX_PROMPT_LENGTH:
         return {
             "segments": [],
+            "profile_signals": None,
             "success": False,
             "error": f"Prompt too long (max {MAX_PROMPT_LENGTH} chars)",
             "metadata": {"prompt_length": len(prompt), "extraction_time_ms": 0, "tokens_used": 0}
@@ -152,7 +155,15 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
             }
           ]
         }
-      ]
+      ],
+      "profile_signals": {
+        "intents": {"PROBLEM_SOLVING": 0.85, "LEARNING": 0.40},
+        "interests": {"PROGRAMMING": 0.80},
+        "behavior_level": "INTERMEDIATE",
+        "signals": {"CODE_FOCUSED": 0.75},
+        "complexity": 0.65,
+        "consistency": 0.5
+      }
     }
     
     CRITICAL RULES:
@@ -164,6 +175,7 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
     - Do NOT include extra fields or explanations
     - All scores must be between 0.0 and 1.0
     - CONSTRAINT behaviors represent hard rules and should have high linguistic_strength
+    - profile_signals MUST always be included with at least one intent and one interest
     
     ⚠️ COMPARATIVE STATEMENTS: For "X over Y" or "X instead of Y" statements:
     - Extract ONLY the PREFERRED option (X) with POSITIVE polarity
@@ -207,6 +219,69 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
     Input: "Maybe I should try using JavaScript for backend"
     Output: {"intent": "PREFERENCE", "target": "JavaScript", "context": "backend", "polarity": "POSITIVE", "confidence": 0.35, "clarity": 0.4, "linguistic_strength": 0.3}
     ⚠️ Note: Weak/uncertain statement - still extract but with low scores to reflect uncertainty
+
+---
+TASK 2: PROFILE SIGNAL EXTRACTION (for Profile Service)
+---
+Additionally, analyze the ENTIRE prompt to extract "profile_signals" — a holistic view of the user's
+behavioral patterns for profile matching. This uses DIFFERENT vocabularies than canonical behaviors.
+
+PROFILE SIGNAL VOCABULARIES:
+
+intents (user's PURPOSE - select all that apply with confidence 0.0-1.0):
+  - LEARNING → User wants to understand a concept deeply
+  - TASK_COMPLETION → User wants something done, result-focused
+  - PROBLEM_SOLVING → User is debugging or solving technical issues
+  - EXPLORATION → User is brainstorming or generating ideas
+  - GUIDANCE → User is seeking advice or personal direction
+  - ENGAGEMENT → Casual, fun, low-commitment interaction
+
+interests (topic AREAS user engages with - select all that apply with confidence 0.0-1.0):
+  - AI → Artificial intelligence, machine learning
+  - DATA_SCIENCE → Data analysis, statistics
+  - WRITING → Drafting, editing, summarizing
+  - PROGRAMMING → Coding, debugging, algorithms
+  - CREATIVE → Stories, scripts, ideation
+  - HEALTH → Well-being, diet, exercise
+  - PERSONAL_GROWTH → Career, life guidance
+  - ENTERTAINMENT → Games, quizzes, leisure
+
+behavior_level (one of):
+  - BEGINNER → Simple questions, needs explanation
+  - INTERMEDIATE → Knows basics, building skills
+  - ADVANCED → Expert-level, sophisticated queries
+
+signals (preferred RESPONSE style - select all that apply with confidence 0.0-1.0):
+  - DEEP_REASONING → Open-ended curiosity-driven queries
+  - DETAILED_EXPLANATION → User wants thorough explanation
+  - CODE_FOCUSED → Response expected to contain code
+  - STEP_BY_STEP → User wants progressive breakdown
+  - QUICK_ANSWER → User wants concise response
+  - CREATIVE_OUTPUT → User wants generated creative content
+  - EMPATHETIC_RESPONSE → User needs emotional tone
+  - ITERATIVE_REFINEMENT → User expects multiple turn refinement
+
+complexity (float 0.0-1.0):
+  Prompt complexity based on length, constraints, multi-step nature, and technical depth.
+
+consistency (float 0.0-1.0):
+  Set to 0.5 as default (actual consistency is calculated across sessions).
+
+PROFILE_SIGNALS OUTPUT (include in JSON response):
+"profile_signals": {
+    "intents": {"PROBLEM_SOLVING": 0.85, "LEARNING": 0.40},
+    "interests": {"PROGRAMMING": 0.80, "AI": 0.45},
+    "behavior_level": "ADVANCED",
+    "signals": {"CODE_FOCUSED": 0.75, "DETAILED_EXPLANATION": 0.60},
+    "complexity": 0.78,
+    "consistency": 0.5
+}
+
+⚠️ RULES FOR PROFILE_SIGNALS:
+- Must include at least one intent and one interest
+- All confidence scores must be 0.0-1.0
+- behavior_level must be exactly one of: BEGINNER, INTERMEDIATE, ADVANCED
+- Profile signals are extracted from the ENTIRE prompt, not per-segment
 """
     start_time = time()
     try:
@@ -230,6 +305,7 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
         if not content:
             return {
                 "segments": [],
+                "profile_signals": None,
                 "success": False,
                 "error": "Empty response from GPT",
                 "metadata": {
@@ -242,7 +318,8 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
         result = json.loads(content)
 
         return {
-            "segments": result["segments"],
+            "segments": result.get("segments", []),
+            "profile_signals": result.get("profile_signals"),
             "success": True,
             "error": None,
             "metadata": {
@@ -256,6 +333,7 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
         extraction_time_ms = (time() - start_time) * 1000
         return {
             "segments": [],
+            "profile_signals": None,
             "success": False,
             "error": f"Failed to parse GPT response as JSON: {str(e)}",
             "metadata": {
@@ -269,6 +347,7 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
         error_type = type(e).__name__
         return {
             "segments": [],
+            "profile_signals": None,
             "success": False,
             "error": f"{error_type}: {str(e)}",
             "metadata": {
@@ -295,6 +374,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
         dict with:
             - standalone_query: str - The enriched standalone version of the prompt
             - segments: list - Extracted behavior segments
+            - profile_signals: dict - Profile signals for Profile Service
             - success: bool
             - error: Optional[str]
             - metadata: dict with timing and token info
@@ -303,6 +383,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
         return {
             "standalone_query": None,
             "segments": [],
+            "profile_signals": None,
             "success": False,
             "error": "Prompt cannot be empty",
             "metadata": {"prompt_length": 0, "extraction_time_ms": 0, "tokens_used": 0}
@@ -314,6 +395,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
         return {
             "standalone_query": None,
             "segments": [],
+            "profile_signals": None,
             "success": False,
             "error": f"Prompt too short (min {MIN_PROMPT_LENGTH} chars)",
             "metadata": {"prompt_length": len(prompt), "extraction_time_ms": 0, "tokens_used": 0}
@@ -323,12 +405,13 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
         return {
             "standalone_query": None,
             "segments": [],
+            "profile_signals": None,
             "success": False,
             "error": f"Prompt too long (max {MAX_PROMPT_LENGTH} chars)",
             "metadata": {"prompt_length": len(prompt), "extraction_time_ms": 0, "tokens_used": 0}
         }
 
-    system_prompt = """You are performing TWO tasks on user input:
+    system_prompt = """You are performing THREE tasks on user input:
     
     ⚠️ CRITICAL: Extract behaviors ONLY from 'LATEST PROMPT', NOT from 'RECENT HISTORY'!
     Recent history is ONLY for query rewriting (TASK 2), NOT for behavior extraction!
@@ -459,8 +542,27 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
             }
           ]
         }
-      ]
+      ],
+      "profile_signals": {
+        "intents": {"PROBLEM_SOLVING": 0.85, "LEARNING": 0.40},
+        "interests": {"PROGRAMMING": 0.80},
+        "behavior_level": "INTERMEDIATE",
+        "signals": {"CODE_FOCUSED": 0.75},
+        "complexity": 0.65,
+        "consistency": 0.5
+      }
     }
+    
+    PROFILE_SIGNALS EXTRACTION (TASK 3):
+    Additionally, analyze the LATEST PROMPT to extract "profile_signals" — a holistic view of the user's
+    behavioral patterns for profile matching. Use these vocabularies:
+    
+    intents (purpose - 0.0-1.0): LEARNING, TASK_COMPLETION, PROBLEM_SOLVING, EXPLORATION, GUIDANCE, ENGAGEMENT
+    interests (topics - 0.0-1.0): AI, DATA_SCIENCE, WRITING, PROGRAMMING, CREATIVE, HEALTH, PERSONAL_GROWTH, ENTERTAINMENT
+    behavior_level: BEGINNER | INTERMEDIATE | ADVANCED
+    signals (response style - 0.0-1.0): DEEP_REASONING, DETAILED_EXPLANATION, CODE_FOCUSED, STEP_BY_STEP, QUICK_ANSWER, CREATIVE_OUTPUT, EMPATHETIC_RESPONSE, ITERATIVE_REFINEMENT
+    complexity: 0.0-1.0 (prompt complexity)
+    consistency: 0.5 (default)
     
     REQUIRED_INTENTS RULES:
     - Predict which behavior intent types are RELEVANT to the user's query for retrieval
@@ -604,6 +706,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
             return {
                 "standalone_query": None,
                 "segments": [],
+                "profile_signals": None,
                 "success": False,
                 "error": "Empty response from GPT",
                 "metadata": {
@@ -633,6 +736,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
             "standalone_query": standalone_query.strip(),
             "required_intents": required_intents,
             "segments": result.get("segments", []),
+            "profile_signals": result.get("profile_signals"),
             "success": True,
             "error": None,
             "metadata": {
@@ -647,6 +751,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
         return {
             "standalone_query": None,
             "segments": [],
+            "profile_signals": None,
             "success": False,
             "error": f"Failed to parse GPT response as JSON: {str(e)}",
             "metadata": {
@@ -661,6 +766,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
         return {
             "standalone_query": None,
             "segments": [],
+            "profile_signals": None,
             "success": False,
             "error": f"{error_type}: {str(e)}",
             "metadata": {

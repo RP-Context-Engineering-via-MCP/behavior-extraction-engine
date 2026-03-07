@@ -66,6 +66,13 @@ class ConflictResolutionRequest(BaseModel):
     )
 
 
+class BehaviorsByIdsRequest(BaseModel):
+    """Request model for retrieving specific behaviors by IDs"""
+    
+    user_id: str = Field(..., description="User ID who owns the behaviors")
+    behavior_ids: List[str] = Field(..., description="List of behavior IDs to retrieve")
+
+
 # ---------------------------------------------------------------------------
 # Response data payloads
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from models.behavior import (
     BehaviorState
 )
 from services.credibilityCalculator import calculate_reinforcement_boost, apply_lazy_decay
+from services.eventPublisher import get_event_publisher
 from config.configurations import DECAY_GRACE_PERIOD_SECONDS
 import time
 import uuid
@@ -120,6 +121,25 @@ def insert_behavior(payload: dict):
             , payload
             )
         conn.commit()
+    
+    # Publish behavior.created event for drift detection
+    try:
+        publisher = get_event_publisher()
+        publisher.publish_behavior_created(
+            user_id=payload.get('user_id'),
+            behavior_id=payload.get('behavior_id'),
+            target=payload.get('target') or '',
+            intent=payload.get('intent') or '',
+            context=payload.get('context') or '',
+            polarity=payload.get('polarity') or '',
+            credibility=payload.get('credibility', 0.0),
+            reinforcement_count=payload.get('reinforcement_count', 1),
+            state=payload.get('behavior_state', 'ACTIVE'),
+            created_at=payload.get('created_at', int(time.time())),
+            last_seen_at=payload.get('last_seen_at', int(time.time()))
+        )
+    except Exception as e:
+        logger.warning(f"Failed to publish behavior.created event: {e}")
 
 def insert_prompt_segment(segment_text: str, user_id: str) -> SegmentInsertResult:
     """
@@ -325,6 +345,21 @@ def reinforce_behavior(
                     cur, behavior_id, user_id, segment_id, current_timestamp
                 )
                 conn.commit()
+                
+                # Publish behavior.reinforced event for drift detection
+                if reinforce_result.success:
+                    try:
+                        publisher = get_event_publisher()
+                        publisher.publish_behavior_reinforced(
+                            user_id=user_id,
+                            behavior_id=behavior_id,
+                            reinforcement_count=reinforce_result.new_reinforcement_count,
+                            credibility=reinforce_result.new_credibility,
+                            last_seen_at=current_timestamp
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to publish behavior.reinforced event: {e}")
+                
                 return reinforce_result
 
     except Exception as e:
@@ -983,7 +1018,11 @@ def insert_conflict(
     behavior_id_2: str,
     conflict_type: ConflictType,
     similarity_distance: float,
-    llm_analysis: Optional[str] = None
+    llm_analysis: Optional[str] = None,
+    old_polarity: Optional[str] = None,
+    new_polarity: Optional[str] = None,
+    old_target: Optional[str] = None,
+    new_target: Optional[str] = None
 ) -> str:
     """
     Store a detected conflict between two behaviors in the database.
@@ -994,14 +1033,19 @@ def insert_conflict(
     - Type of conflict (resolvable vs needs user input)
     - LLM's analysis and reasoning
     - Resolution status and outcome
+    - Polarity and target information for drift detection
     
     Args:
         user_id: User whose behaviors conflict
-        behavior_id_1: First behavior ID
-        behavior_id_2: Second behavior ID
+        behavior_id_1: First behavior ID (existing/old behavior)
+        behavior_id_2: Second behavior ID (new behavior)
         conflict_type: RESOLVABLE or USER_DECISION_NEEDED
         similarity_distance: Embedding distance between behaviors
         llm_analysis: Optional LLM explanation of the conflict
+        old_polarity: Polarity of existing behavior (POSITIVE/NEGATIVE)
+        new_polarity: Polarity of new behavior (POSITIVE/NEGATIVE)
+        old_target: Target of existing behavior
+        new_target: Target of new behavior
         
     Returns:
         conflict_id: UUID of the created conflict record
@@ -1013,7 +1057,9 @@ def insert_conflict(
         >>> conflict_id = insert_conflict(
         ...     "user123", "beh_abc", "beh_xyz",
         ...     ConflictType.RESOLVABLE, 0.22,
-        ...     "Behaviors contradict in same domain"
+        ...     "Behaviors contradict in same domain",
+        ...     old_polarity="POSITIVE", new_polarity="NEGATIVE",
+        ...     old_target="python", new_target="python"
         ... )
     """
     try:
@@ -1033,9 +1079,13 @@ def insert_conflict(
                         similarity_distance,
                         llm_analysis,
                         resolution_status,
-                        created_at
+                        created_at,
+                        old_polarity,
+                        new_polarity,
+                        old_target,
+                        new_target
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         conflict_id,
@@ -1046,15 +1096,39 @@ def insert_conflict(
                         similarity_distance,
                         llm_analysis,
                         ResolutionStatus.PENDING.value,
-                        current_timestamp
+                        current_timestamp,
+                        old_polarity,
+                        new_polarity,
+                        old_target,
+                        new_target
                     )
                 )
                 conn.commit()
         
         logger.info(
             f"Stored conflict {conflict_id}: {behavior_id_1} <-> {behavior_id_2} "
-            f"(distance: {similarity_distance:.3f}, type: {conflict_type.value})"
+            f"(distance: {similarity_distance:.3f}, type: {conflict_type.value}, "
+            f"polarity: {old_polarity}→{new_polarity}, target: {old_target}→{new_target})"
         )
+        
+        # Publish behavior.conflict.resolved event for drift detection
+        try:
+            publisher = get_event_publisher()
+            publisher.publish_conflict_resolved(
+                user_id=user_id,
+                conflict_id=conflict_id,
+                behavior_id_1=behavior_id_1,
+                behavior_id_2=behavior_id_2,
+                conflict_type=conflict_type.value,
+                resolution_status=ResolutionStatus.PENDING.value,
+                old_polarity=old_polarity,
+                new_polarity=new_polarity,
+                old_target=old_target,
+                new_target=new_target,
+                created_at=current_timestamp
+            )
+        except Exception as pub_error:
+            logger.warning(f"Failed to publish behavior.conflict.resolved event: {pub_error}")
         
         return conflict_id
         
@@ -1225,6 +1299,19 @@ def supersede_behavior(
                     cur, old_behavior_id, new_behavior_id, user_id, current_timestamp
                 )
                 conn.commit()
+                
+                # Publish behavior.superseded event for drift detection
+                if success:
+                    try:
+                        publisher = get_event_publisher()
+                        publisher.publish_behavior_superseded(
+                            user_id=user_id,
+                            behavior_id=old_behavior_id,
+                            superseded_by=new_behavior_id
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to publish behavior.superseded event: {e}")
+                
                 return success
 
     except Exception as e:
@@ -1758,4 +1845,100 @@ def resolve_conflict(
     except Exception as e:
         logger.error(f"Failed to resolve conflict {conflict_id}: {str(e)}")
         raise Exception(f"Database error resolving conflict: {str(e)}")
+
+
+def get_behaviors_by_ids(user_id: str, behavior_ids: List[str]) -> List[dict]:
+    """
+    Retrieve specific behaviors by their IDs for a given user.
+    
+    Args:
+        user_id: The user ID who owns the behaviors
+        behavior_ids: List of behavior IDs to retrieve
+        
+    Returns:
+        List of behavior dictionaries with all fields including canonical structure
+    """
+    if not behavior_ids:
+        return []
+    
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                # Build parameterized query for multiple behavior IDs
+                placeholders = ','.join(['%s'] * len(behavior_ids))
+                
+                cur.execute(
+                    f"""
+                    SELECT 
+                        behavior_id,
+                        user_id,
+                        session_id,
+                        behavior_text,
+                        credibility,
+                        reinforcement_count,
+                        decay_rate,
+                        created_at,
+                        last_seen_at,
+                        prompt_history_ids,
+                        clarity_score,
+                        extraction_confidence,
+                        linguistic_strength,
+                        behavior_state,
+                        superseded_by_id,
+                        related_behaviors,
+                        last_decay_applied_at,
+                        context_notes,
+                        last_accessed_at,
+                        intent,
+                        target,
+                        context,
+                        polarity
+                    FROM behaviors
+                    WHERE user_id = %s 
+                    AND behavior_id IN ({placeholders})
+                    ORDER BY last_seen_at DESC
+                    """,
+                    [user_id] + behavior_ids
+                )
+                
+                rows = cur.fetchall()
+        
+        behaviors = []
+        for row in rows:
+            behavior = {
+                "behavior_id": row[0],
+                "user_id": row[1],
+                "session_id": row[2],
+                "behavior_text": row[3],
+                "credibility": float(row[4]) if row[4] is not None else 0.0,
+                "reinforcement_count": row[5] or 0,
+                "decay_rate": float(row[6]) if row[6] is not None else 0.0,
+                "created_at": row[7],
+                "last_seen_at": row[8],
+                "prompt_history_ids": row[9] or [],
+                "clarity_score": float(row[10]) if row[10] is not None else 0.0,
+                "extraction_confidence": float(row[11]) if row[11] is not None else 0.0,
+                "linguistic_strength": float(row[12]) if row[12] is not None else 0.0,
+                "behavior_state": row[13],
+                "superseded_by_id": row[14],
+                "related_behaviors": row[15] or [],
+                "last_decay_applied_at": row[16],
+                "context_notes": row[17],
+                "last_accessed_at": row[18],
+                # Canonical fields
+                "canonical": {
+                    "intent": row[19],
+                    "target": row[20],
+                    "context": row[21],
+                    "polarity": row[22]
+                }
+            }
+            behaviors.append(behavior)
+        
+        logger.info(f"Retrieved {len(behaviors)} behaviors for user={user_id} with IDs={behavior_ids}")
+        return behaviors
+        
+    except Exception as e:
+        logger.error(f"Failed to retrieve behaviors by IDs for user={user_id}: {str(e)}")
+        raise
 
