@@ -1,0 +1,106 @@
+# ==========================================================
+#  Observability stack: Loki + Promtail + Grafana
+#  Plus the behavior-detection service itself.
+#
+#  Usage:
+#    docker compose -f docker/docker-compose.yml up -d
+#
+#  Access:
+#    Grafana   → http://localhost:3000  (admin / admin)
+#    Loki API  → http://localhost:3100
+#    App API   → http://localhost:8000
+# ==========================================================
+
+networks:
+  observability:
+    driver: bridge
+  app:
+    driver: bridge
+
+volumes:
+  loki_data:
+  grafana_data:
+
+services:
+
+  # ─── Your application ────────────────────────────────────
+  behavior-detection:
+    build:
+      context: ..          # project root (where Dockerfile lives)
+      dockerfile: Dockerfile
+    container_name: behavior-detection
+    restart: unless-stopped
+    env_file:
+      - ../.env            # your secrets — never commit this file
+    environment:
+      SERVICE_NAME: behavior-detection
+      APP_ENV: production
+      LOG_LEVEL: info
+    ports:
+      - "8000:8000"
+    networks:
+      - app
+      - observability
+    labels:
+      # Promtail uses these labels to tag log streams in Loki
+      logging: "promtail"
+      logging_jobname: "behavior-detection"
+    # Write logs as plain text to stdout/stderr.
+    # Promtail reads them from the Docker log files on the host.
+    logging:
+      driver: "json-file"       # this is Docker's log driver, not our app logs
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ─── Loki — log storage & indexing ───────────────────────
+  loki:
+    image: grafana/loki:2.9.4
+    container_name: loki
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - observability
+
+  # ─── Promtail — log collector / shipper ──────────────────
+  promtail:
+    image: grafana/promtail:2.9.4
+    container_name: promtail
+    restart: unless-stopped
+    volumes:
+      # Config file
+      - ./promtail-config.yml:/etc/promtail/config.yml:ro
+      # Docker log files on the host — this is where container stdout goes
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # Docker socket so Promtail can resolve container metadata (labels, names)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - observability
+    depends_on:
+      - loki
+
+  # ─── Grafana — dashboards & alerting ─────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin          # change for prod
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # Auto-provision the Loki datasource on first boot
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - observability
+    depends_on:
+      - loki
