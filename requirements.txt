@@ -7,6 +7,7 @@ openai==1.57.4
 
 # Database & Vector Support
 psycopg[binary]==3.2.3
+psycopg-pool==3.2.3
 pgvector==0.3.6
 supabase==2.11.0
 
@@ -22,3 +23,6 @@ httpx==0.28.1
 
 # Utility
 typing-extensions==4.12.2
+
+# Structured JSON logging (for Loki / Grafana observability)
+python-json-logger==2.0.7

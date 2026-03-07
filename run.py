@@ -5,12 +5,11 @@ Run this script to start the service: python run.py
 """
 
 import uvicorn
-import logging
 
-logging.basicConfig(
-    level=logging.INFO,  # Changed from INFO to DEBUG
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+from config.logging_config import setup_logging
+
+# Structured JSON logging — must be called before uvicorn starts
+setup_logging()
 
 if __name__ == "__main__":
     uvicorn.run(

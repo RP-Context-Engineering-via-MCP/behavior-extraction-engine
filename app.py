@@ -3,7 +3,7 @@ Application factory for the Behavior Extraction API.
 
 This module is intentionally thin:
   - Creates the FastAPI instance with its lifespan (startup / shutdown hooks)
-  - Registers CORS middleware and static-file mount
+  - Registers CORS middleware
   - Includes the APIRouter that owns all route definitions
 
 Business logic lives in services/.
@@ -16,12 +16,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from api.router import router
+from config.logging_config import setup_logging
 from db.connection import close_db_pool, init_db_pool
 
-logging.basicConfig(level=logging.INFO)
+# Initialise structured JSON logging before anything else logs a message
+setup_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -61,9 +62,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Static frontend assets
-app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
 
 # Register all API routes
 app.include_router(router)
