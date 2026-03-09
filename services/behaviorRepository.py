@@ -325,7 +325,14 @@ def reinforce_behavior(
                     cur, behavior_id, user_id, segment_id, current_timestamp
                 )
                 conn.commit()
-                return reinforce_result
+
+        # After reinforcement is committed, check if this behavior is
+        # involved in any PENDING conflict that can now be auto-resolved.
+        # Runs in its own transaction — failures are logged, never raised.
+        if reinforce_result.success:
+            _check_and_auto_resolve_conflicts(behavior_id, user_id)
+
+        return reinforce_result
 
     except Exception as e:
         logger.error(f"Failed to reinforce behavior {behavior_id}: {str(e)}")
@@ -339,6 +346,314 @@ def reinforce_behavior(
             error=str(e)
         )
 
+
+# ---------------------------------------------------------------------------
+# Reinforcement-Divergence Auto-Resolution
+# ---------------------------------------------------------------------------
+
+def _check_and_auto_resolve_conflicts(
+    behavior_id: str,
+    user_id: str,
+) -> None:
+    """
+    Check if a just-reinforced behavior is involved in any PENDING conflict
+    and attempt automatic resolution based on reinforcement divergence.
+
+    Called after every successful reinforcement.  Uses the existing
+    ``idx_conflicts_behaviors`` B-tree index on (behavior_id_1, behavior_id_2)
+    for a sub-millisecond lookup — no Redis or external cache needed.
+
+    Resolution rules (either condition triggers resolution):
+        reinforcement_gap ≥ AUTO_RESOLVE_MIN_REINFORCEMENT_GAP   (default 3)
+        OR credibility_gap ≥ AUTO_RESOLVE_MIN_CREDIBILITY_GAP    (default 0.15)
+        ⇒ stronger behaviour wins  (OLD_WINS or NEW_WINS)
+
+    Expiration fallback:
+        conflict_age > CONFLICT_EXPIRY_SECONDS   (default 30 days)
+        ⇒ resolve as BOTH_CORRECT (user implicitly accepts both)
+
+    All DB work runs in a single transaction so the resolution is atomic.
+    Errors are logged but never propagated — reinforcement must not fail
+    because of an auto-resolution edge case.
+    """
+    from config.configurations import (
+        AUTO_RESOLVE_MIN_REINFORCEMENT_GAP,
+        AUTO_RESOLVE_MIN_CREDIBILITY_GAP,
+        CONFLICT_EXPIRY_SECONDS,
+    )
+
+    try:
+        current_timestamp = int(time.time())
+
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                # ---------------------------------------------------------
+                # 1. Find all PENDING conflicts involving this behavior.
+                #    The OR covers both positions (behavior_id_1, _2).
+                # ---------------------------------------------------------
+                cur.execute(
+                    """
+                    SELECT
+                        c.conflict_id,
+                        c.behavior_id_1,
+                        c.behavior_id_2,
+                        c.created_at,
+                        b1.credibility        AS cred_1,
+                        b1.reinforcement_count AS rc_1,
+                        b2.credibility        AS cred_2,
+                        b2.reinforcement_count AS rc_2
+                    FROM behavior_conflicts c
+                    JOIN behaviors b1
+                      ON b1.behavior_id = c.behavior_id_1 AND b1.user_id = c.user_id
+                    JOIN behaviors b2
+                      ON b2.behavior_id = c.behavior_id_2 AND b2.user_id = c.user_id
+                    WHERE c.user_id = %s
+                      AND c.resolution_status = 'PENDING'
+                      AND (c.behavior_id_1 = %s OR c.behavior_id_2 = %s)
+                    """,
+                    (user_id, behavior_id, behavior_id),
+                )
+
+                pending_conflicts = cur.fetchall()
+
+                if not pending_conflicts:
+                    return  # fast path — nothing to do
+
+                logger.info(
+                    f"[AUTO-RESOLVE-FLAGGED] Checking {len(pending_conflicts)} pending "
+                    f"conflict(s) for behavior {behavior_id}"
+                )
+
+                for row in pending_conflicts:
+                    (
+                        conflict_id,
+                        bid_1, bid_2,
+                        created_at,
+                        cred_1, rc_1,
+                        cred_2, rc_2,
+                    ) = row
+
+                    conflict_age = current_timestamp - created_at
+                    reinforcement_gap = abs(int(rc_1) - int(rc_2))
+                    credibility_gap = abs(float(cred_1) - float(cred_2))
+
+                    # -------------------------------------------------
+                    # Rule 1: Divergence threshold met → winner takes all
+                    #
+                    # Either condition alone is sufficient evidence:
+                    #   - reinforcement_gap ≥ 3 means the user has
+                    #     repeatedly expressed one behavior but not the
+                    #     other — clear user intent signal.
+                    #   - credibility_gap ≥ 0.15 means quality scores
+                    #     have diverged enough (possible when one
+                    #     started with low credibility).
+                    #
+                    # Using OR avoids the case where both behaviors
+                    # start with high credibility (~0.88) making the
+                    # gap physically unreachable (capped at 1.0).
+                    # -------------------------------------------------
+                    if (
+                        reinforcement_gap >= AUTO_RESOLVE_MIN_REINFORCEMENT_GAP
+                        or credibility_gap >= AUTO_RESOLVE_MIN_CREDIBILITY_GAP
+                    ):
+                        # Determine winner (behavior_id_1 = old, _2 = new)
+                        if float(cred_1) > float(cred_2):
+                            resolution_choice = "OLD_WINS"
+                            winner_id, loser_id = bid_1, bid_2
+                        else:
+                            resolution_choice = "NEW_WINS"
+                            winner_id, loser_id = bid_2, bid_1
+
+                        # Execute resolution atomically on this cursor
+                        _apply_auto_resolution(
+                            cur,
+                            conflict_id=conflict_id,
+                            user_id=user_id,
+                            resolution_choice=resolution_choice,
+                            winner_id=winner_id,
+                            loser_id=loser_id,
+                            current_timestamp=current_timestamp,
+                        )
+
+                        logger.info(
+                            f"[AUTO-RESOLVE] Conflict {conflict_id} → {resolution_choice} "
+                            f"(gap: rc={reinforcement_gap}, cred={credibility_gap:.3f})"
+                        )
+                        continue
+
+                    # -------------------------------------------------
+                    # Rule 2: Expiration → BOTH_CORRECT
+                    # -------------------------------------------------
+                    if conflict_age >= CONFLICT_EXPIRY_SECONDS:
+                        _apply_auto_resolution_both_correct(
+                            cur,
+                            conflict_id=conflict_id,
+                            user_id=user_id,
+                            bid_1=bid_1,
+                            bid_2=bid_2,
+                            current_timestamp=current_timestamp,
+                        )
+
+                        logger.info(
+                            f"[AUTO-RESOLVE] Conflict {conflict_id} expired after "
+                            f"{conflict_age // 86400} days → BOTH_CORRECT"
+                        )
+                        continue
+
+                    # Neither threshold met — leave as PENDING
+                    logger.info(
+                        f"[AUTO-RESOLVE] Conflict {conflict_id} not yet resolvable "
+                        f"(rc_gap={reinforcement_gap} [need≥{AUTO_RESOLVE_MIN_REINFORCEMENT_GAP}], "
+                        f"cred_gap={credibility_gap:.3f} [need≥{AUTO_RESOLVE_MIN_CREDIBILITY_GAP}], "
+                        f"age={conflict_age // 86400}d [expire≥{CONFLICT_EXPIRY_SECONDS // 86400}d])"
+                    )
+
+                conn.commit()
+
+    except Exception as e:
+        # Never propagate — reinforcement should not fail because of this.
+        logger.error(
+            f"[AUTO-RESOLVE] Error checking conflicts for behavior "
+            f"{behavior_id}: {str(e)}"
+        )
+
+
+def _apply_auto_resolution(
+    cur,
+    conflict_id: str,
+    user_id: str,
+    resolution_choice: str,
+    winner_id: str,
+    loser_id: str,
+    current_timestamp: int,
+) -> None:
+    """
+    Apply OLD_WINS or NEW_WINS auto-resolution on an existing cursor.
+
+    Winner  → ACTIVE, reinforced once.
+    Loser   → SUPERSEDED, credibility → 0.0 (queued for pruning).
+    Conflict → resolution_status = AUTO_RESOLVED.
+
+    Does NOT commit — caller is responsible.
+    """
+    # Reinforce winner
+    _reinforce_behavior_on_cursor(
+        cur, winner_id, user_id,
+        segment_id=None,
+        current_timestamp=current_timestamp,
+    )
+
+    # Ensure winner is ACTIVE
+    cur.execute(
+        """
+        UPDATE behaviors
+        SET behavior_state = %s,
+            last_accessed_at = %s
+        WHERE behavior_id = %s AND user_id = %s
+        """,
+        (BehaviorState.ACTIVE.value, current_timestamp, winner_id, user_id),
+    )
+
+    # Supersede loser
+    cur.execute(
+        """
+        UPDATE behaviors
+        SET credibility = 0.0,
+            behavior_state = %s,
+            superseded_by_id = %s,
+            last_accessed_at = %s
+        WHERE behavior_id = %s AND user_id = %s
+        """,
+        (
+            BehaviorState.SUPERSEDED.value,
+            winner_id,
+            current_timestamp,
+            loser_id,
+            user_id,
+        ),
+    )
+
+    # Mark conflict as AUTO_RESOLVED
+    cur.execute(
+        """
+        UPDATE behavior_conflicts
+        SET resolution_status = %s,
+            resolution_choice = %s,
+            resolved_at = %s
+        WHERE conflict_id = %s AND user_id = %s
+        """,
+        (
+            ResolutionStatus.AUTO_RESOLVED.value,
+            resolution_choice,
+            current_timestamp,
+            conflict_id,
+            user_id,
+        ),
+    )
+
+
+def _apply_auto_resolution_both_correct(
+    cur,
+    conflict_id: str,
+    user_id: str,
+    bid_1: str,
+    bid_2: str,
+    current_timestamp: int,
+) -> None:
+    """
+    Expire a stale conflict as BOTH_CORRECT on an existing cursor.
+
+    Both behaviours → ACTIVE (reinforced once each).
+    Conflict → resolution_status = EXPIRED, resolution_choice = BOTH_CORRECT.
+
+    Does NOT commit — caller is responsible.
+    """
+    # Reinforce both behaviours
+    _reinforce_behavior_on_cursor(
+        cur, bid_1, user_id,
+        segment_id=None,
+        current_timestamp=current_timestamp,
+    )
+    _reinforce_behavior_on_cursor(
+        cur, bid_2, user_id,
+        segment_id=None,
+        current_timestamp=current_timestamp,
+    )
+
+    # Ensure both are ACTIVE
+    cur.execute(
+        """
+        UPDATE behaviors
+        SET behavior_state = %s,
+            last_accessed_at = %s
+        WHERE behavior_id IN (%s, %s) AND user_id = %s
+        """,
+        (
+            BehaviorState.ACTIVE.value,
+            current_timestamp,
+            bid_1,
+            bid_2,
+            user_id,
+        ),
+    )
+
+    # Mark conflict as EXPIRED / BOTH_CORRECT
+    cur.execute(
+        """
+        UPDATE behavior_conflicts
+        SET resolution_status = %s,
+            resolution_choice = %s,
+            resolved_at = %s
+        WHERE conflict_id = %s AND user_id = %s
+        """,
+        (
+            ResolutionStatus.EXPIRED.value,
+            "BOTH_CORRECT",
+            current_timestamp,
+            conflict_id,
+            user_id,
+        ),
+    )
 
 
 def get_user_behaviors(user_id: str, session_id: Optional[str] = None, include_states: List[str] = None) -> List[dict]:
@@ -561,150 +876,86 @@ def search_similar_behavior_3D(
     limit: int = None
 ) -> HybridSearchResponse:
     """
-    Tuple-Guided Hybrid Retrieval (TGHR) — 3-dimensional behavior search.
-    
-    Combines three retrieval signals in a single database query:
-      1. Dense retrieval  — cosine similarity via pgvector (semantic meaning)
-      2. Sparse retrieval — BM25 via PostgreSQL tsvector (exact keyword matching)
-      3. Metadata pre-filtering — intent-based filtering predicted by the LLM
-    
-    The dense and sparse scores are fused using a weighted linear combination:
-        hybrid_score = DENSE_WEIGHT * (1 - cosine_distance) + SPARSE_WEIGHT * bm25_rank
-    
-    This method is READ-ONLY at query time. It collects pending updates
+    Layered Retrieval Architecture (LRA) — 3-stage behavior search.
+
+    Replaces the previous single-pass additive hybrid (TGHR) with a
+    retrieve-and-rerank pipeline that avoids BM25 score incompatibility
+    and lexical sparsity issues on micro-behaviors (<7 words).
+
+    Pipeline stages:
+      Stage 1 — Coarse Semantic Retrieval (Recall Layer):
+          Pure cosine-distance query via pgvector.  Fetches the top K
+          candidates purely by semantic meaning, maximising recall.
+
+      Stage 2 — Multiplicative Intent Re-ranking (Precision Layer):
+          Neuro-symbolic fusion: each candidate's base semantic score is
+          modulated by a multiplicative intent-affinity scalar.
+              S_base  = 1 - D_cosine
+              M       = 1 + (α · A)          (α = INTENT_RERANK_ALPHA)
+              S_final = S_base · M
+          This ensures intent alignment *amplifies* strong semantic
+          matches but cannot rescue irrelevant behaviors.
+
+      Stage 3 — Dynamic Thresholding & Relevance Gap Cutoff:
+          a) Absolute Semantic Floor — discard any S_final < τ_min.
+          b) Relevance Gap — T_dynamic = S_max · (1 - ρ).  Any result
+             below T_dynamic is cut, preventing "tail noise" from
+             diluting the LLM's attention.
+          c) Soft cap — hard limit on returned results.
+
+    This method is READ-ONLY at query time.  It collects pending updates
     (lazy decay + last_accessed_at) which the caller should persist
     asynchronously via persist_retrieval_updates_batch().
-    
+
     Args:
         user_id: User identifier
         query_embedding: Dense vector embedding of the standalone query
-        query_text: Plain text of the standalone query (used for BM25 sparse search)
+        query_text: Plain text of the standalone query (kept for logging)
         session_id: Session identifier for isolation (defaults to "default")
         required_intents: Optional list of intent types predicted by the LLM
-                          (e.g., ["CONSTRAINT", "PREFERENCE"]). If None or empty,
-                          no intent filtering is applied.
-        limit: Maximum number of results to return (defaults to HYBRID_SEARCH_LIMIT)
-    
+                          (e.g., ["CONSTRAINT", "PREFERENCE"]).  If None or
+                          empty, no intent re-ranking is applied.
+        limit: Maximum candidates fetched from DB (defaults to HYBRID_SEARCH_LIMIT)
+
     Returns:
         HybridSearchResponse containing:
-          - results: List of SimilarityResult objects (sorted by hybrid_score desc)
+          - results: List of SimilarityResult objects (sorted by S_final desc)
           - decay_updates: Pending credibility updates for async persistence
-          - accessed_behavior_ids: IDs of all returned behaviors for last_accessed_at update
+          - accessed_behavior_ids: IDs of all returned behaviors for
+            last_accessed_at update
     """
     from config.configurations import (
-        HYBRID_DENSE_WEIGHT,
-        HYBRID_SPARSE_WEIGHT,
-        HYBRID_INTENT_BOOST_WEIGHT,
         HYBRID_SEARCH_LIMIT,
-        HYBRID_SCORE_THRESHOLD,
+        INTENT_RERANK_ALPHA,
+        SEMANTIC_FLOOR_THRESHOLD,
         RELEVANCE_GAP_DROP_RATIO,
         MAX_RETRIEVAL_RESULTS,
         ALL_INTENT_TYPES,
         INTENT_AFFINITY
     )
-    
+
     if limit is None:
         limit = HYBRID_SEARCH_LIMIT
-
-    # ----------------------------------------------------------
-    # Build OR-based tsquery from query text.
-    # plainto_tsquery uses AND between all terms, which produces 0
-    # when short behavior texts only partially overlap with long queries.
-    # OR-based matching gives partial credit for any keyword match.
-    # ----------------------------------------------------------
-    def _build_or_tsquery(text: str) -> str:
-        """Convert natural language text to OR-based tsquery string.
-        
-        'What foods should I eat before my morning run'
-        → 'food | eat | morn | run'  (after PostgreSQL stemming)
-        
-        We send the raw words joined by | and let to_tsquery('english', ...)
-        handle stemming. Stop words are kept but to_tsquery ignores them.
-        """
-        import re
-        # Extract alphanumeric words, skip very short ones (likely stop words)
-        words = re.findall(r'[a-zA-Z]{3,}', text.lower())
-        if not words:
-            return text  # fallback: let PostgreSQL handle it
-        return ' | '.join(words)
 
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
-                # ----------------------------------------------------------
-                # Build the WHERE clause dynamically based on intent filter
-                # ----------------------------------------------------------
+                # ==========================================================
+                # STAGE 1 — Coarse Semantic Retrieval (Recall Layer)
+                # Pure dense vector search via pgvector cosine distance.
+                # No BM25, no intent scoring in SQL — just semantics.
+                # ==========================================================
                 base_conditions = """
                     user_id = %s
                     AND session_id = %s
                     AND behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED')
                 """
-                where_params: list = [user_id, session_id]
-
-                # ----------------------------------------------------------
-                # Hybrid scoring query — 3 signals combined:
-                #   Signal 1: Dense score  = 1 - cosine_distance  (semantic)
-                #   Signal 2: Sparse score = ts_rank_cd / BM25    (keyword)
-                #   Signal 3: Intent boost = graduated affinity-based boost
-                #
-                # Intent is a GRADUATED SOFT BOOST via affinity matrix.
-                # Exact intent matches get full boost, related intents get
-                # partial boost (e.g., HABIT→CONSTRAINT = 0.50), unrelated
-                # intents get 0. This prevents "intent blind spots".
-                #
-                # IMPORTANT: params must be ordered to match %s appearance:
-                #   SELECT clause params → WHERE clause params → LIMIT
-                # ----------------------------------------------------------
-                
-                # Build intent boost SQL fragment (graduated via affinity matrix)
-                # Instead of binary 1.0/0.0, related intents get partial boost.
-                # This prevents "intent blind spots" where HABIT behaviors about
-                # health are invisible to CONSTRAINT/PREFERENCE queries.
-                use_intent_boost = required_intents and len(required_intents) > 0
-                if use_intent_boost:
-                    boost_map = {}
-                    for intent_type in ALL_INTENT_TYPES:
-                        if intent_type in required_intents:
-                            boost_map[intent_type] = 1.0
-                        else:
-                            max_affinity = 0.0
-                            for req in required_intents:
-                                key = frozenset({intent_type, req})
-                                affinity = INTENT_AFFINITY.get(key, 0.0)
-                                max_affinity = max(max_affinity, affinity)
-                            boost_map[intent_type] = max_affinity
-
-                    # Build graduated CASE — intent names are from ALL_INTENT_TYPES
-                    # (known enum, safe to interpolate). Only weight is parameterized.
-                    case_parts = []
-                    for intent_type, boost_val in boost_map.items():
-                        if boost_val > 0.0:
-                            case_parts.append(f"WHEN intent = '{intent_type}' THEN {boost_val:.4f}")
-
-                    if case_parts:
-                        case_sql = f"CASE {' '.join(case_parts)} ELSE 0.0 END"
-                        intent_boost_sql = f"%s * ({case_sql})"
-                    else:
-                        intent_boost_sql = "0.0"
-                        use_intent_boost = False
-
-                    logger.debug(f"[3D] Intent affinity boosts: {boost_map}")
-                else:
-                    intent_boost_sql = "0.0"
-
-                # Build OR-based tsquery string for BM25 sparse matching
-                or_tsquery_str = _build_or_tsquery(query_text)
-                logger.debug(f"[3D] OR tsquery: '{or_tsquery_str}'")
 
                 query = f"""
                     SELECT
                         behavior_id,
                         behavior_text,
                         embedding <=> %s::vector AS cosine_distance,
-                        ts_rank_cd(
-                            COALESCE(search_vector, to_tsvector('english', behavior_text || ' ' || COALESCE(target, '') || ' ' || COALESCE(context, ''))),
-                            to_tsquery('english', %s)
-                        ) AS bm25_score,
                         credibility,
                         last_seen_at,
                         reinforcement_count,
@@ -713,62 +964,77 @@ def search_similar_behavior_3D(
                         context,
                         polarity,
                         decay_rate,
-                        last_decay_applied_at,
-                        (
-                            %s * (1.0 - (embedding <=> %s::vector))
-                            +
-                            %s * ts_rank_cd(
-                                COALESCE(search_vector, to_tsvector('english', behavior_text || ' ' || COALESCE(target, '') || ' ' || COALESCE(context, ''))),
-                                to_tsquery('english', %s)
-                            )
-                            +
-                            {intent_boost_sql}
-                        ) AS hybrid_score
+                        last_decay_applied_at
                     FROM behaviors
                     WHERE {base_conditions}
-                    ORDER BY hybrid_score DESC
+                    ORDER BY cosine_distance ASC
                     LIMIT %s;
                 """
-                
-                # Build params in SQL %s appearance order: SELECT → WHERE → LIMIT
-                select_params = [
-                    query_embedding,          # embedding <=> %s::vector (cosine_distance)
-                    or_tsquery_str,           # to_tsquery('english', %s) (bm25_score)
-                    HYBRID_DENSE_WEIGHT,      # %s * (1.0 - ...) (dense weight)
-                    query_embedding,          # embedding <=> %s::vector (hybrid dense)
-                    HYBRID_SPARSE_WEIGHT,     # %s * ts_rank_cd(...) (sparse weight)
-                    or_tsquery_str,           # to_tsquery('english', %s) (hybrid sparse)
+
+                params = [
+                    query_embedding,   # embedding <=> %s::vector
+                    user_id,           # WHERE user_id = %s
+                    session_id,        # AND session_id = %s
+                    limit,             # LIMIT %s
                 ]
-                # Add intent boost weight param if applicable
-                # (boost values per intent are baked into CASE — only weight is parameterized)
-                if use_intent_boost:
-                    select_params.append(HYBRID_INTENT_BOOST_WEIGHT)  # %s * (CASE ...)
-                
-                params = select_params + where_params + [limit]
 
                 cur.execute(query, params)
-                results = cur.fetchall()
+                rows = cur.fetchall()
                 current_time = int(time.time())
 
-                # ----------------------------------------------------------
-                # Build SimilarityResult objects with in-memory lazy decay
-                # Collect pending updates for async persistence
-                # ----------------------------------------------------------
-                similarity_results = []
+                # ==========================================================
+                # STAGE 2 — Multiplicative Intent Re-ranking (Precision Layer)
+                #
+                # Build per-intent affinity map, then compute:
+                #   S_base  = 1 - D_cosine         (bounded 0..1)
+                #   M       = 1 + (α · A)          (bounded 1..1+α)
+                #   S_final = S_base · M
+                #
+                # This is a neuro-symbolic operation: neural (embedding
+                # distance) modulated by symbolic (intent taxonomy).
+                # Multiplication guarantees that intent alone cannot rescue
+                # a semantically poor match.
+                # ==========================================================
+
+                # Pre-compute affinity map: intent_type → best affinity
+                use_intent_rerank = required_intents and len(required_intents) > 0
+                affinity_map: dict[str, float] = {}
+                if use_intent_rerank:
+                    for intent_type in ALL_INTENT_TYPES:
+                        if intent_type in required_intents:
+                            affinity_map[intent_type] = 1.0
+                        else:
+                            best = 0.0
+                            for req in required_intents:
+                                key = frozenset({intent_type, req})
+                                best = max(best, INTENT_AFFINITY.get(key, 0.0))
+                            affinity_map[intent_type] = best
+                    logger.debug(f"[LRA] Intent affinity map: {affinity_map}")
+
+                # Process rows: compute S_final, apply lazy decay, collect
+                scored_candidates = []
                 decay_updates = []
-                accessed_behavior_ids = []
-                
-                for row in results:
+
+                for row in rows:
                     (
-                        behavior_id, behavior_text, cosine_distance, bm25_score,
+                        behavior_id, behavior_text, cosine_distance,
                         stored_credibility, last_seen_at, reinforcement_count,
                         intent, target, context, polarity,
-                        decay_rate, last_decay_applied_at, hybrid_score
+                        decay_rate, last_decay_applied_at,
                     ) = row
 
-                    # Skip results below the hybrid score threshold
-                    if float(hybrid_score) < HYBRID_SCORE_THRESHOLD:
-                        continue
+                    # S_base: convert cosine distance → similarity (bounded 0..1)
+                    s_base = max(0.0, 1.0 - float(cosine_distance))
+
+                    # Multiplicative intent scalar
+                    if use_intent_rerank:
+                        affinity = affinity_map.get(intent, 0.0)
+                        multiplier = 1.0 + (INTENT_RERANK_ALPHA * affinity)
+                    else:
+                        affinity = 0.0
+                        multiplier = 1.0
+
+                    s_final = s_base * multiplier
 
                     # Apply lazy decay in-memory (read-only, no DB update)
                     new_credibility, decay_applied, days_elapsed = apply_lazy_decay(
@@ -780,11 +1046,10 @@ def search_similar_behavior_3D(
 
                     if decay_applied:
                         logger.debug(
-                            f"[3D] Lazy decay (in-memory) for {behavior_id}: "
+                            f"[LRA] Lazy decay (in-memory) for {behavior_id}: "
                             f"{stored_credibility:.4f} → {new_credibility:.4f} "
                             f"({days_elapsed} days)"
                         )
-                        # Collect for async batch update
                         decay_updates.append((
                             new_credibility,
                             current_time,
@@ -792,99 +1057,130 @@ def search_similar_behavior_3D(
                             user_id
                         ))
 
-                    # Map hybrid_score → distance so lower = better (API consistency)
-                    # hybrid_score is 0..~1, so distance = 1 - hybrid_score
-                    effective_distance = max(0.0, 1.0 - float(hybrid_score))
+                    scored_candidates.append({
+                        "behavior_id": behavior_id,
+                        "behavior_text": behavior_text,
+                        "cosine_distance": float(cosine_distance),
+                        "s_base": s_base,
+                        "affinity": affinity,
+                        "multiplier": multiplier,
+                        "s_final": s_final,
+                        "credibility": new_credibility,
+                        "last_seen_at": int(last_seen_at),
+                        "reinforcement_count": int(reinforcement_count),
+                        "intent": intent,
+                        "target": target,
+                        "context": context if context else "general",
+                        "polarity": polarity,
+                    })
 
-                    similarity_results.append(SimilarityResult(
-                        behavior_id=behavior_id,
-                        behavior_text=behavior_text,
-                        distance=effective_distance,
-                        credibility=new_credibility,
-                        last_seen_at=int(last_seen_at),
-                        reinforcement_count=int(reinforcement_count),
-                        intent=intent,
-                        target=target,
-                        context=context if context else "general",
-                        polarity=polarity
-                    ))
-                    
-                    # Track all returned behavior IDs for last_accessed_at update
-                    accessed_behavior_ids.append(behavior_id)
+                # Sort by S_final descending (re-ranking may reorder)
+                scored_candidates.sort(key=lambda c: c["s_final"], reverse=True)
 
-                    # Log each matched behavior with scoring breakdown
+                # ==========================================================
+                # STAGE 3a — Absolute Semantic Floor (Hard Cutoff)
+                # Discard any candidate with S_final < τ_min.
+                # Prevents injecting weakly-related behaviors that could
+                # cause hallucination or knowledge fragmentation in the LLM.
+                # ==========================================================
+                before_floor = len(scored_candidates)
+                scored_candidates = [
+                    c for c in scored_candidates
+                    if c["s_final"] >= SEMANTIC_FLOOR_THRESHOLD
+                ]
+                dropped_by_floor = before_floor - len(scored_candidates)
+                if dropped_by_floor > 0:
                     logger.info(
-                        f"[3D] MATCH #{len(similarity_results)}: "
-                        f"id={behavior_id} | intent={intent} | "
-                        f"dense={1.0 - float(cosine_distance):.4f} | "
-                        f"sparse={float(bm25_score):.4f} | "
-                        f"hybrid={float(hybrid_score):.4f} | "
-                        f"credibility={new_credibility:.4f} | "
-                        f"text='{behavior_text[:80]}...'"
+                        f"[LRA] Semantic floor: dropped {dropped_by_floor} candidates "
+                        f"below τ_min={SEMANTIC_FLOOR_THRESHOLD:.2f}"
                     )
 
-                # ----------------------------------------------------------
-                # Apply relevance gap cutoff:
-                # If a result's score drops more than RELEVANCE_GAP_DROP_RATIO
-                # below the top result, stop including further results.
-                # This prevents low-quality tail noise from being returned.
-                # ----------------------------------------------------------
-                if similarity_results:
-                    top_score = float(1.0 - similarity_results[0].distance)  # convert back to hybrid score
-                    cutoff_score = top_score * (1.0 - RELEVANCE_GAP_DROP_RATIO)
-                    
-                    filtered_results = []
-                    filtered_decay = []
-                    filtered_ids = []
-                    
-                    for i, sr in enumerate(similarity_results):
-                        sr_score = 1.0 - sr.distance
-                        if sr_score < cutoff_score:
-                            break
-                        filtered_results.append(sr)
-                        # Keep corresponding decay update if it exists
-                        # decay_updates and accessed_behavior_ids align with similarity_results
-                        if sr.behavior_id in [d[2] for d in decay_updates]:
-                            for d in decay_updates:
-                                if d[2] == sr.behavior_id:
-                                    filtered_decay.append(d)
-                                    break
-                        filtered_ids.append(sr.behavior_id)
-                    
-                    dropped = len(similarity_results) - len(filtered_results)
-                    if dropped > 0:
-                        logger.info(
-                            f"[3D] Relevance gap cutoff: kept {len(filtered_results)}, "
-                            f"dropped {dropped} (top_score={top_score:.4f}, "
-                            f"cutoff={cutoff_score:.4f})"
-                        )
-                    
-                    similarity_results = filtered_results
-                    decay_updates = filtered_decay
-                    accessed_behavior_ids = filtered_ids
+                # ==========================================================
+                # STAGE 3b — Relevance Gap (Dynamic Context Truncation)
+                # T_dynamic = S_max · (1 - ρ)
+                # Detects the "semantic cliff" between the top match and
+                # weaker results.  Prevents tail noise from diluting the
+                # LLM's attention mechanism.
+                # ==========================================================
+                if scored_candidates:
+                    s_max = scored_candidates[0]["s_final"]
+                    t_dynamic = s_max * (1.0 - RELEVANCE_GAP_DROP_RATIO)
 
-                # ----------------------------------------------------------
-                # Soft cap: limit maximum results to prevent over-retrieval
-                # for broad/vague queries where many behaviors cluster in a
-                # similar score range and gap cutoff alone can't separate them.
-                # ----------------------------------------------------------
-                if len(similarity_results) > MAX_RETRIEVAL_RESULTS:
-                    dropped_by_cap = len(similarity_results) - MAX_RETRIEVAL_RESULTS
-                    similarity_results = similarity_results[:MAX_RETRIEVAL_RESULTS]
-                    accessed_behavior_ids = accessed_behavior_ids[:MAX_RETRIEVAL_RESULTS]
-                    remaining_ids = set(accessed_behavior_ids)
-                    decay_updates = [d for d in decay_updates if d[2] in remaining_ids]
+                    gap_filtered = []
+                    for c in scored_candidates:
+                        if c["s_final"] < t_dynamic:
+                            break
+                        gap_filtered.append(c)
+
+                    dropped_by_gap = len(scored_candidates) - len(gap_filtered)
+                    if dropped_by_gap > 0:
+                        logger.info(
+                            f"[LRA] Relevance gap cutoff: kept {len(gap_filtered)}, "
+                            f"dropped {dropped_by_gap} "
+                            f"(S_max={s_max:.4f}, T_dynamic={t_dynamic:.4f}, "
+                            f"ρ={RELEVANCE_GAP_DROP_RATIO})"
+                        )
+                    scored_candidates = gap_filtered
+
+                # ==========================================================
+                # STAGE 3c — Soft Cap
+                # Hard limit on returned results to prevent over-retrieval
+                # for broad/vague queries.
+                # ==========================================================
+                if len(scored_candidates) > MAX_RETRIEVAL_RESULTS:
+                    dropped_by_cap = len(scored_candidates) - MAX_RETRIEVAL_RESULTS
+                    scored_candidates = scored_candidates[:MAX_RETRIEVAL_RESULTS]
                     logger.info(
-                        f"[3D] Soft cap applied: kept top {MAX_RETRIEVAL_RESULTS}, "
+                        f"[LRA] Soft cap applied: kept top {MAX_RETRIEVAL_RESULTS}, "
                         f"dropped {dropped_by_cap} excess results"
                     )
 
+                # ==========================================================
+                # Build final response objects
+                # ==========================================================
+                similarity_results = []
+                accessed_behavior_ids = []
+
+                for i, c in enumerate(scored_candidates):
+                    # distance = 1 - S_final  (lower = better, API consistency)
+                    effective_distance = max(0.0, 1.0 - c["s_final"])
+
+                    similarity_results.append(SimilarityResult(
+                        behavior_id=c["behavior_id"],
+                        behavior_text=c["behavior_text"],
+                        distance=effective_distance,
+                        credibility=c["credibility"],
+                        last_seen_at=c["last_seen_at"],
+                        reinforcement_count=c["reinforcement_count"],
+                        intent=c["intent"],
+                        target=c["target"],
+                        context=c["context"],
+                        polarity=c["polarity"],
+                    ))
+                    accessed_behavior_ids.append(c["behavior_id"])
+
+                    logger.info(
+                        f"[LRA] MATCH #{i + 1}: "
+                        f"id={c['behavior_id']} | intent={c['intent']} | "
+                        f"S_base={c['s_base']:.4f} | "
+                        f"affinity={c['affinity']:.2f} | "
+                        f"M={c['multiplier']:.4f} | "
+                        f"S_final={c['s_final']:.4f} | "
+                        f"credibility={c['credibility']:.4f} | "
+                        f"text='{c['behavior_text'][:80]}...'"
+                    )
+
+                # Trim decay_updates to only include returned behavior IDs
+                returned_ids = set(accessed_behavior_ids)
+                decay_updates = [d for d in decay_updates if d[2] in returned_ids]
+
                 logger.info(
-                    f"[3D] Hybrid search for user {user_id} in session {session_id}: "
+                    f"[LRA] Search for user {user_id} in session {session_id}: "
                     f"{len(similarity_results)} results "
-                    f"(dense_w={HYBRID_DENSE_WEIGHT}, sparse_w={HYBRID_SPARSE_WEIGHT}, "
-                    f"intent_boost_w={HYBRID_INTENT_BOOST_WEIGHT}, "
-                    f"intents_boost={required_intents or 'NONE'}, "
+                    f"(α={INTENT_RERANK_ALPHA}, "
+                    f"τ_min={SEMANTIC_FLOOR_THRESHOLD}, "
+                    f"ρ={RELEVANCE_GAP_DROP_RATIO}, "
+                    f"intents={required_intents or 'NONE'}, "
                     f"decay_pending={len(decay_updates)}, "
                     f"query='{query_text[:60]}...')"
                 )
@@ -895,7 +1191,7 @@ def search_similar_behavior_3D(
                 )
 
     except Exception as e:
-        logger.error(f"[3D] Failed to search similar behaviors: {str(e)}")
+        logger.error(f"[LRA] Failed to search similar behaviors: {str(e)}")
         return HybridSearchResponse()
 
 

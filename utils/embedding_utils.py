@@ -16,7 +16,7 @@ def get_text_embedding(text: str) -> List[float]:
         text: Natural language text to embed
         
     Returns:
-        List of floats representing the embedding vector (3072 dimensions for text-embedding-3-large)
+        List of floats representing the embedding vector (384 dimensions for all-MiniLM-L6-v2)
         
     Raises:
         ValueError: If text is empty or invalid

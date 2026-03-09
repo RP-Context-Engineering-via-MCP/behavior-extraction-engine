@@ -18,24 +18,26 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from config.constants import (  # re-export for backward compatibility
     ALL_INTENT_TYPES,
+    AUTO_RESOLVE_MIN_CREDIBILITY_GAP,
+    AUTO_RESOLVE_MIN_REINFORCEMENT_GAP,
     BASE_REINFORCEMENT_BOOST,
     CONFIRMATION_EXPIRATION_DAYS,
     CONFIRMATION_EXPIRATION_SECONDS,
+    CONFLICT_EXPIRY_DAYS,
+    CONFLICT_EXPIRY_SECONDS,
     CREDIBILITY_PRUNE_THRESHOLD,
     CREDIBILITY_WEIGHTS,
     DECAY_GRACE_PERIOD_DAYS,
     DECAY_GRACE_PERIOD_SECONDS,
     DEFAULT_DECAY_RATE,
-    HYBRID_DENSE_WEIGHT,
-    HYBRID_INTENT_BOOST_WEIGHT,
-    HYBRID_SCORE_THRESHOLD,
     HYBRID_SEARCH_LIMIT,
-    HYBRID_SPARSE_WEIGHT,
     INTENT_AFFINITY,
     INTENT_DECAY_RATES,
+    INTENT_RERANK_ALPHA,
     MAX_RETRIEVAL_RESULTS,
     RELATED_BEHAVIORS_DISTANCE_THRESHOLD,
     RELEVANCE_GAP_DROP_RATIO,
+    SEMANTIC_FLOOR_THRESHOLD,
     SEMANTIC_RELEVANCE_THRESHOLD,
 )
 
@@ -52,24 +54,26 @@ __all__ = [
     "SAMPLE_USERID",
     # --- algorithm constants (re-exported from constants.py) --------------
     "ALL_INTENT_TYPES",
+    "AUTO_RESOLVE_MIN_CREDIBILITY_GAP",
+    "AUTO_RESOLVE_MIN_REINFORCEMENT_GAP",
     "BASE_REINFORCEMENT_BOOST",
     "CONFIRMATION_EXPIRATION_DAYS",
     "CONFIRMATION_EXPIRATION_SECONDS",
+    "CONFLICT_EXPIRY_DAYS",
+    "CONFLICT_EXPIRY_SECONDS",
     "CREDIBILITY_PRUNE_THRESHOLD",
     "CREDIBILITY_WEIGHTS",
     "DECAY_GRACE_PERIOD_DAYS",
     "DECAY_GRACE_PERIOD_SECONDS",
     "DEFAULT_DECAY_RATE",
-    "HYBRID_DENSE_WEIGHT",
-    "HYBRID_INTENT_BOOST_WEIGHT",
-    "HYBRID_SCORE_THRESHOLD",
     "HYBRID_SEARCH_LIMIT",
-    "HYBRID_SPARSE_WEIGHT",
     "INTENT_AFFINITY",
     "INTENT_DECAY_RATES",
+    "INTENT_RERANK_ALPHA",
     "MAX_RETRIEVAL_RESULTS",
     "RELATED_BEHAVIORS_DISTANCE_THRESHOLD",
     "RELEVANCE_GAP_DROP_RATIO",
+    "SEMANTIC_FLOOR_THRESHOLD",
     "SEMANTIC_RELEVANCE_THRESHOLD",
 ]
 
@@ -101,7 +105,7 @@ class Settings(BaseSettings):
     # per deployment, so we keep them here with sensible defaults.
     azure_openai_api_version: str = "2024-12-01-preview"
     gpt_model: str = "gpt-4.1-mini"
-    embed_model: str = "text-embedding-3-large"
+    embed_model: str = "all-MiniLM-L6-v2"
 
     # Database -------------------------------------------------------------------
     database_url: str

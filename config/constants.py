@@ -69,6 +69,29 @@ CONFIRMATION_EXPIRATION_SECONDS: int = (
 )
 
 # ---------------------------------------------------------------------------
+# Reinforcement-Divergence Auto-Resolution
+# ---------------------------------------------------------------------------
+# After each reinforcement, the system checks whether the reinforced behavior
+# is involved in any PENDING conflict.  If the two conflicting behaviors have
+# diverged enough in both reinforcement count AND credibility, the conflict is
+# automatically resolved in favour of the stronger behaviour (OLD_WINS / NEW_WINS).
+#
+# Thresholds (either condition triggers resolution):
+#   reinforcement_gap ≥ AUTO_RESOLVE_MIN_REINFORCEMENT_GAP  OR
+#   credibility_gap   ≥ AUTO_RESOLVE_MIN_CREDIBILITY_GAP
+# ⇒ stronger behaviour wins, weaker is SUPERSEDED.
+#
+# If neither threshold is met but the conflict is older than
+# CONFLICT_EXPIRY_DAYS, the system expires it as BOTH_CORRECT (the user
+# clearly doesn't mind both coexisting).
+
+AUTO_RESOLVE_MIN_REINFORCEMENT_GAP: int = 3
+AUTO_RESOLVE_MIN_CREDIBILITY_GAP: float = 0.15
+
+CONFLICT_EXPIRY_DAYS: int = 30
+CONFLICT_EXPIRY_SECONDS: int = CONFLICT_EXPIRY_DAYS * 24 * 60 * 60  # 2 592 000 s
+
+# ---------------------------------------------------------------------------
 # Similarity / retrieval thresholds
 # ---------------------------------------------------------------------------
 
@@ -84,47 +107,41 @@ SEMANTIC_RELEVANCE_THRESHOLD: float = 0.55
 RELATED_BEHAVIORS_DISTANCE_THRESHOLD: float = 0.73
 
 # ---------------------------------------------------------------------------
-# TGHR – Tuple-Guided Hybrid Retrieval (3D search) configuration
+# Layered Retrieval Architecture (LRA) — replaces the old additive TGHR
 # ---------------------------------------------------------------------------
-# hybrid_score = DENSE_W * semantic + SPARSE_W * bm25 + INTENT_BOOST_W * intent_match
-#
-# Weight rationale (must sum to 1.0):
-#   Dense  0.50 — primary relevance signal (semantic similarity)
-#   Sparse 0.25 — keyword overlap bonus (BM25 via tsvector)
-#   Intent 0.25 — LLM-predicted intent is a high-quality signal; giving it
-#                 more weight anchors retrieval to the semantic "type" of the
-#                 query, preventing fringe behaviors from crowding out
-#                 intent-matched ones that sit slightly further in dense space.
+# Pipeline:
+#   Stage 1: Pure dense (cosine) retrieval from DB → top K candidates
+#   Stage 2: In-memory multiplicative intent re-ranking
+#            S_base = 1 - D_cosine
+#            M = 1 + (INTENT_RERANK_ALPHA * affinity)
+#            S_final = S_base * M
+#   Stage 3: Absolute semantic floor + relevance-gap dynamic cutoff
+# ---------------------------------------------------------------------------
 
-# Dense (semantic / cosine) signal weight.
-HYBRID_DENSE_WEIGHT: float = 0.50
-
-# Sparse (BM25 / tsvector) signal weight.
-HYBRID_SPARSE_WEIGHT: float = 0.25
-
-# Intent-match soft boost weight.
-# NOT a hard filter — non-matching intents still appear if dense+sparse score well.
-HYBRID_INTENT_BOOST_WEIGHT: float = 0.25
-
-# Maximum results fetched from DB before threshold / gap filtering.
-# 40 provides enough headroom for users with ~50-100 stored behaviors without
-# over-querying in production (where the partitioned table keeps per-user counts
-# well below a few hundred in typical use).
+# Maximum candidates fetched from DB before in-memory re-ranking.
+# 40 provides enough headroom for users with ~50-100 stored behaviors.
 HYBRID_SEARCH_LIMIT: int = 40
 
-# Results whose hybrid_score falls below this value are treated as irrelevant.
-HYBRID_SCORE_THRESHOLD: float = 0.10
+# Intent re-ranking alpha — multiplicative weight for intent affinity.
+# S_final = S_base * (1 + INTENT_RERANK_ALPHA * affinity)
+# At alpha=0.25, a perfect intent match lifts the score by 25%.
+# A zero-affinity intent leaves the score unchanged.
+INTENT_RERANK_ALPHA: float = 0.25
 
-# Relevance-gap cutoff ratio.
-# If a result's score drops more than this fraction below the top result,
-# all further results are discarded.
-# Set higher than 0.40 because BM25 spikes in the top result would otherwise
-# kill equally-relevant behaviors that lack exact keyword overlap.
-RELEVANCE_GAP_DROP_RATIO: float = 0.55
+# Absolute semantic floor — any behavior with S_final below this is
+# mathematically discarded.  Prevents injecting weakly-related behaviors
+# into the LLM context window, reducing hallucination risk.
+SEMANTIC_FLOOR_THRESHOLD: float = 0.55
+
+# Relevance-gap cutoff ratio (Top-Score Relative Drop-off).
+# T_dynamic = S_max * (1 - RELEVANCE_GAP_DROP_RATIO)
+# Any behaviour below T_dynamic is cut.  Tight value (0.15) is safe now
+# that BM25 spikes are removed and all scores sit on a bounded scale.
+RELEVANCE_GAP_DROP_RATIO: float = 0.15
 
 # Hard cap on the number of results returned after gap filtering.
 # Prevents over-retrieval on broad / vague queries.
-MAX_RETRIEVAL_RESULTS: int = 20
+MAX_RETRIEVAL_RESULTS: int = 10
 
 # ---------------------------------------------------------------------------
 # Intent taxonomy

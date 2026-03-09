@@ -2,12 +2,12 @@ import json
 from time import time
 from typing import Any, Dict, List
 from openai import AzureOpenAI
+from sentence_transformers import SentenceTransformer
 from config.configurations import(
     AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_KEY,
     AZURE_OPENAI_API_VERSION,
     GPT_MODEL,
-    EMBED_MODEL,
 )
 from models.behavior import ConflictAnalysisResult, ConflictAnalysisType
 import logging
@@ -20,6 +20,9 @@ client = AzureOpenAI(
     api_version=AZURE_OPENAI_API_VERSION,
     timeout=30
     )
+
+# Local embedding model — all-MiniLM-L6-v2 (384 dimensions)
+_embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 MAX_PROMPT_LENGTH = 8000 
 MIN_PROMPT_LENGTH = 3
@@ -350,17 +353,20 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     - Requests: "tell me about...", "explain..."
     - Temporary states: "I'm hungry right now", "currently working on..."
     
-    TASK 2: CONTEXTUAL QUERY REWRITING (using history for context)
+    TASK 2: SEMANTIC PROBE GENERATION (Query Transformation for Vector Search)
     ---
-    Look at 'RECENT HISTORY' and 'LATEST PROMPT'. Rewrite the prompt into a self-contained query by:
-    - Resolving pronouns/references ("it", "that", "those") to specific entities from history
-    - Replacing vague terms with explicit context
-    - If already standalone, keep as-is
-    - Keep concise (10-30 words)
+    Look at 'RECENT HISTORY' and 'LATEST PROMPT'. You must convert the user's intent into a 'Semantic Search Probe' to be used as `standalone_query`. 
     
-    Examples:
-    History: "I like Python and JavaScript" | Latest: "which is better for backend?" → "which is better for backend development: Python or JavaScript?"
-    History: "Popular frameworks include React, Angular, Vue" | Latest: "I prefer the first one" → "I prefer React framework"
+    ⚠️ THE ASYMMETRIC SEARCH RULE:
+    This probe MUST NOT be a question. It MUST NOT be a full sentence. 
+    It MUST be written as a short, declarative behavior segment (starting with an action verb) that represents the exact type of behavior we are looking for in the database.
+    
+    Examples of Semantic Probes (HyDE Transformation):
+    - User Query: "What ingredients must I absolutely keep out of the food?" → Probe: "avoids specific foods"
+    - User Query: "Recommend entertainment that I would actually enjoy watching" → Probe: "enjoys watching specific entertainment"
+    - User Query: "What does my daily health and wellness routine look like?" → Probe: "performs daily health routines"
+    - User Query: "which is better for backend, Python or Node?" → Probe: "prefers specific backend language"
+    - User Query: "Can you summarize my coding habits?" → Probe: "has specific coding habits"
     ---
     FOR EACH BEHAVIOR, YOU MUST PRODUCE A CANONICAL FORM WITH THESE FIELDS:
     
@@ -441,7 +447,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     OUTPUT FORMAT (STRICT JSON - use these EXACT field names):
     
     {
-      "standalone_query": "The fully resolved, decontextualized version of the LATEST PROMPT",
+      "standalone_query": "The short, declarative Semantic Search Probe (e.g., 'avoids specific foods')",
       "required_intents": ["CONSTRAINT", "PREFERENCE"],
       "segments": [
         {
@@ -477,7 +483,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     ⚠️ CRITICAL RULES:
     - Extract behaviors ONLY from 'LATEST PROMPT' - NEVER from 'RECENT HISTORY'!
     - If LATEST PROMPT is a question or has no behaviors, return empty segments list []
-    - standalone_query is MANDATORY - always provide it
+    - standalone_query is MANDATORY - it MUST be a behavioral probe (action verb + noun phrase), NOT a question.
     - Target must be CONCISE (1-3 words) - the noun, not the whole phrase
     - Target must use CANONICAL/FULL form - NEVER abbreviations (JavaScript not JS)
     - Use field name "linguistic_strength" (NOT "strength")
@@ -491,56 +497,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     ⚠️ COMPARATIVE STATEMENTS: For "X over Y" or "X instead of Y" statements:
     - Extract ONLY the PREFERRED option (X) with POSITIVE polarity
     - Do NOT extract the rejected option (Y) as a separate behavior
-    - Examples:
-      * "I prefer TypeScript over JavaScript" → Extract ONLY TypeScript POSITIVE
-      * "I like Angular instead of React" → Extract ONLY Angular POSITIVE
-      * "I don't like React, prefer Angular" → Extract ONLY Angular POSITIVE
     - This prevents creating multiple conflicting behaviors from a single preference statement
-    
-    MULTI-DOMAIN EXAMPLES:
-    
-    Input: "I'm vegetarian and cannot eat meat"
-    Output: {"intent": "CONSTRAINT", "target": "meat", "context": "general", "polarity": "NEGATIVE", "linguistic_strength": 0.9}
-    
-    Input: "I prefer working from home in the mornings"
-    Output: {"intent": "PREFERENCE", "target": "remote work", "context": "morning", "polarity": "POSITIVE", "linguistic_strength": 0.7}
-    
-    Input: "I always do yoga before breakfast"
-    Output: {"intent": "HABIT", "target": "yoga", "context": "morning", "polarity": "POSITIVE", "linguistic_strength": 0.85}
-    
-    Input: "I'm experienced with AWS cloud infrastructure"
-    Output: {"intent": "SKILL", "target": "AWS", "context": "cloud infrastructure", "polarity": "POSITIVE", "linguistic_strength": 0.75}
-    
-    Input: "I like JS for frontend development"
-    Output: {"intent": "PREFERENCE", "target": "JavaScript", "context": "frontend", "polarity": "POSITIVE", "linguistic_strength": 0.65}
-    ⚠️ Note: "JS" was normalized to "JavaScript"
-    
-    Input: "Never use eval() in production code"
-    Output: {"intent": "CONSTRAINT", "target": "eval function", "context": "production", "polarity": "NEGATIVE", "linguistic_strength": 0.95}
-    ⚠️ Note: "Never" indicates CONSTRAINT with high linguistic_strength
-    
-    Input: "I prefer TypeScript over JavaScript for frontend"
-    Output: {"intent": "PREFERENCE", "target": "TypeScript", "context": "frontend", "polarity": "POSITIVE", "linguistic_strength": 0.7}
-    ⚠️ Note: Comparative statement - only extract the PREFERRED option (TypeScript), not the rejected one
-    
-    Input: "I like Angular instead of React"
-    Output: {"intent": "PREFERENCE", "target": "Angular", "context": "general", "polarity": "POSITIVE", "linguistic_strength": 0.65}
-    ⚠️ Note: Extract only the preferred choice (Angular)
-    
-    Input: "Maybe I should try using JavaScript for backend"
-    Output: {"intent": "PREFERENCE", "target": "JavaScript", "context": "backend", "polarity": "POSITIVE", "confidence": 0.35, "clarity": 0.4, "linguistic_strength": 0.3}
-    ⚠️ Note: Weak/uncertain statement - still extract but with low scores to reflect uncertainty
-    
-    Input: "I am a software engineer who work late nights. I have decided to go for a 1h walk every morning. Note that I have lactose intolerance."
-    Output: 
-    {
-      "standalone_query": "software engineer working late nights decides to walk 1 hour every morning, has lactose intolerance",
-      "segments": [
-        {"text": "I have decided to go for a 1h walk every morning", "behaviors": [{"intent": "HABIT", "target": "morning walk", "context": "morning", "polarity": "POSITIVE", ...}]},
-        {"text": "I have lactose intolerance", "behaviors": [{"intent": "CONSTRAINT", "target": "lactose", "context": "general", "polarity": "NEGATIVE", ...}]}
-      ]
-    }
-    ⚠️ Note: "software engineer working late nights" is background context, NOT extracted as behavior. "lactose intolerance" → target is "lactose" (not "lactose intolerance")
     
     ⚠️ CRITICAL EXAMPLE - Behavior Extraction with History:
     
@@ -552,14 +509,13 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     
     CORRECT Output:
     {
-      "standalone_query": "Which is the sweetest food among oatmeal and fruits?",
+      "standalone_query": "prefers sweet food",
       "segments": []
     }
     
     ⚠️ WHY segments is empty:
     - Latest prompt is a QUESTION, not a behavior statement
     - "I like healthy breakfast..." is in HISTORY and was ALREADY PROCESSED - DO NOT extract it again!
-    - Extracting from history causes false reinforcement
     
     WRONG Output (DO NOT DO THIS):
     {
@@ -671,24 +627,20 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
         }
 
 
-# text embedding for singel text
+# text embedding for single text (local MiniLM model — 384 dimensions)
 def embed_text(text: str) -> List[float]:
     if not text or not text.strip():
         raise ValueError("Text cannot be empty for embedding")
     
     try:
-        response = client.embeddings.create(
-            model= EMBED_MODEL,
-            input= text
-        )
-
-        return response.data[0].embedding
+        embedding = _embedding_model.encode(text.strip(), normalize_embeddings=True)
+        return embedding.tolist()
     except Exception as e:
         raise Exception(f"Embedding error: {str(e)}")
     
     
     
-# text embedding for multiple texts for efficiency
+# text embedding for multiple texts for efficiency (local MiniLM model — 384 dimensions)
 def embed_batch(texts: List[str]) -> List[List[float]]:
 
     if not texts:
@@ -702,13 +654,8 @@ def embed_batch(texts: List[str]) -> List[List[float]]:
         cleaned_texts.append(text.strip())
 
     try:
-        response = client.embeddings.create(
-            model=EMBED_MODEL,
-            input=cleaned_texts
-        )
-        # IMPORTANT: Sort by index to ensure order matches input
-        sorted_data = sorted(response.data, key=lambda x: x.index)
-        return [item.embedding for item in sorted_data]
+        embeddings = _embedding_model.encode(cleaned_texts, normalize_embeddings=True)
+        return [emb.tolist() for emb in embeddings]
     
     except Exception as e:
         raise Exception(f"Batch embedding error: {str(e)}")
