@@ -1157,28 +1157,48 @@ def search_similar_behavior_3D(
 
                 # ==========================================================
                 # STAGE 3b — Relevance Gap (Dynamic Context Truncation)
-                # T_dynamic = S_max · (1 - ρ)
-                # Detects the "semantic cliff" between the top match and
-                # weaker results.  Prevents tail noise from diluting the
+                # T_dynamic = S_ref · (1 - ρ)
+                # Detects the "semantic cliff" between relevant results and
+                # tail noise.  Prevents weak matches from diluting the
                 # LLM's attention mechanism.
+                #
+                # Exact-match guard: when the top candidate is a near-exact
+                # match (S_base ≥ 0.95, i.e. distance ≈ 0), the gap between
+                # it and every other candidate is artificially large.  In
+                # that case, compute T_dynamic from the second-best candidate
+                # so the gap cutoff evaluates the real cluster of results.
                 # ==========================================================
                 if scored_candidates:
-                    s_max = scored_candidates[0]["s_final"]
-                    t_dynamic = s_max * (1.0 - RELEVANCE_GAP_DROP_RATIO)
-
-                    gap_filtered = []
-                    for c in scored_candidates:
-                        if c["s_final"] < t_dynamic:
-                            break
-                        gap_filtered.append(c)
+                    # Check if top candidate is a near-exact match (S_base ≥ 0.95)
+                    top_s_base = scored_candidates[0].get("s_base", 0.0)
+                    if top_s_base >= 0.95 and len(scored_candidates) >= 2:
+                        # Use second-best for gap reference — always keep the exact match
+                        s_ref = scored_candidates[1]["s_final"]
+                        t_dynamic = s_ref * (1.0 - RELEVANCE_GAP_DROP_RATIO)
+                        gap_filtered = [scored_candidates[0]]  # exact match always kept
+                        for c in scored_candidates[1:]:
+                            if c["s_final"] < t_dynamic:
+                                break
+                            gap_filtered.append(c)
+                    else:
+                        s_ref = scored_candidates[0]["s_final"]
+                        # Cap at 1.0 — intent boost can push S_final > 1.0
+                        s_ref = min(s_ref, 1.0)
+                        t_dynamic = s_ref * (1.0 - RELEVANCE_GAP_DROP_RATIO)
+                        gap_filtered = []
+                        for c in scored_candidates:
+                            if c["s_final"] < t_dynamic:
+                                break
+                            gap_filtered.append(c)
 
                     dropped_by_gap = len(scored_candidates) - len(gap_filtered)
                     if dropped_by_gap > 0:
                         logger.info(
                             f"[LRA] Relevance gap cutoff: kept {len(gap_filtered)}, "
                             f"dropped {dropped_by_gap} "
-                            f"(S_max={s_max:.4f}, T_dynamic={t_dynamic:.4f}, "
-                            f"ρ={RELEVANCE_GAP_DROP_RATIO})"
+                            f"(S_ref={s_ref:.4f}, T_dynamic={t_dynamic:.4f}, "
+                            f"ρ={RELEVANCE_GAP_DROP_RATIO}, "
+                            f"exact_match_guard={top_s_base >= 0.95})"
                         )
                     scored_candidates = gap_filtered
 

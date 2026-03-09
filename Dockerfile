@@ -19,14 +19,18 @@ WORKDIR /build
 COPY requirements.txt .
 
 RUN pip install --upgrade pip \
-    # Install PyTorch CPU-only wheel into /install first to avoid the multi-GB CUDA variant.
-    # --prefix=/install is required so torch ends up in the same prefix that is
-    # copied into the runtime stage; without it torch is invisible at runtime.
+    # 1) Install PyTorch CPU-only wheel first to avoid the multi-GB CUDA variant.
     && pip install --prefix=/install --no-cache-dir \
         torch==2.3.0 \
         --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --prefix=/install --no-cache-dir -r requirements.txt \
-        --extra-index-url https://download.pytorch.org/whl/cpu
+    # 2) Install everything else from requirements.txt.
+    #    Use --index-url (not --extra) so PyPI CPU index is PRIMARY,
+    #    preventing pip from pulling CUDA torch as a transitive dep
+    #    of sentence-transformers.  torch is already satisfied from step 1.
+    && PIP_NO_CACHE_DIR=1 pip install --prefix=/install \
+        -r requirements.txt \
+        --index-url https://download.pytorch.org/whl/cpu \
+        --extra-index-url https://pypi.org/simple/
 
 
 # ============================================================
@@ -49,6 +53,18 @@ COPY --from=builder /install /usr/local
 
 WORKDIR /app
 
+# ----------------------------------------------------------------
+# Pre-download the sentence-transformers embedding model BEFORE
+# copying app source.  This layer only re-runs when dependencies
+# (requirements.txt / base image) change — not on every code edit.
+# ----------------------------------------------------------------
+ENV HF_HOME=/app/.cache/huggingface \
+    SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers
+
+RUN python -c \
+      "from sentence_transformers import SentenceTransformer; \
+       SentenceTransformer('all-MiniLM-L6-v2')"
+
 # Copy application source (respects .dockerignore)
 COPY api/         ./api/
 COPY config/      ./config/
@@ -57,19 +73,6 @@ COPY models/      ./models/
 COPY services/    ./services/
 COPY utils/       ./utils/
 COPY app.py       .
-
-# ----------------------------------------------------------------
-# Pre-download the sentence-transformers embedding model so it is
-# baked into the image — avoids network calls and cold-start latency
-# at runtime.  The cache is stored inside /app so the non-root user
-# already has ownership after the chown below.
-# ----------------------------------------------------------------
-ENV HF_HOME=/app/.cache/huggingface \
-    SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers
-
-RUN python -c \
-      "from sentence_transformers import SentenceTransformer; \
-       SentenceTransformer('all-MiniLM-L6-v2')"
 
 # Hand ownership to the non-root user
 RUN chown -R appuser:appgroup /app
