@@ -19,8 +19,12 @@ WORKDIR /build
 COPY requirements.txt .
 
 RUN pip install --upgrade pip \
-    # Install PyTorch CPU-only wheel first to avoid the multi-GB CUDA variant
-    && pip install --no-cache-dir torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu \
+    # Install PyTorch CPU-only wheel into /install first to avoid the multi-GB CUDA variant.
+    # --prefix=/install is required so torch ends up in the same prefix that is
+    # copied into the runtime stage; without it torch is invisible at runtime.
+    && pip install --prefix=/install --no-cache-dir \
+        torch==2.3.0 \
+        --index-url https://download.pytorch.org/whl/cpu \
     && pip install --prefix=/install --no-cache-dir -r requirements.txt \
         --extra-index-url https://download.pytorch.org/whl/cpu
 
