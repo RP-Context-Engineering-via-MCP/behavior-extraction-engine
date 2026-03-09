@@ -19,7 +19,10 @@ WORKDIR /build
 COPY requirements.txt .
 
 RUN pip install --upgrade pip \
-    && pip install --prefix=/install --no-cache-dir -r requirements.txt
+    # Install PyTorch CPU-only wheel first to avoid the multi-GB CUDA variant
+    && pip install --no-cache-dir torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --prefix=/install --no-cache-dir -r requirements.txt \
+        --extra-index-url https://download.pytorch.org/whl/cpu
 
 
 # ============================================================
@@ -51,17 +54,30 @@ COPY services/    ./services/
 COPY utils/       ./utils/
 COPY app.py       .
 
+# ----------------------------------------------------------------
+# Pre-download the sentence-transformers embedding model so it is
+# baked into the image — avoids network calls and cold-start latency
+# at runtime.  The cache is stored inside /app so the non-root user
+# already has ownership after the chown below.
+# ----------------------------------------------------------------
+ENV HF_HOME=/app/.cache/huggingface \
+    SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers
+
+RUN python -c \
+      "from sentence_transformers import SentenceTransformer; \
+       SentenceTransformer('all-MiniLM-L6-v2')"
+
 # Hand ownership to the non-root user
 RUN chown -R appuser:appgroup /app
 
 USER appuser
 
 # Expose the port uvicorn listens on (default 8000, override with PORT env var)
-EXPOSE 8000
+EXPOSE 8001
 
 # Health check — Docker / Kubernetes will use this to know the container is ready
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-8000}/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-8001}/health')" || exit 1
 
 # Entrypoint:
 #   --workers 1        single worker — scale horizontally with replicas, not threads
@@ -70,7 +86,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
 CMD ["sh", "-c", \
      "uvicorn app:app \
         --host 0.0.0.0 \
-        --port ${PORT:-8000} \
+        --port ${PORT:-8001} \
         --workers 1 \
         --log-level ${LOG_LEVEL:-info} \
         --no-access-log"]
