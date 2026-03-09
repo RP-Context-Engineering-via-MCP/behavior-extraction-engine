@@ -655,11 +655,7 @@ def extract_behaviors_with_history(
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
-                "success": True,
-                "data": {
-                    "behaviors": behavior_texts,
-                },
-                "error": None,
+                "behaviors": behavior_texts,
             },
         )
 
