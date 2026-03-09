@@ -573,6 +573,9 @@ def _apply_auto_resolution(
         ),
     )
 
+    # Inherit loser's graph edges → winner (0.5× weight)
+    _inherit_edges_on_cursor(cur, winner_id, loser_id, user_id, current_timestamp)
+
     # Mark conflict as AUTO_RESOLVED
     cur.execute(
         """
@@ -928,6 +931,8 @@ def search_similar_behavior_3D(
         HYBRID_SEARCH_LIMIT,
         INTENT_RERANK_ALPHA,
         SEMANTIC_FLOOR_THRESHOLD,
+        SEMANTIC_FLOOR_FALLBACK,
+        MAX_FALLBACK_RESULTS,
         RELEVANCE_GAP_DROP_RATIO,
         MAX_RETRIEVAL_RESULTS,
         ALL_INTENT_TYPES,
@@ -1083,6 +1088,9 @@ def search_similar_behavior_3D(
                 # Prevents injecting weakly-related behaviors that could
                 # cause hallucination or knowledge fragmentation in the LLM.
                 # ==========================================================
+                # Save sorted candidates before floor for potential fallback
+                candidates_before_floor = list(scored_candidates)
+
                 before_floor = len(scored_candidates)
                 scored_candidates = [
                     c for c in scored_candidates
@@ -1094,6 +1102,25 @@ def search_similar_behavior_3D(
                         f"[LRA] Semantic floor: dropped {dropped_by_floor} candidates "
                         f"below τ_min={SEMANTIC_FLOOR_THRESHOLD:.2f}"
                     )
+
+                # ==========================================================
+                # STAGE 3a-FALLBACK — Soft floor for zero-result recovery
+                # If the primary floor drops ALL candidates, try a relaxed
+                # threshold (τ_fallback).  Only fires when the strict floor
+                # returns nothing — cannot affect queries that already pass.
+                # Capped at MAX_FALLBACK_RESULTS to limit noise.
+                # ==========================================================
+                if not scored_candidates and candidates_before_floor:
+                    scored_candidates = [
+                        c for c in candidates_before_floor
+                        if c["s_final"] >= SEMANTIC_FLOOR_FALLBACK
+                    ][:MAX_FALLBACK_RESULTS]
+                    if scored_candidates:
+                        logger.info(
+                            f"[LRA] Soft fallback: recovered {len(scored_candidates)} "
+                            f"candidate(s) above τ_fallback={SEMANTIC_FLOOR_FALLBACK:.2f} "
+                            f"(primary floor returned 0)"
+                        )
 
                 # ==========================================================
                 # STAGE 3b — Relevance Gap (Dynamic Context Truncation)
@@ -1916,6 +1943,11 @@ def resolve_conflict(
                         (BehaviorState.SUPERSEDED.value, current_timestamp, behavior_id_2, user_id)
                     )
 
+                    # Inherit loser's graph edges → winner (0.5× weight)
+                    _inherit_edges_on_cursor(
+                        cur, behavior_id_1, behavior_id_2, user_id, current_timestamp
+                    )
+
                     logger.info(
                         f"OLD_WINS: Reinforced {behavior_id_1} (set to ACTIVE), "
                         f"invalidated {behavior_id_2} (credibility set to 0.0 for pruning)"
@@ -1942,6 +1974,11 @@ def resolve_conflict(
 
                     if not supersede_success:
                         raise Exception(f"Failed to supersede old behavior {behavior_id_1}")
+
+                    # Inherit loser's graph edges → winner (0.5× weight)
+                    _inherit_edges_on_cursor(
+                        cur, behavior_id_2, behavior_id_1, user_id, current_timestamp
+                    )
 
                     logger.info(
                         f"NEW_WINS: Set {behavior_id_2} to ACTIVE, "
@@ -2055,3 +2092,253 @@ def resolve_conflict(
         logger.error(f"Failed to resolve conflict {conflict_id}: {str(e)}")
         raise Exception(f"Database error resolving conflict: {str(e)}")
 
+
+# ===========================================================================
+# Co-Occurrence Graph — edge creation, expansion, inheritance, cleanup
+# ===========================================================================
+
+def insert_co_occurrences_batch(
+    behavior_ids: List[str],
+    user_id: str,
+    edge_type: str,
+) -> int:
+    """
+    Create pairwise co-occurrence edges for a list of behavior IDs.
+
+    Generates all unique (a, b) pairs (a < b lexicographically to avoid
+    duplicate reversed edges) and upserts them.  On conflict the edge
+    weight is incremented by 0.5 (diminishing reinforcement signal).
+
+    Args:
+        behavior_ids: List of behavior IDs that co-occurred.
+        user_id: The user who owns these behaviors.
+        edge_type: 'CO_PROMPT' or 'CO_SESSION'.
+
+    Returns:
+        Number of edges written (inserted or updated).
+    """
+    if len(behavior_ids) < 2:
+        return 0
+
+    current_timestamp = int(time.time())
+
+    # Build all unique pairs (sorted to guarantee canonical order)
+    pairs = []
+    sorted_ids = sorted(set(behavior_ids))
+    for i in range(len(sorted_ids)):
+        for j in range(i + 1, len(sorted_ids)):
+            pairs.append((sorted_ids[i], sorted_ids[j]))
+
+    if not pairs:
+        return 0
+
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                # Use executemany with UPSERT — ON CONFLICT bumps weight
+                cur.executemany(
+                    """
+                    INSERT INTO behavior_co_occurrences
+                        (behavior_id_1, behavior_id_2, user_id, edge_type, weight, created_at)
+                    VALUES (%s, %s, %s, %s, 1.0, %s)
+                    ON CONFLICT (behavior_id_1, behavior_id_2, edge_type)
+                    DO UPDATE SET
+                        weight     = behavior_co_occurrences.weight + 0.5,
+                        created_at = EXCLUDED.created_at
+                    """,
+                    [
+                        (a, b, user_id, edge_type, current_timestamp)
+                        for a, b in pairs
+                    ],
+                )
+                conn.commit()
+
+        logger.info(
+            f"[GRAPH] Upserted {len(pairs)} {edge_type} edge(s) for user {user_id}"
+        )
+        return len(pairs)
+
+    except Exception as e:
+        logger.error(f"[GRAPH] Failed to insert co-occurrence edges: {str(e)}")
+        return 0
+
+
+def get_graph_expanded_behaviors(
+    user_id: str,
+    seed_behavior_ids: List[str],
+    limit: int = 10,
+) -> List[dict]:
+    """
+    1-hop graph expansion from seed behaviors.
+
+    Given a set of behavior IDs returned by embedding search, walk
+    the co-occurrence graph one hop to find associated behaviors.
+    Results are ranked by ``edge_weight * behavior_credibility`` so
+    that strongly-associated, high-credibility behaviors bubble up.
+
+    Only returns behaviors in ACTIVE / NEW state — SUPERSEDED, ARCHIVED,
+    and FLAGGED behaviors are excluded.  Already-retrieved seed IDs are
+    also excluded to avoid duplicates.
+
+    Args:
+        user_id: User identifier.
+        seed_behavior_ids: Behavior IDs from the embedding search.
+        limit: Maximum neighbors to return (default 10).
+
+    Returns:
+        List of dicts, each containing behavior details + edge metadata.
+        Empty list if no graph neighbors exist.
+    """
+    if not seed_behavior_ids:
+        return []
+
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT DISTINCT ON (neighbor_id)
+                        neighbor_id,
+                        b.behavior_text,
+                        b.credibility,
+                        b.intent,
+                        b.target,
+                        b.context,
+                        b.polarity,
+                        e.edge_type,
+                        e.weight,
+                        (e.weight * b.credibility) AS rank_score
+                    FROM (
+                        -- Forward edges: seed is behavior_id_1
+                        SELECT behavior_id_2 AS neighbor_id, edge_type, weight
+                        FROM behavior_co_occurrences
+                        WHERE user_id = %s
+                          AND behavior_id_1 = ANY(%s)
+
+                        UNION ALL
+
+                        -- Reverse edges: seed is behavior_id_2
+                        SELECT behavior_id_1 AS neighbor_id, edge_type, weight
+                        FROM behavior_co_occurrences
+                        WHERE user_id = %s
+                          AND behavior_id_2 = ANY(%s)
+                    ) e
+                    JOIN behaviors b
+                      ON b.behavior_id = e.neighbor_id
+                     AND b.user_id = %s
+                    WHERE b.behavior_state IN ('ACTIVE', 'NEW')
+                      AND e.neighbor_id != ALL(%s)
+                    ORDER BY neighbor_id, rank_score DESC
+                    """,
+                    (
+                        user_id, seed_behavior_ids,
+                        user_id, seed_behavior_ids,
+                        user_id, seed_behavior_ids,
+                    ),
+                )
+
+                rows = cur.fetchall()
+
+        # Re-sort by rank_score descending and apply limit
+        rows.sort(key=lambda r: r[9], reverse=True)
+        rows = rows[:limit]
+
+        results = []
+        for row in rows:
+            results.append({
+                "behavior_id": row[0],
+                "behavior_text": row[1],
+                "credibility": float(row[2]),
+                "intent": row[3],
+                "target": row[4],
+                "context": row[5],
+                "polarity": row[6],
+                "edge_type": row[7],
+                "edge_weight": float(row[8]),
+                "source": "graph",
+            })
+
+        logger.info(
+            f"[GRAPH] Expanded {len(seed_behavior_ids)} seed(s) → "
+            f"{len(results)} associated behavior(s) for user {user_id}"
+        )
+        return results
+
+    except Exception as e:
+        logger.error(f"[GRAPH] Failed to expand graph: {str(e)}")
+        return []
+
+
+def _inherit_edges_on_cursor(
+    cur,
+    winner_id: str,
+    loser_id: str,
+    user_id: str,
+    current_timestamp: int,
+) -> int:
+    """
+    Transfer co-occurrence edges from the loser to the winner during
+    conflict resolution.  Runs on an existing cursor (no commit).
+
+    For every edge the loser has, create an equivalent edge pointing
+    at the winner — at half the original weight (inherited association
+    is weaker than direct co-occurrence).
+
+    Skips edges where:
+    - The neighbor IS the winner (self-loop)
+    - An edge between the winner and that neighbor already exists
+      with the same edge_type (ON CONFLICT DO NOTHING)
+
+    Args:
+        cur: Open psycopg cursor in an active transaction.
+        winner_id: Behavior that survived the conflict.
+        loser_id: Behavior that was superseded.
+        user_id: User identifier.
+        current_timestamp: Unix epoch seconds.
+
+    Returns:
+        Number of edges inherited.
+    """
+    # Step 1: Collect all of the loser's neighbors (both directions)
+    cur.execute(
+        """
+        SELECT neighbor_id, edge_type, weight FROM (
+            SELECT behavior_id_2 AS neighbor_id, edge_type, weight
+            FROM behavior_co_occurrences
+            WHERE user_id = %s AND behavior_id_1 = %s
+
+            UNION ALL
+
+            SELECT behavior_id_1 AS neighbor_id, edge_type, weight
+            FROM behavior_co_occurrences
+            WHERE user_id = %s AND behavior_id_2 = %s
+        ) sub
+        WHERE neighbor_id != %s
+        """,
+        (user_id, loser_id, user_id, loser_id, winner_id),
+    )
+
+    loser_edges = cur.fetchall()
+    if not loser_edges:
+        return 0
+
+    # Step 2: Insert inherited edges (canonical order: min < max)
+    inherited = 0
+    for neighbor_id, edge_type, weight in loser_edges:
+        a, b = (min(winner_id, neighbor_id), max(winner_id, neighbor_id))
+        cur.execute(
+            """
+            INSERT INTO behavior_co_occurrences
+                (behavior_id_1, behavior_id_2, user_id, edge_type, weight, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (behavior_id_1, behavior_id_2, edge_type)
+            DO NOTHING
+            """,
+            (a, b, user_id, edge_type, float(weight) * 0.5, current_timestamp),
+        )
+        inherited += cur.rowcount  # 1 if inserted, 0 if conflict
+
+    logger.info(
+        f"[GRAPH] Inherited {inherited} edge(s) from {loser_id} → {winner_id}"
+    )
+    return inherited

@@ -28,7 +28,8 @@ from services.behaviorRepository import (
     insert_conflict,
     supersede_behavior,
     update_behavior_state,
-    update_behavior_access_time
+    update_behavior_access_time,
+    insert_co_occurrences_batch
 )
 from datetime import datetime
 import time
@@ -1143,6 +1144,7 @@ def store_behavior(
         return []
 
     stored_behaviors: List[StoredBehavior] = []
+    prompt_behavior_ids: List[str] = []   # All behavior IDs touched in this prompt (for graph edges)
 
     for segment in extraction_result.segments:
         segment_id: Optional[str] = None
@@ -1269,6 +1271,10 @@ def store_behavior(
             # 8️⃣ FALLBACK → INSERT NEW BEHAVIOR
             # ==============================================================
             if decision_taken:
+                # Track reinforced duplicate IDs for graph edges
+                for rel in relationships:
+                    if rel.relation_type == RelationType.DUPLICATE:
+                        prompt_behavior_ids.append(rel.existing_behavior.behavior_id)
                 logger.info("DECISION TAKEN → skipping insertion")
                 continue
 
@@ -1290,8 +1296,26 @@ def store_behavior(
             try:
                 insert_behavior(stored.model_dump())
                 stored_behaviors.append(stored)
+                prompt_behavior_ids.append(stored.behavior_id)
             except Exception as e:
                 logger.error(f"Failed to insert new behavior: {e}")
+
+    # Collect behavior IDs from conflict-handling paths (new behaviors
+    # inserted by _handle_polarity_conflict / _handle_potential_conflict)
+    for sb in stored_behaviors:
+        if sb.behavior_id not in prompt_behavior_ids:
+            prompt_behavior_ids.append(sb.behavior_id)
+
+    # Create CO_PROMPT edges between all behaviors in this prompt
+    if len(prompt_behavior_ids) >= 2:
+        try:
+            insert_co_occurrences_batch(
+                behavior_ids=prompt_behavior_ids,
+                user_id=user_id,
+                edge_type="CO_PROMPT",
+            )
+        except Exception as e:
+            logger.error(f"[GRAPH] Failed to create CO_PROMPT edges: {e}")
 
     logger.info(f"store_behavior complete: {len(stored_behaviors)} behaviors stored")
     return stored_behaviors

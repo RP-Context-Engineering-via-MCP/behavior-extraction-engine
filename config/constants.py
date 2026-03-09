@@ -133,6 +133,16 @@ INTENT_RERANK_ALPHA: float = 0.25
 # into the LLM context window, reducing hallucination risk.
 SEMANTIC_FLOOR_THRESHOLD: float = 0.55
 
+# Soft-fallback floor — only activated when the primary floor (above)
+# drops ALL candidates to zero results.  Recovers near-miss behaviors
+# that the strict floor filters out.  Because this only fires when the
+# primary search returns nothing, it CANNOT affect already-passing queries.
+SEMANTIC_FLOOR_FALLBACK: float = 0.48
+
+# Maximum results returned in fallback mode.  Capped low to prevent
+# noise from diluting the LLM context when the match quality is marginal.
+MAX_FALLBACK_RESULTS: int = 3
+
 # Relevance-gap cutoff ratio (Top-Score Relative Drop-off).
 # T_dynamic = S_max * (1 - RELEVANCE_GAP_DROP_RATIO)
 # Any behaviour below T_dynamic is cut.  Tight value (0.15) is safe now

@@ -18,6 +18,7 @@ from models.behavior import ExtractRequest, ExtractRequestWithHistory
 from services.behaviorRepository import (
     get_behaviors_by_user,
     get_user_conflicts,
+    get_graph_expanded_behaviors,
     persist_retrieval_updates_batch,
     resolve_conflict,
     search_similar_behavior_3D,
@@ -587,6 +588,23 @@ def extract_behaviors_with_history(
             except Exception as e:
                 logger.error(f"Failed to search related behaviors: {str(e)}")
 
+        # STEP 2b: Graph expansion — 1-hop co-occurrence walk from embedding results
+        associated_behaviors = []
+        if related_behaviors:
+            try:
+                seed_ids = [b["behavior_id"] for b in related_behaviors]
+                associated_behaviors = get_graph_expanded_behaviors(
+                    user_id=request.user_id,
+                    seed_behavior_ids=seed_ids,
+                    limit=10,
+                )
+                logger.info(
+                    f"[GRAPH] {len(seed_ids)} seed(s) → "
+                    f"{len(associated_behaviors)} associated behavior(s)"
+                )
+            except Exception as e:
+                logger.error(f"[GRAPH] Failed to expand graph: {str(e)}")
+
         # STEP 3: Schedule behavior storage in background (ASYNC - non-blocking)
         background_tasks.add_task(
             _store_behaviors_async,
@@ -624,6 +642,7 @@ def extract_behaviors_with_history(
                     "required_intents": extraction_result.required_intents,
                     "original_prompt": request.prompt,
                     "related_behaviors": related_behaviors,
+                    "associated_behaviors": associated_behaviors,
                     "extraction_time_ms": extraction_result.extraction_time,
                     "user_id": request.user_id,
                 },

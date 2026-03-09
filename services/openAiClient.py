@@ -361,12 +361,28 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     This probe MUST NOT be a question. It MUST NOT be a full sentence. 
     It MUST be written as a short, declarative behavior segment (starting with an action verb) that represents the exact type of behavior we are looking for in the database.
     
+    ⚠️ CONCRETE VOCABULARY RULE (CRITICAL for vector search accuracy):
+    - NEVER use abstract filler words in the probe: "specific", "certain", "particular", "various", "some"
+    - These words have ZERO semantic value in vector space and cause the search to miss real behaviors
+    - Instead, use CONCRETE domain nouns and verbs that plausibly describe stored behaviors
+    - Draw vocabulary from the TOPIC DOMAIN mentioned in the conversation (e.g., food → ingredients, allergens, diet; music → genre names, concentration, working; health → vitamins, supplements, water)
+    - The probe should sound like a REAL stored behavior, not a category label
+    
     Examples of Semantic Probes (HyDE Transformation):
-    - User Query: "What ingredients must I absolutely keep out of the food?" → Probe: "avoids specific foods"
-    - User Query: "Recommend entertainment that I would actually enjoy watching" → Probe: "enjoys watching specific entertainment"
-    - User Query: "What does my daily health and wellness routine look like?" → Probe: "performs daily health routines"
-    - User Query: "which is better for backend, Python or Node?" → Probe: "prefers specific backend language"
-    - User Query: "Can you summarize my coding habits?" → Probe: "has specific coding habits"
+    - User: "What ingredients must I absolutely keep out of the food?" → "avoids food ingredients and allergens in diet"
+    - User: "Recommend entertainment that I would actually enjoy watching" → "watches and enjoys shows movies streaming content in evening"
+    - User: "What does my daily health and wellness routine look like?" → "takes daily vitamins supplements and drinks water for wellness"
+    - User: "which is better for backend, Python or Node?" → "prefers Python or Node for backend development"
+    - User: "Can you summarize my coding habits?" → "follows coding habits and programming workflow patterns"
+    - User: "What music helps me concentrate?" → "listens to music while working for focus and concentration"
+    - User: "How do I usually shop for things?" → "compares prices and prefers online shopping for products"
+    
+    ❌ BAD probes (abstract filler words — will FAIL vector search):
+    - "has specific food preferences" ← "specific" matches nothing
+    - "selects TV entertainment" ← too compressed, no domain vocabulary
+    - "uses specific music genre for focus" ← "specific genre" adds nothing
+    - "has device and app preferences" ← no concrete terms like dark mode, cloud, settings
+    - "shops electronics with specific method" ← "specific method" is empty
     ---
     FOR EACH BEHAVIOR, YOU MUST PRODUCE A CANONICAL FORM WITH THESE FIELDS:
     
@@ -484,6 +500,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     - Extract behaviors ONLY from 'LATEST PROMPT' - NEVER from 'RECENT HISTORY'!
     - If LATEST PROMPT is a question or has no behaviors, return empty segments list []
     - standalone_query is MANDATORY - it MUST be a behavioral probe (action verb + noun phrase), NOT a question.
+    - standalone_query MUST use concrete domain vocabulary — NEVER use "specific", "certain", "particular" as they fail vector search.
     - Target must be CONCISE (1-3 words) - the noun, not the whole phrase
     - Target must use CANONICAL/FULL form - NEVER abbreviations (JavaScript not JS)
     - Use field name "linguistic_strength" (NOT "strength")
