@@ -3,7 +3,7 @@ Behavior extraction orchestrator.
 Handles the workflow: raw prompt -> GPT extraction -> validated Pydantic models
 """
 
-from typing import Dict, Any, List, Optional
+from typing import List, Optional
 from models.behavior import (
     ExtractionResult, 
     BehaviorSegment, 
@@ -18,8 +18,8 @@ from models.behavior import (
     BehaviorFlowInfo,
     DetailedExtractionResult
 )
-from services.openAiClient import extract_behavior, embed_text, analyze_conflict
-from services.credibilityCalculator import calculate_initial_credibility, should_store_behavior
+from services.openAiClient import extract_behavior, embed_text, analyze_conflict, extract_behavior_with_history
+from services.credibilityCalculator import calculate_initial_credibility, should_store_behavior, get_decay_rate
 from services.behaviorRepository import (
     insert_behavior, 
     insert_prompt_segment, 
@@ -27,13 +27,18 @@ from services.behaviorRepository import (
     reinforce_behavior,
     insert_conflict,
     supersede_behavior,
-    update_behavior_state
+    update_behavior_state,
+    update_behavior_access_time,
+    insert_co_occurrences_batch
 )
+from services.profileSignalExtractor import ProfileSignalExtractor
 from datetime import datetime
+import time
 from config.configurations import (
     DEFAULT_DECAY_RATE,
     SAMPLE_USERID,
-    SEMANTIC_RELEVANCE_THRESHOLD
+    SEMANTIC_RELEVANCE_THRESHOLD,
+    DECAY_GRACE_PERIOD_SECONDS
 )
 
 import logging
@@ -42,6 +47,8 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# Profile Signal Extractor instance for validating GPT-4 profile_signals output
+_profile_signal_extractor = ProfileSignalExtractor()
 
 # ==============================================================================
 # INTENT CONFLICT RULES
@@ -158,16 +165,39 @@ def run_behavior_extraction(prompt: str) -> ExtractionResult:
             )
             validated_segments.append(validated_segment)
         
+        # Validate and extract profile_signals for Profile Service integration
+        validated_profile_signals = None
+        raw_profile_signals = raw_response.get("profile_signals")
+        if raw_profile_signals:
+            try:
+                validated_profile_signals = _profile_signal_extractor.parse_and_validate(raw_profile_signals)
+                logger.info(
+                    f"Validated profile_signals: behavior_level={validated_profile_signals.get('behavior_level')}, "
+                    f"intents={list(validated_profile_signals.get('intents', {}).keys())}, "
+                    f"interests={list(validated_profile_signals.get('interests', {}).keys())}"
+                )
+            except ValueError as e:
+                logger.error(f"Profile signals validation failed: {e}. Raw data: {raw_profile_signals}")
+                # Continue without profile_signals - not critical for extraction
+        else:
+            logger.warning(
+                "No profile_signals in GPT response. Profile Service integration will not be triggered. "
+                "This may be because the GPT prompt did not generate profile_signals, or the user's prompt "
+                "did not contain enough information to generate a behavioral profile."
+            )
+        
         # Return successful extraction result
         return ExtractionResult(
             segments=validated_segments,
             success=True,
             error=None,
-            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0)
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            profile_signals=validated_profile_signals
         )
     
     except KeyError as e:
         # Missing required field in response
+        logger.error(f"Invalid response structure: missing field {str(e)}")
         return ExtractionResult(
             segments=[],
             success=False,
@@ -177,11 +207,160 @@ def run_behavior_extraction(prompt: str) -> ExtractionResult:
     
     except Exception as e:
         # Pydantic validation error or other unexpected error
+        logger.error(f"Failed to validate extraction result: {str(e)}")
         return ExtractionResult(
             segments=[],
             success=False,
             error=f"Failed to validate extraction result: {str(e)}",
             extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0)
+        )
+
+
+def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]) -> ExtractionResult:
+    """
+    Extract behaviors from a user prompt with conversation history and enrich prompt for similarity search.
+    
+    This method performs TWO key tasks:
+    1. Extracts behaviors from the prompt
+    2. Enriches the prompt to a standalone query by resolving references using conversation history
+    
+    The standalone query is useful for similarity search when the prompt contains references
+    like "it", "that", "the above options" which depend on conversation context.
+    
+    Args:
+        prompt: User's natural language prompt (may contain contextual references)
+        recent_history: List of recent conversation messages [{"role": "user"/"assistant", "text": "..."}]
+        
+    Returns:
+        ExtractionResult object with:
+            - segments: Extracted behavior segments
+            - standalone_query: Enriched standalone version of prompt for similarity search
+            - success: Boolean indicating success
+            - error: Error message if failed
+            - extraction_time: Time taken in milliseconds
+        
+    Workflow:
+        1. Call GPT-4 via openAiClient.extract_behavior_with_history()
+        2. Validate response structure
+        3. Convert to Pydantic models for type safety
+        4. Return ExtractionResult with standalone_query
+        
+    Example:
+        >>> history = [
+        ...     {"role": "user", "text": "I like Python and JavaScript"},
+        ...     {"role": "assistant", "text": "Both are great choices!"}
+        ... ]
+        >>> result = run_behavior_extraction_with_history("which one is better for backend?", history)
+        >>> result.standalone_query
+        "which is better for backend development: Python or JavaScript?"
+    """
+    raw_response = extract_behavior_with_history(prompt, recent_history)
+    
+    if not raw_response.get("success", False):
+        return ExtractionResult(
+            segments=[],
+            success=False,
+            error=raw_response.get("error", "Unknown extraction error"),
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            standalone_query=None
+        )
+    
+    try:
+        validated_segments = []
+        
+        for segment_data in raw_response.get("segments", []):
+            segment_text = segment_data["text"]
+
+            # Convert each behavior dict to ExtractedBehavior model
+            validated_behaviors = []
+            
+            for behavior_data in segment_data.get("behaviors", []):
+                # Pydantic will validate ranges and types automatically
+                validated_behavior = ExtractedBehavior(
+                    description=behavior_data["description"],
+                    confidence=behavior_data["confidence"],
+                    clarity=behavior_data["clarity"],
+                    linguistic_strength=behavior_data["linguistic_strength"],
+                    extracted_at=datetime.now().isoformat(),
+                    # Canonical fields for structured reasoning
+                    intent=behavior_data.get("intent"),
+                    target=behavior_data.get("target"),
+                    context=behavior_data.get("context", "general"),
+                    polarity=behavior_data.get("polarity")
+                )
+                validated_behaviors.append(validated_behavior)
+            
+            # Create validated segment with validated behaviors only
+            validated_segment = BehaviorSegment(
+                text=segment_text,
+                behaviors=validated_behaviors
+            )
+            validated_segments.append(validated_segment)
+        
+        # Extract standalone query from response
+        standalone_query = raw_response.get("standalone_query")
+        if not standalone_query or not standalone_query.strip():
+            logger.warning("No standalone_query in response, using original prompt")
+            standalone_query = prompt
+        
+        # Extract required_intents for hybrid retrieval (3D search)
+        required_intents = raw_response.get("required_intents")
+        if not required_intents or not isinstance(required_intents, list):
+            logger.warning("No required_intents in response, using default [PREFERENCE, CONSTRAINT]")
+            required_intents = ["PREFERENCE", "CONSTRAINT"]
+        
+        # Validate and extract profile_signals for Profile Service integration
+        validated_profile_signals = None
+        raw_profile_signals = raw_response.get("profile_signals")
+        if raw_profile_signals:
+            try:
+                validated_profile_signals = _profile_signal_extractor.parse_and_validate(raw_profile_signals)
+                logger.info(
+                    f"Validated profile_signals: behavior_level={validated_profile_signals.get('behavior_level')}, "
+                    f"intents={list(validated_profile_signals.get('intents', {}).keys())}, "
+                    f"interests={list(validated_profile_signals.get('interests', {}).keys())}"
+                )
+            except ValueError as e:
+                logger.error(f"Profile signals validation failed: {e}. Raw data: {raw_profile_signals}")
+                # Continue without profile_signals - not critical for extraction
+        else:
+            logger.warning(
+                "No profile_signals in GPT response. Profile Service integration will not be triggered. "
+                "This may be because the GPT prompt did not generate profile_signals, or the user's prompt "
+                "did not contain enough information to generate a behavioral profile."
+            )
+        
+        # Return successful extraction result with standalone query and required intents
+        return ExtractionResult(
+            segments=validated_segments,
+            success=True,
+            error=None,
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            standalone_query=standalone_query.strip(),
+            required_intents=required_intents,
+            profile_signals=validated_profile_signals
+        )
+    
+    except KeyError as e:
+        # Missing required field in response
+        logger.error(f"Invalid response structure: missing field {str(e)}")
+        return ExtractionResult(
+            segments=[],
+            success=False,
+            error=f"Invalid response structure: missing field {str(e)}",
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            standalone_query=None
+        )
+    
+    except Exception as e:
+        # Pydantic validation error or other unexpected error
+        logger.error(f"Failed to validate extraction result: {e}")
+        return ExtractionResult(
+            segments=[],
+            success=False,
+            error=f"Failed to validate extraction result: {str(e)}",
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            standalone_query=None
         )
 
 
@@ -310,9 +489,23 @@ def _create_stored_behavior(
     linguistic_strength: float,
     embedding_vector: List[float],
     segment_id: str,
-    canonical: CanonicalBehavior
+    canonical: CanonicalBehavior,
+    session_id: str = "default"
 ) -> StoredBehavior:
-    """Create a StoredBehavior object from extraction data."""
+    """Create a StoredBehavior object from extraction data with intent-based decay rate."""
+    # Get intent-specific decay rate based on behavioral intent
+    decay_rate = get_decay_rate(intent=canonical.intent)
+    
+    # Calculate timestamps
+    current_time = int(time.time())
+    # Set decay to start after grace period (7 days)
+    decay_starts_at = current_time + DECAY_GRACE_PERIOD_SECONDS
+    
+    logger.debug(
+        f"Creating behavior with intent '{canonical.intent}', decay_rate {decay_rate}, "
+        f"grace period ends at {datetime.fromtimestamp(decay_starts_at).isoformat()}"
+    )
+    
     return StoredBehavior(
         user_id=user_id,
         behavior_text=behavior_description,
@@ -320,10 +513,13 @@ def _create_stored_behavior(
         clarity_score=clarity,
         extraction_confidence=confidence,
         linguistic_strength=linguistic_strength,
-        decay_rate=DEFAULT_DECAY_RATE,
+        decay_rate=decay_rate,
         embedding=embedding_vector,
+        created_at=current_time,
+        last_seen_at=current_time,
+        last_decay_applied_at=decay_starts_at,
         prompt_history_ids=[segment_id],
-        session_id="default",
+        session_id=session_id,
         intent=canonical.intent,
         target=canonical.target,
         context=canonical.context,
@@ -336,9 +532,25 @@ def _flag_and_create_conflict(
     user_id: str,
     stored: StoredBehavior,
     similarity_distance: float,
-    llm_explanation: str
+    llm_explanation: str,
+    old_polarity: Optional[str] = None,
+    new_polarity: Optional[str] = None,
+    old_target: Optional[str] = None,
+    new_target: Optional[str] = None
 ) -> None:
-    """Flag both behaviors and create a conflict record."""
+    """Flag both behaviors and create a conflict record.
+    
+    Args:
+        existing_behavior_id: ID of the existing behavior
+        user_id: User ID
+        stored: New StoredBehavior to insert
+        similarity_distance: Distance between behaviors
+        llm_explanation: LLM analysis of the conflict
+        old_polarity: Polarity of existing behavior (for drift detection)
+        new_polarity: Polarity of new behavior (for drift detection)
+        old_target: Target of existing behavior (for drift detection)
+        new_target: Target of new behavior (for drift detection)
+    """
     update_behavior_state(
         behavior_id=existing_behavior_id,
         user_id=user_id,
@@ -355,7 +567,11 @@ def _flag_and_create_conflict(
         behavior_id_2=stored.behavior_id,
         conflict_type=ConflictType.USER_DECISION_NEEDED,
         similarity_distance=similarity_distance,
-        llm_analysis=llm_explanation
+        llm_analysis=llm_explanation,
+        old_polarity=old_polarity,
+        new_polarity=new_polarity,
+        old_target=old_target,
+        new_target=new_target
     )
 
 
@@ -384,7 +600,8 @@ def _handle_llm_conflict_analysis(
     embedding_vector: List[float],
     segment_id: str,
     canonical: CanonicalBehavior,
-    stored_behaviors: List[StoredBehavior]
+    stored_behaviors: List[StoredBehavior],
+    session_id: str = "default"
 ) -> tuple[bool, bool]:
     """
     Handle LLM conflict analysis for ambiguous credibility scenarios.
@@ -415,7 +632,8 @@ def _handle_llm_conflict_analysis(
         linguistic_strength=linguistic_strength,
         embedding_vector=embedding_vector,
         segment_id=segment_id,
-        canonical=canonical
+        canonical=canonical,
+        session_id=session_id
     )
 
     if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
@@ -425,7 +643,11 @@ def _handle_llm_conflict_analysis(
             user_id=user_id,
             stored=stored,
             similarity_distance=existing.distance,
-            llm_explanation=conflict_analysis.explanation
+            llm_explanation=conflict_analysis.explanation,
+            old_polarity=existing.polarity,
+            new_polarity=canonical.polarity,
+            old_target=existing.target,
+            new_target=canonical.target
         )
         stored_behaviors.append(stored)
         return (True, True)
@@ -437,7 +659,11 @@ def _handle_llm_conflict_analysis(
             user_id=user_id,
             stored=stored,
             similarity_distance=existing.distance,
-            llm_explanation=conflict_analysis.explanation
+            llm_explanation=conflict_analysis.explanation,
+            old_polarity=existing.polarity,
+            new_polarity=canonical.polarity,
+            old_target=existing.target,
+            new_target=canonical.target
         )
         stored_behaviors.append(stored)
         return (True, True)
@@ -456,7 +682,8 @@ def _handle_polarity_conflict(
     embedding_vector: List[float],
     segment_id: str,
     canonical: CanonicalBehavior,
-    stored_behaviors: List[StoredBehavior]
+    stored_behaviors: List[StoredBehavior],
+    session_id: str = "default"
 ) -> tuple[bool, bool]:
     """
     Handle polarity conflict (same target, different polarity).
@@ -492,7 +719,8 @@ def _handle_polarity_conflict(
             linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
             segment_id=segment_id,
-            canonical=canonical
+            canonical=canonical,
+            session_id=session_id
         )
         
         _supersede_existing_behavior(
@@ -510,6 +738,8 @@ def _handle_polarity_conflict(
             f"AUTO-RESOLVE: Ignoring new behavior "
             f"(credibility: {initial_credibility:.2f} < {existing.credibility:.2f})"
         )
+        # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+        update_behavior_access_time(existing.behavior_id, user_id)
         return (True, True)
 
     # Case C: Ambiguous credibilities → LLM analysis needed
@@ -526,7 +756,8 @@ def _handle_polarity_conflict(
             embedding_vector=embedding_vector,
             segment_id=segment_id,
             canonical=canonical,
-            stored_behaviors=stored_behaviors
+            stored_behaviors=stored_behaviors,
+            session_id=session_id
         )
 
     return (False, False)
@@ -543,7 +774,8 @@ def _handle_potential_conflict(
     embedding_vector: List[float],
     segment_id: str,
     canonical: CanonicalBehavior,
-    stored_behaviors: List[StoredBehavior]
+    stored_behaviors: List[StoredBehavior],
+    session_id: str = "default"
 ) -> tuple[bool, bool]:
     """
     Handle potential conflict (different target, same context).
@@ -581,7 +813,8 @@ def _handle_potential_conflict(
         linguistic_strength=linguistic_strength,
         embedding_vector=embedding_vector,
         segment_id=segment_id,
-        canonical=canonical
+        canonical=canonical,
+        session_id=session_id
     )
 
     if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
@@ -591,7 +824,11 @@ def _handle_potential_conflict(
             user_id=user_id,
             stored=stored,
             similarity_distance=existing.distance,
-            llm_explanation=conflict_analysis.explanation
+            llm_explanation=conflict_analysis.explanation,
+            old_polarity=existing.polarity,
+            new_polarity=canonical.polarity,
+            old_target=existing.target,
+            new_target=canonical.target
         )
         stored_behaviors.append(stored)
         return (True, True)
@@ -620,6 +857,8 @@ def _handle_potential_conflict(
         # Case B: Existing behavior wins, ignore new
         elif resolution_type == "IGNORE_NEW":
             logger.info("AUTO-RESOLVE: Ignoring new behavior")
+            # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+            update_behavior_access_time(existing.behavior_id, user_id)
             return (True, True)
 
         # Case C: Ambiguous credibilities → flag for user decision
@@ -630,7 +869,11 @@ def _handle_potential_conflict(
                 user_id=user_id,
                 stored=stored,
                 similarity_distance=existing.distance,
-                llm_explanation=conflict_analysis.explanation
+                llm_explanation=conflict_analysis.explanation,
+                old_polarity=existing.polarity,
+                new_polarity=canonical.polarity,
+                old_target=existing.target,
+                new_target=canonical.target
             )
             stored_behaviors.append(stored)
             return (True, True)
@@ -814,7 +1057,8 @@ def _process_relationships(
     linguistic_strength: float,
     embedding_vector: List[float],
     segment_id: str,
-    stored_behaviors: List[StoredBehavior]
+    stored_behaviors: List[StoredBehavior],
+    session_id: str = "default"
 ) -> bool:
     """
     Process all collected relationships and take appropriate actions.
@@ -888,7 +1132,8 @@ def _process_relationships(
                 embedding_vector=embedding_vector,
                 segment_id=segment_id,
                 canonical=canonical,
-                stored_behaviors=stored_behaviors
+                stored_behaviors=stored_behaviors,
+                session_id=session_id
             )
             if not decision_taken:
                 all_conflicts_resolved = False
@@ -925,7 +1170,8 @@ def _process_relationships(
                 embedding_vector=embedding_vector,
                 segment_id=segment_id,
                 canonical=canonical,
-                stored_behaviors=stored_behaviors
+                stored_behaviors=stored_behaviors,
+                session_id=session_id
             )
             if decision_taken:
                 return True
@@ -951,7 +1197,8 @@ def _process_relationships(
                 embedding_vector=embedding_vector,
                 segment_id=segment_id,
                 canonical=canonical,
-                stored_behaviors=stored_behaviors
+                stored_behaviors=stored_behaviors,
+                session_id=session_id
             )
             if decision_taken:
                 return True
@@ -962,7 +1209,8 @@ def _process_relationships(
 
 def store_behavior(
     extraction_result: ExtractionResult,
-    user_id: str = SAMPLE_USERID
+    user_id: str = SAMPLE_USERID,
+    session_id: str = "default"
 ) -> List[StoredBehavior]:
     """
     Store extracted behaviors using CANONICAL reasoning with
@@ -979,6 +1227,7 @@ def store_behavior(
         return []
 
     stored_behaviors: List[StoredBehavior] = []
+    prompt_behavior_ids: List[str] = []   # All behavior IDs touched in this prompt (for graph edges)
 
     for segment in extraction_result.segments:
         segment_id: Optional[str] = None
@@ -1056,7 +1305,8 @@ def store_behavior(
                 candidates = search_similar_behaviors(
                     user_id=user_id,
                     query_embedding=embedding_vector,
-                    limit=5
+                    session_id=session_id,
+                    limit=10
                 )
                 logger.info(
                     f"Retrieved {len(candidates)} candidate(s) for "
@@ -1096,13 +1346,18 @@ def store_behavior(
                 linguistic_strength=behavior.linguistic_strength,
                 embedding_vector=embedding_vector,
                 segment_id=segment_id,
-                stored_behaviors=stored_behaviors
+                stored_behaviors=stored_behaviors,
+                session_id=session_id
             )
 
             # ==============================================================
             # 8️⃣ FALLBACK → INSERT NEW BEHAVIOR
             # ==============================================================
             if decision_taken:
+                # Track reinforced duplicate IDs for graph edges
+                for rel in relationships:
+                    if rel.relation_type == RelationType.DUPLICATE:
+                        prompt_behavior_ids.append(rel.existing_behavior.behavior_id)
                 logger.info("DECISION TAKEN → skipping insertion")
                 continue
 
@@ -1117,14 +1372,33 @@ def store_behavior(
                 linguistic_strength=behavior.linguistic_strength,
                 embedding_vector=embedding_vector,
                 segment_id=segment_id,
-                canonical=canonical
+                canonical=canonical,
+                session_id=session_id
             )
 
             try:
                 insert_behavior(stored.model_dump())
                 stored_behaviors.append(stored)
+                prompt_behavior_ids.append(stored.behavior_id)
             except Exception as e:
                 logger.error(f"Failed to insert new behavior: {e}")
+
+    # Collect behavior IDs from conflict-handling paths (new behaviors
+    # inserted by _handle_polarity_conflict / _handle_potential_conflict)
+    for sb in stored_behaviors:
+        if sb.behavior_id not in prompt_behavior_ids:
+            prompt_behavior_ids.append(sb.behavior_id)
+
+    # Create CO_PROMPT edges between all behaviors in this prompt
+    if len(prompt_behavior_ids) >= 2:
+        try:
+            insert_co_occurrences_batch(
+                behavior_ids=prompt_behavior_ids,
+                user_id=user_id,
+                edge_type="CO_PROMPT",
+            )
+        except Exception as e:
+            logger.error(f"[GRAPH] Failed to create CO_PROMPT edges: {e}")
 
     logger.info(f"store_behavior complete: {len(stored_behaviors)} behaviors stored")
     return stored_behaviors
@@ -1132,7 +1406,8 @@ def store_behavior(
 
 def store_behavior_with_tracking(
     extraction_result: ExtractionResult,
-    user_id: str = SAMPLE_USERID
+    user_id: str = SAMPLE_USERID,
+    session_id: str = "default"
 ) -> DetailedExtractionResult:
     """
     Store extracted behaviors with detailed flow tracking for UI display.
@@ -1245,6 +1520,7 @@ def store_behavior_with_tracking(
                 candidates = search_similar_behaviors(
                     user_id=user_id,
                     query_embedding=embedding_vector,
+                    session_id=session_id,
                     limit=5
                 )
                 logger.info(f"Retrieved {len(candidates)} candidate(s)")
@@ -1282,7 +1558,8 @@ def store_behavior_with_tracking(
                     linguistic_strength=behavior.linguistic_strength,
                     embedding_vector=embedding_vector,
                     segment_id=segment_id,
-                    stored_behaviors=stored_behaviors
+                    stored_behaviors=stored_behaviors,
+                    session_id=session_id
                 )
                 
                 if decision_taken:
@@ -1314,7 +1591,8 @@ def store_behavior_with_tracking(
                     linguistic_strength=behavior.linguistic_strength,
                     embedding_vector=embedding_vector,
                     segment_id=segment_id,
-                    canonical=canonical
+                    canonical=canonical,
+                    session_id=session_id
                 )
                 
                 try:
@@ -1378,7 +1656,8 @@ def _process_candidate_with_tracking(
     linguistic_strength: float,
     embedding_vector: List[float],
     segment_id: str,
-    stored_behaviors: List[StoredBehavior]
+    stored_behaviors: List[StoredBehavior],
+    session_id: str = "default"
 ) -> tuple[bool, Optional[BehaviorFlowInfo]]:
     """
     Process a single candidate behavior with flow tracking.
@@ -1452,6 +1731,9 @@ def _process_candidate_with_tracking(
                 return (True, flow_info)
             
             elif resolution_type == "IGNORE_NEW":
+                # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+                update_behavior_access_time(existing.behavior_id, user_id)
+                
                 flow_info = BehaviorFlowInfo(
                     behavior_description=behavior_description,
                     action=BehaviorFlowAction.IGNORED_NEW,
@@ -1487,7 +1769,8 @@ def _process_candidate_with_tracking(
                     linguistic_strength=linguistic_strength,
                     embedding_vector=embedding_vector,
                     segment_id=segment_id,
-                    canonical=canonical
+                    canonical=canonical,
+                    session_id=session_id
                 )
                 
                 _flag_and_create_conflict(
@@ -1495,7 +1778,11 @@ def _process_candidate_with_tracking(
                     user_id=user_id,
                     stored=stored,
                     similarity_distance=existing.distance,
-                    llm_explanation=conflict_analysis.explanation
+                    llm_explanation=conflict_analysis.explanation,
+                    old_polarity=existing.polarity,
+                    new_polarity=canonical.polarity,
+                    old_target=existing.target,
+                    new_target=canonical.target
                 )
                 stored_behaviors.append(stored)
                 
@@ -1570,7 +1857,8 @@ def _process_candidate_with_tracking(
             linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
             segment_id=segment_id,
-            canonical=canonical
+            canonical=canonical,
+            session_id=session_id
         )
         
         if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
@@ -1579,7 +1867,11 @@ def _process_candidate_with_tracking(
                 user_id=user_id,
                 stored=stored,
                 similarity_distance=existing.distance,
-                llm_explanation=conflict_analysis.explanation
+                llm_explanation=conflict_analysis.explanation,
+                old_polarity=existing.polarity,
+                new_polarity=canonical.polarity,
+                old_target=existing.target,
+                new_target=canonical.target
             )
             stored_behaviors.append(stored)
             
@@ -1635,6 +1927,9 @@ def _process_candidate_with_tracking(
                 return (True, flow_info)
             
             elif resolution_type == "IGNORE_NEW":
+                # Update last_accessed_at - existing behavior was confirmed in conflict resolution
+                update_behavior_access_time(existing.behavior_id, user_id)
+                
                 flow_info = BehaviorFlowInfo(
                     behavior_description=behavior_description,
                     action=BehaviorFlowAction.IGNORED_NEW,
@@ -1658,7 +1953,11 @@ def _process_candidate_with_tracking(
                     user_id=user_id,
                     stored=stored,
                     similarity_distance=existing.distance,
-                    llm_explanation=conflict_analysis.explanation
+                    llm_explanation=conflict_analysis.explanation,
+                    old_polarity=existing.polarity,
+                    new_polarity=canonical.polarity,
+                    old_target=existing.target,
+                    new_target=canonical.target
                 )
                 stored_behaviors.append(stored)
                 
@@ -1686,6 +1985,141 @@ def _process_candidate_with_tracking(
     return (False, None)
 
 
+# ==============================================================================
+# PROFILE SIGNALS DISPATCH (for Profile Service Integration)
+# ==============================================================================
 
+async def dispatch_profile_signals(
+    user_id: str,
+    prompt_id: str,
+    profile_signals: Optional[dict]
+) -> Optional[dict]:
+    """
+    Dispatch profile signals to the Profile Service for cold-start profiling.
+    
+    This function should be called after each extraction to:
+    1. Save profile_signals locally (for drift fallback)
+    2. Forward to Profile Service if user is in COLD_START mode
+    
+    Args:
+        user_id: Unique user identifier
+        prompt_id: Unique prompt/request identifier (e.g., UUID or segment_id)
+        profile_signals: Validated profile signals from extraction result
+        
+    Returns:
+        Profile Service response if dispatched, None otherwise
+    """
+    if not profile_signals:
+        logger.debug(f"No profile_signals to dispatch for user={user_id}")
+        return None
+    
+    try:
+        from services.coldStartDispatcher import get_cold_start_dispatcher
+        
+        dispatcher = get_cold_start_dispatcher()
+        result = await dispatcher.dispatch(user_id, prompt_id, profile_signals)
+        
+        if result:
+            logger.info(
+                f"Profile signals dispatched for user={user_id}: "
+                f"status={result.get('status')}"
+            )
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to dispatch profile_signals for user={user_id}: {e}")
+        return None
+
+
+def dispatch_profile_signals_sync(
+    user_id: str,
+    prompt_id: str,
+    profile_signals: Optional[dict]
+) -> Optional[dict]:
+    """
+    Synchronous wrapper for dispatch_profile_signals.
+    
+    For use in synchronous contexts where async/await is not available.
+    """
+    import asyncio
+    
+    if not profile_signals:
+        return None
+    
+    try:
+        # Try to get existing event loop
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, create a task
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(
+                    asyncio.run,
+                    dispatch_profile_signals(user_id, prompt_id, profile_signals)
+                )
+                return future.result(timeout=15)
+        except RuntimeError:
+            # No running event loop, safe to use asyncio.run
+            return asyncio.run(
+                dispatch_profile_signals(user_id, prompt_id, profile_signals)
+            )
+    except Exception as e:
+        logger.error(f"Sync dispatch failed for user={user_id}: {e}")
+        return None
+
+
+def save_profile_signals_per_behavior(
+    user_id: str,
+    prompt_id: str,
+    profile_signals: Optional[dict],
+    stored_behaviors: List
+) -> None:
+    """
+    Save profile signals for each stored behavior.
+    
+    This function links profile signals to specific behavior IDs, enabling
+    the /api/behaviors/by-ids endpoint to return profile signals for
+    specific behaviors.
+    
+    Args:
+        user_id: Unique user identifier
+        prompt_id: Unique prompt/request identifier
+        profile_signals: Validated profile signals from extraction
+        stored_behaviors: List of StoredBehavior objects with behavior_ids
+    """
+    if not profile_signals or not stored_behaviors:
+        return
+    
+    try:
+        from services.profileSignalRepository import get_profile_signal_repository
+        
+        signal_repo = get_profile_signal_repository()
+        
+        for behavior in stored_behaviors:
+            try:
+                # Save profile signals with behavior_id link
+                signal_repo.save(
+                    user_id=user_id,
+                    prompt_id=f"{prompt_id}_{behavior.behavior_id}",  # Unique prompt_id per behavior
+                    profile_signals=profile_signals,
+                    behavior_id=behavior.behavior_id
+                )
+                logger.debug(
+                    f"Saved profile_signals for behavior_id={behavior.behavior_id}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to save profile_signals for behavior_id={behavior.behavior_id}: {e}"
+                )
+        
+        logger.info(
+            f"Saved profile_signals for {len(stored_behaviors)} behaviors "
+            f"(user={user_id})"
+        )
+        
+    except Exception as e:
+        logger.error(
+            f"Failed to save profile_signals per behavior for user={user_id}: {e}"
+        )
 
     

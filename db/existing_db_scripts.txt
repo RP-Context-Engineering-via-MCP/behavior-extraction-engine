@@ -290,3 +290,40 @@ WHERE behavior_state = 'ACTIVE';
 CREATE INDEX IF NOT EXISTS idx_behaviors_polarity 
 ON behaviors(user_id, polarity) 
 WHERE behavior_state IN ('ACTIVE', 'FLAGGED');
+
+-- ============================================================================
+-- TGHR (Tuple-Guided Hybrid Retrieval) Migration
+-- Adds tsvector column for BM25/sparse text search alongside dense embeddings
+-- ============================================================================
+
+-- 1. Add the tsvector column for full-text search (sparse retrieval)
+ALTER TABLE behaviors
+ADD COLUMN IF NOT EXISTS search_vector tsvector;
+
+-- 2. Create GIN index on tsvector column for fast full-text search
+CREATE INDEX IF NOT EXISTS idx_behaviors_search_vector
+ON behaviors USING GIN (search_vector);
+
+-- 3. Backfill existing rows: generate search_vector from behavior_text + target + context
+-- Using enriched tsvector for better BM25 recall — matches on target ("running", "sleep")
+-- and context ("before morning workout") that behavior_text alone may not contain.
+UPDATE behaviors
+SET search_vector = to_tsvector('english', behavior_text || ' ' || COALESCE(target, '') || ' ' || COALESCE(context, ''))
+WHERE search_vector IS NULL
+   OR search_vector = to_tsvector('english', behavior_text);  -- re-backfill old narrow vectors
+
+-- 4. Composite index for metadata pre-filtering + intent filtering used in hybrid search
+CREATE INDEX IF NOT EXISTS idx_behaviors_hybrid_filter
+ON behaviors(user_id, session_id, intent)
+WHERE behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED');
+
+-- ============================================================================
+-- Drift Detection Integration - Add polarity/target fields to behavior_conflicts
+-- Used by PreferenceReversalDetector to efficiently detect polarity flips
+-- ============================================================================
+
+ALTER TABLE behavior_conflicts 
+ADD COLUMN IF NOT EXISTS old_polarity TEXT,
+ADD COLUMN IF NOT EXISTS new_polarity TEXT,
+ADD COLUMN IF NOT EXISTS old_target TEXT,
+ADD COLUMN IF NOT EXISTS new_target TEXT;

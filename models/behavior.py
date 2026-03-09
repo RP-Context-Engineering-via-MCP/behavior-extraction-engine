@@ -1,7 +1,6 @@
-from urllib import response
 from pydantic import BaseModel,Field,field_validator
 from typing import List, Optional, Literal
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import time
 import uuid
@@ -36,7 +35,7 @@ class ExtractedBehavior(BaseModel):
         le=1.0,
         description="Linguistic strength score (0.0-1.0) - how strongly the user expressed the behavior")
     extracted_at: str = Field(
-        default_factory=lambda: datetime.now(datetime.timezone.utc).isoformat(),
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
         description="Timestamp of extraction in UTC")
     
     # Canonical fields for structured reasoning
@@ -72,6 +71,18 @@ class ExtractionResult(BaseModel):
         default=0.0,
         ge=0.0,
         description="Time taken for extraction in milliseconds"
+    )
+    standalone_query: Optional[str] = Field(
+        None,
+        description="Enriched standalone version of the prompt for similarity search (with conversation context resolved)"
+    )
+    required_intents: Optional[List[str]] = Field(
+        default=None,
+        description="LLM-predicted intent types relevant to the query for metadata pre-filtering (e.g., ['CONSTRAINT', 'PREFERENCE'])"
+    )
+    profile_signals: Optional[dict] = Field(
+        default=None,
+        description="Profile signals extracted for Profile Service integration (intents, interests, behavior_level, signals, complexity, consistency)"
     )
 
 
@@ -111,6 +122,14 @@ class StoredBehavior(BaseModel):
     last_seen_at: int = Field(
         default_factory=lambda: int(time.time()),
         description="Timestamp when the behavior was last reinforced"
+    )
+    last_decay_applied_at: Optional[int] = Field(
+        default=None,
+        description="Timestamp when decay was last applied or when it should start (created_at + grace period)"
+    )
+    last_accessed_at: Optional[int] = Field(
+        default=None,
+        description="Timestamp when behavior was last actively used (context enrichment, reinforcement, conflict resolution)"
     )
     prompt_history_ids: List[str] = Field(
         default_factory=list,
@@ -159,9 +178,9 @@ class StoredBehavior(BaseModel):
 
     @field_validator('embedding')
     def validate_embedding_dimension(cls, v):
-        """Ensure embedding has correct dimensions for text-embedding-3-large."""
-        if v is not None and len(v) != 3072:
-            raise ValueError(f"Embedding must be 3072-dimensional, got {len(v)}")
+        """Ensure embedding has correct dimensions for all-MiniLM-L6-v2."""
+        if v is not None and len(v) != 384:
+            raise ValueError(f"Embedding must be 384-dimensional, got {len(v)}")
         return v
     
 
@@ -214,8 +233,8 @@ class BehaviorConflict(BaseModel):
         description="Unique identifier for the conflict"
     )
     user_id: str = Field(..., description="User whose behaviors conflict")
-    behavior_id_1: str = Field(..., description="First conflicting behavior ID")
-    behavior_id_2: str = Field(..., description="Second conflicting behavior ID")
+    behavior_id_1: str = Field(..., description="First conflicting behavior ID (existing/old)")
+    behavior_id_2: str = Field(..., description="Second conflicting behavior ID (new)")
     conflict_type: ConflictType = Field(..., description="Type of conflict detected")
     similarity_distance: float = Field(..., ge=0.0, description="Embedding distance between behaviors")
     llm_analysis: Optional[str] = Field(None, description="LLM's explanation of the conflict")
@@ -229,6 +248,11 @@ class BehaviorConflict(BaseModel):
         default_factory=lambda: int(time.time()),
         description="Timestamp when conflict was detected"
     )
+    # Drift detection fields - track polarity/target changes for preference reversal detection
+    old_polarity: Optional[str] = Field(None, description="Polarity of existing behavior (POSITIVE/NEGATIVE)")
+    new_polarity: Optional[str] = Field(None, description="Polarity of new behavior (POSITIVE/NEGATIVE)")
+    old_target: Optional[str] = Field(None, description="Target of existing behavior")
+    new_target: Optional[str] = Field(None, description="Target of new behavior")
 
 
 class ConflictAnalysisType(str, Enum):
@@ -295,9 +319,13 @@ class ExtractRequest(BaseModel):
         ...,
         description="User's natural language prompt"
     )
+    user_id: str = Field(
+        ...,
+        description="User identifier for behavior extraction and storage"
+    )
     session_id: str = Field(
         default="default",
-        description="session id for session specific behavior grouping "
+        description="Optional session ID for session-specific behavior grouping within a user"
     )
 
     @field_validator('prompt')
@@ -306,16 +334,90 @@ class ExtractRequest(BaseModel):
             raise ValueError("Prompt cannot be empty or whitespace only")
         return v.strip()
     
+    @field_validator('user_id')
+    def validate_user_id(cls, v):
+        sanitized = v.strip()
+        if not sanitized:
+            raise ValueError("User ID cannot be empty")
+        # Allow only alphanumeric, hyphens, underscores
+        if not all(c.isalnum() or c in ['-', '_'] for c in sanitized):
+            raise ValueError("User ID can only contain alphanumeric characters, hyphens, and underscores")
+        return sanitized
+    
     @field_validator('session_id')
     def validate_session_id(cls, v):
         sanitized = v.strip()
         if not sanitized:
-            raise ValueError("Session ID cannot be empty")
+            return "default"
         # Allow only alphanumeric, hyphens, underscores
         if not all(c.isalnum() or c in ['-', '_'] for c in sanitized):
             raise ValueError("Session ID can only contain alphanumeric characters, hyphens, and underscores")
         return sanitized
     
+class HistoryMessage(BaseModel):
+    """Represents a message in conversation history"""
+    role: Literal["user", "assistant"] = Field(
+        ...,
+        description="Role of the message sender (user or assistant)"
+    )
+    text: str = Field(
+        ...,
+        min_length=1,
+        description="Content of the message"
+    )
+    
+    @field_validator('text')
+    def validate_text(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Message text cannot be empty or whitespace only")
+        return v.strip()
+
+
+class ExtractRequestWithHistory(BaseModel):
+    prompt: str = Field(
+        ...,
+        description="User's natural language prompt"
+    )
+    user_id: str = Field(
+        ...,
+        description="User identifier for behavior extraction and storage"
+    )
+    session_id: str = Field(
+        default="default",
+        description="Optional session ID for session-specific behavior grouping within a user"
+    )
+    recent_history: Optional[List[HistoryMessage]] = Field(
+        default=None,
+        description="Optional recent conversation history for context"
+    )
+
+    @field_validator('prompt')
+    def validate_prompt(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Prompt cannot be empty or whitespace only")
+        return v.strip()
+    
+    @field_validator('user_id')
+    def validate_user_id(cls, v):
+        sanitized = v.strip()
+        if not sanitized:
+            raise ValueError("User ID cannot be empty")
+        # Allow only alphanumeric, hyphens, underscores
+        if not all(c.isalnum() or c in ['-', '_'] for c in sanitized):
+            raise ValueError("User ID can only contain alphanumeric characters, hyphens, and underscores")
+        return sanitized
+    
+    @field_validator('session_id')
+    def validate_session_id(cls, v):
+        sanitized = v.strip()
+        if not sanitized:
+            return "default"
+        # Allow only alphanumeric, hyphens, underscores
+        if not all(c.isalnum() or c in ['-', '_'] for c in sanitized):
+            raise ValueError("Session ID can only contain alphanumeric characters, hyphens, and underscores")
+        return sanitized
+
+
 class PromptSegment(BaseModel):
     """Represents a segment of user prompt to be stored"""
     user_id: str = Field(..., description="User who provided this segment")

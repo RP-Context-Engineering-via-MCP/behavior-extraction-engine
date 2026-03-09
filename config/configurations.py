@@ -1,59 +1,173 @@
-import os 
-from dotenv import load_dotenv
+"""
+Runtime configuration for the Behavior Detection and Management system.
+
+Environment-backed secrets and service URLs are validated here via
+pydantic-settings.  A missing required variable raises a clear error
+at process startup rather than silently returning None mid-request.
+
+Pure algorithm constants (thresholds, weights, decay rates, etc.) live
+in config/constants.py and are re-exported here so all existing
+`from config.configurations import X` statements keep working without
+change.
+"""
+
+from functools import lru_cache
+from typing import Optional
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from config.constants import (  # re-export for backward compatibility
+    ALL_INTENT_TYPES,
+    AUTO_RESOLVE_MIN_CREDIBILITY_GAP,
+    AUTO_RESOLVE_MIN_REINFORCEMENT_GAP,
+    BASE_REINFORCEMENT_BOOST,
+    CONFIRMATION_EXPIRATION_DAYS,
+    CONFIRMATION_EXPIRATION_SECONDS,
+    CONFLICT_EXPIRY_DAYS,
+    CONFLICT_EXPIRY_SECONDS,
+    CREDIBILITY_PRUNE_THRESHOLD,
+    CREDIBILITY_WEIGHTS,
+    DECAY_GRACE_PERIOD_DAYS,
+    DECAY_GRACE_PERIOD_SECONDS,
+    DEFAULT_DECAY_RATE,
+    HYBRID_SEARCH_LIMIT,
+    INTENT_AFFINITY,
+    INTENT_DECAY_RATES,
+    INTENT_RERANK_ALPHA,
+    MAX_FALLBACK_RESULTS,
+    MAX_RETRIEVAL_RESULTS,
+    RELATED_BEHAVIORS_DISTANCE_THRESHOLD,
+    RELEVANCE_GAP_DROP_RATIO,
+    SEMANTIC_FLOOR_FALLBACK,
+    SEMANTIC_FLOOR_THRESHOLD,
+    SEMANTIC_RELEVANCE_THRESHOLD,
+)
+
+__all__ = [
+    # --- environment-backed names (loaded below) --------------------------
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_KEY",
+    "AZURE_OPENAI_API_VERSION",
+    "GPT_MODEL",
+    "EMBED_MODEL",
+    "SUPABASE_URL",
+    "SUPABASE_KEY",
+    "DATABASE_URL",
+    "SAMPLE_USERID",
+    "REDIS_URL",
+    "REDIS_STREAM_NAME",
+    "REDIS_EVENTS_ENABLED",
+    "USER_MANAGEMENT_SERVICE_BASE_URL",
+    "PROFILE_SIGNALS_DEFAULT_LIMIT",
+    "PROFILE_SIGNALS_MAX_LIMIT",
+    # --- algorithm constants (re-exported from constants.py) --------------
+    "ALL_INTENT_TYPES",
+    "AUTO_RESOLVE_MIN_CREDIBILITY_GAP",
+    "AUTO_RESOLVE_MIN_REINFORCEMENT_GAP",
+    "BASE_REINFORCEMENT_BOOST",
+    "CONFIRMATION_EXPIRATION_DAYS",
+    "CONFIRMATION_EXPIRATION_SECONDS",
+    "CONFLICT_EXPIRY_DAYS",
+    "CONFLICT_EXPIRY_SECONDS",
+    "CREDIBILITY_PRUNE_THRESHOLD",
+    "CREDIBILITY_WEIGHTS",
+    "DECAY_GRACE_PERIOD_DAYS",
+    "DECAY_GRACE_PERIOD_SECONDS",
+    "DEFAULT_DECAY_RATE",
+    "HYBRID_SEARCH_LIMIT",
+    "INTENT_AFFINITY",
+    "INTENT_DECAY_RATES",
+    "INTENT_RERANK_ALPHA",
+    "MAX_FALLBACK_RESULTS",
+    "MAX_RETRIEVAL_RESULTS",
+    "RELATED_BEHAVIORS_DISTANCE_THRESHOLD",
+    "RELEVANCE_GAP_DROP_RATIO",
+    "SEMANTIC_FLOOR_FALLBACK",
+    "SEMANTIC_FLOOR_THRESHOLD",
+    "SEMANTIC_RELEVANCE_THRESHOLD",
+]
 
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Settings — validated at startup via pydantic-settings
+# ---------------------------------------------------------------------------
 
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
-AZURE_OPENAI_API_VERSION = "2024-12-01-preview"
+class Settings(BaseSettings):
+    """
+    Environment-backed configuration.
 
-GPT_MODEL = "gpt-4.1-mini"
-EMBED_MODEL = "text-embedding-3-large"
+    All fields without a default are *required* — the process will refuse to
+    start if they are absent from the environment / .env file, which prevents
+    subtle None-related failures deep inside request handling.
+    """
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",           # Ignore unknown env vars — keeps .env flexible
+    )
 
-DEFAULT_DECAY_RATE = 0.015
+    # Azure OpenAI ----------------------------------------------------------------
+    azure_openai_endpoint: str
+    azure_openai_key: str
+    # These are model/API version constants that could theoretically be overridden
+    # per deployment, so we keep them here with sensible defaults.
+    azure_openai_api_version: str = "2024-12-01-preview"
+    gpt_model: str = "gpt-4.1-mini"
+    embed_model: str = "all-MiniLM-L6-v2"
 
-# Credibility calculation weights
-# confidence: GPT's confidence in the extraction (0.0-1.0)
-# clarity: How unambiguous the behavior is (0.0-1.0)
-# linguistic_strength: How strongly the user expressed the behavior (0.0-1.0)
-CREDIBILITY_WEIGHTS = {
-    "confidence": 0.40,
-    "clarity": 0.35,
-    "linguistic_strength": 0.25
-}
+    # Database -------------------------------------------------------------------
+    database_url: str
 
-# Minimum credibility threshold for storing behaviors in database
-# Behaviors below this threshold are filtered out as low quality
-CREDIBILITY_PRUNE_THRESHOLD = 0.4
+    # Supabase (optional — only required if the Supabase client is used) ----------
+    supabase_url: Optional[str] = None
+    supabase_key: Optional[str] = None
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+    # Redis (for Drift Detection Service integration) ----------------------------
+    redis_url: str = "redis://localhost:6379/0"
+    redis_stream_name: str = "behavior.events"
+    redis_events_enabled: bool = True
 
-SAMPLE_USERID = os.getenv("SAMPLE_USERID", "user_12345")
+    # User Management Service Integration ----------------------------------------
+    user_management_service_base_url: str = "http://user-management-service:8080"
+    profile_signals_default_limit: int = 10
+    profile_signals_max_limit: int = 50
 
-# Similarity distance thresholds for RETRIEVAL (not classification)
-# Based on cosine distance between embeddings (0.0 = identical, 2.0 = opposite)
-# Can be relaxed since structured matching handles precision
-# DUPLICATE_THRESHOLD = 0.25       # Retrieval hint for likely duplicates (was 0.12)
-# SIMILAR_THRESHOLD = 0.35         # Retrieval hint for related behaviors (was 0.20)
-# CONFLICT_THRESHOLD_MIN = 0.35    # Retrieval hint for potential conflicts (was 0.20)
-# CONFLICT_THRESHOLD_MAX = 0.70    # Retrieval cutoff for unrelated behaviors (was 0.55)
+    # Misc -----------------------------------------------------------------------
+    sample_userid: str = "user_12345"
 
-# Phase 2: Conflict resolution threshold
-# When credibility difference exceeds this, auto-resolve (higher credibility wins)
-# When below this, flag for user decision (Phase 3)
-# CREDIBILITY_DIFFERENCE_THRESHOLD = 0.3
 
-# Phase 1: Reinforcement boost calculation
-# Formula: BASE_REINFORCEMENT_BOOST / sqrt(reinforcement_count)
-# This creates diminishing returns for repeated behaviors
-BASE_REINFORCEMENT_BOOST = 0.05
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Return the validated Settings singleton (created once, cached forever)."""
+    return Settings()
 
-# Phase 3: User confirmation expiration (in seconds)
-CONFIRMATION_EXPIRATION_DAYS = 7
-CONFIRMATION_EXPIRATION_SECONDS = CONFIRMATION_EXPIRATION_DAYS * 24 * 60 * 60  # 604800 seconds
 
-SEMANTIC_RELEVANCE_THRESHOLD = 0.55
+# ---------------------------------------------------------------------------
+# Module-level flat names — kept for backward compatibility so that all
+# existing `from config.configurations import X` calls keep working.
+# ---------------------------------------------------------------------------
+
+_s = get_settings()
+
+AZURE_OPENAI_ENDPOINT: str = _s.azure_openai_endpoint
+AZURE_OPENAI_KEY: str = _s.azure_openai_key
+AZURE_OPENAI_API_VERSION: str = _s.azure_openai_api_version
+GPT_MODEL: str = _s.gpt_model
+EMBED_MODEL: str = _s.embed_model
+
+DATABASE_URL: str = _s.database_url
+
+SUPABASE_URL: Optional[str] = _s.supabase_url
+SUPABASE_KEY: Optional[str] = _s.supabase_key
+
+REDIS_URL: str = _s.redis_url
+REDIS_STREAM_NAME: str = _s.redis_stream_name
+REDIS_EVENTS_ENABLED: bool = _s.redis_events_enabled
+
+USER_MANAGEMENT_SERVICE_BASE_URL: str = _s.user_management_service_base_url
+PROFILE_SIGNALS_DEFAULT_LIMIT: int = _s.profile_signals_default_limit
+PROFILE_SIGNALS_MAX_LIMIT: int = _s.profile_signals_max_limit
+
+SAMPLE_USERID: str = _s.sample_userid
