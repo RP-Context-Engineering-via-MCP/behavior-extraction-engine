@@ -316,3 +316,14 @@ WHERE search_vector IS NULL
 CREATE INDEX IF NOT EXISTS idx_behaviors_hybrid_filter
 ON behaviors(user_id, session_id, intent)
 WHERE behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED');
+
+-- ============================================================================
+-- Drift Detection Integration - Add polarity/target fields to behavior_conflicts
+-- Used by PreferenceReversalDetector to efficiently detect polarity flips
+-- ============================================================================
+
+ALTER TABLE behavior_conflicts 
+ADD COLUMN IF NOT EXISTS old_polarity TEXT,
+ADD COLUMN IF NOT EXISTS new_polarity TEXT,
+ADD COLUMN IF NOT EXISTS old_target TEXT,
+ADD COLUMN IF NOT EXISTS new_target TEXT;

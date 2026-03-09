@@ -31,6 +31,7 @@ from services.behaviorRepository import (
     update_behavior_access_time,
     insert_co_occurrences_batch
 )
+from services.profileSignalExtractor import ProfileSignalExtractor
 from datetime import datetime
 import time
 from config.configurations import (
@@ -46,6 +47,8 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# Profile Signal Extractor instance for validating GPT-4 profile_signals output
+_profile_signal_extractor = ProfileSignalExtractor()
 
 # ==============================================================================
 # INTENT CONFLICT RULES
@@ -162,12 +165,34 @@ def run_behavior_extraction(prompt: str) -> ExtractionResult:
             )
             validated_segments.append(validated_segment)
         
+        # Validate and extract profile_signals for Profile Service integration
+        validated_profile_signals = None
+        raw_profile_signals = raw_response.get("profile_signals")
+        if raw_profile_signals:
+            try:
+                validated_profile_signals = _profile_signal_extractor.parse_and_validate(raw_profile_signals)
+                logger.info(
+                    f"Validated profile_signals: behavior_level={validated_profile_signals.get('behavior_level')}, "
+                    f"intents={list(validated_profile_signals.get('intents', {}).keys())}, "
+                    f"interests={list(validated_profile_signals.get('interests', {}).keys())}"
+                )
+            except ValueError as e:
+                logger.error(f"Profile signals validation failed: {e}. Raw data: {raw_profile_signals}")
+                # Continue without profile_signals - not critical for extraction
+        else:
+            logger.warning(
+                "No profile_signals in GPT response. Profile Service integration will not be triggered. "
+                "This may be because the GPT prompt did not generate profile_signals, or the user's prompt "
+                "did not contain enough information to generate a behavioral profile."
+            )
+        
         # Return successful extraction result
         return ExtractionResult(
             segments=validated_segments,
             success=True,
             error=None,
-            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0)
+            extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+            profile_signals=validated_profile_signals
         )
     
     except KeyError as e:
@@ -284,6 +309,27 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
             logger.warning("No required_intents in response, using default [PREFERENCE, CONSTRAINT]")
             required_intents = ["PREFERENCE", "CONSTRAINT"]
         
+        # Validate and extract profile_signals for Profile Service integration
+        validated_profile_signals = None
+        raw_profile_signals = raw_response.get("profile_signals")
+        if raw_profile_signals:
+            try:
+                validated_profile_signals = _profile_signal_extractor.parse_and_validate(raw_profile_signals)
+                logger.info(
+                    f"Validated profile_signals: behavior_level={validated_profile_signals.get('behavior_level')}, "
+                    f"intents={list(validated_profile_signals.get('intents', {}).keys())}, "
+                    f"interests={list(validated_profile_signals.get('interests', {}).keys())}"
+                )
+            except ValueError as e:
+                logger.error(f"Profile signals validation failed: {e}. Raw data: {raw_profile_signals}")
+                # Continue without profile_signals - not critical for extraction
+        else:
+            logger.warning(
+                "No profile_signals in GPT response. Profile Service integration will not be triggered. "
+                "This may be because the GPT prompt did not generate profile_signals, or the user's prompt "
+                "did not contain enough information to generate a behavioral profile."
+            )
+        
         # Return successful extraction result with standalone query and required intents
         return ExtractionResult(
             segments=validated_segments,
@@ -291,7 +337,8 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
             error=None,
             extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
             standalone_query=standalone_query.strip(),
-            required_intents=required_intents
+            required_intents=required_intents,
+            profile_signals=validated_profile_signals
         )
     
     except KeyError as e:
@@ -485,9 +532,25 @@ def _flag_and_create_conflict(
     user_id: str,
     stored: StoredBehavior,
     similarity_distance: float,
-    llm_explanation: str
+    llm_explanation: str,
+    old_polarity: Optional[str] = None,
+    new_polarity: Optional[str] = None,
+    old_target: Optional[str] = None,
+    new_target: Optional[str] = None
 ) -> None:
-    """Flag both behaviors and create a conflict record."""
+    """Flag both behaviors and create a conflict record.
+    
+    Args:
+        existing_behavior_id: ID of the existing behavior
+        user_id: User ID
+        stored: New StoredBehavior to insert
+        similarity_distance: Distance between behaviors
+        llm_explanation: LLM analysis of the conflict
+        old_polarity: Polarity of existing behavior (for drift detection)
+        new_polarity: Polarity of new behavior (for drift detection)
+        old_target: Target of existing behavior (for drift detection)
+        new_target: Target of new behavior (for drift detection)
+    """
     update_behavior_state(
         behavior_id=existing_behavior_id,
         user_id=user_id,
@@ -504,7 +567,11 @@ def _flag_and_create_conflict(
         behavior_id_2=stored.behavior_id,
         conflict_type=ConflictType.USER_DECISION_NEEDED,
         similarity_distance=similarity_distance,
-        llm_analysis=llm_explanation
+        llm_analysis=llm_explanation,
+        old_polarity=old_polarity,
+        new_polarity=new_polarity,
+        old_target=old_target,
+        new_target=new_target
     )
 
 
@@ -576,7 +643,11 @@ def _handle_llm_conflict_analysis(
             user_id=user_id,
             stored=stored,
             similarity_distance=existing.distance,
-            llm_explanation=conflict_analysis.explanation
+            llm_explanation=conflict_analysis.explanation,
+            old_polarity=existing.polarity,
+            new_polarity=canonical.polarity,
+            old_target=existing.target,
+            new_target=canonical.target
         )
         stored_behaviors.append(stored)
         return (True, True)
@@ -588,7 +659,11 @@ def _handle_llm_conflict_analysis(
             user_id=user_id,
             stored=stored,
             similarity_distance=existing.distance,
-            llm_explanation=conflict_analysis.explanation
+            llm_explanation=conflict_analysis.explanation,
+            old_polarity=existing.polarity,
+            new_polarity=canonical.polarity,
+            old_target=existing.target,
+            new_target=canonical.target
         )
         stored_behaviors.append(stored)
         return (True, True)
@@ -749,7 +824,11 @@ def _handle_potential_conflict(
             user_id=user_id,
             stored=stored,
             similarity_distance=existing.distance,
-            llm_explanation=conflict_analysis.explanation
+            llm_explanation=conflict_analysis.explanation,
+            old_polarity=existing.polarity,
+            new_polarity=canonical.polarity,
+            old_target=existing.target,
+            new_target=canonical.target
         )
         stored_behaviors.append(stored)
         return (True, True)
@@ -790,7 +869,11 @@ def _handle_potential_conflict(
                 user_id=user_id,
                 stored=stored,
                 similarity_distance=existing.distance,
-                llm_explanation=conflict_analysis.explanation
+                llm_explanation=conflict_analysis.explanation,
+                old_polarity=existing.polarity,
+                new_polarity=canonical.polarity,
+                old_target=existing.target,
+                new_target=canonical.target
             )
             stored_behaviors.append(stored)
             return (True, True)
@@ -1695,7 +1778,11 @@ def _process_candidate_with_tracking(
                     user_id=user_id,
                     stored=stored,
                     similarity_distance=existing.distance,
-                    llm_explanation=conflict_analysis.explanation
+                    llm_explanation=conflict_analysis.explanation,
+                    old_polarity=existing.polarity,
+                    new_polarity=canonical.polarity,
+                    old_target=existing.target,
+                    new_target=canonical.target
                 )
                 stored_behaviors.append(stored)
                 
@@ -1780,7 +1867,11 @@ def _process_candidate_with_tracking(
                 user_id=user_id,
                 stored=stored,
                 similarity_distance=existing.distance,
-                llm_explanation=conflict_analysis.explanation
+                llm_explanation=conflict_analysis.explanation,
+                old_polarity=existing.polarity,
+                new_polarity=canonical.polarity,
+                old_target=existing.target,
+                new_target=canonical.target
             )
             stored_behaviors.append(stored)
             
@@ -1862,7 +1953,11 @@ def _process_candidate_with_tracking(
                     user_id=user_id,
                     stored=stored,
                     similarity_distance=existing.distance,
-                    llm_explanation=conflict_analysis.explanation
+                    llm_explanation=conflict_analysis.explanation,
+                    old_polarity=existing.polarity,
+                    new_polarity=canonical.polarity,
+                    old_target=existing.target,
+                    new_target=canonical.target
                 )
                 stored_behaviors.append(stored)
                 
@@ -1890,6 +1985,141 @@ def _process_candidate_with_tracking(
     return (False, None)
 
 
+# ==============================================================================
+# PROFILE SIGNALS DISPATCH (for Profile Service Integration)
+# ==============================================================================
 
+async def dispatch_profile_signals(
+    user_id: str,
+    prompt_id: str,
+    profile_signals: Optional[dict]
+) -> Optional[dict]:
+    """
+    Dispatch profile signals to the Profile Service for cold-start profiling.
+    
+    This function should be called after each extraction to:
+    1. Save profile_signals locally (for drift fallback)
+    2. Forward to Profile Service if user is in COLD_START mode
+    
+    Args:
+        user_id: Unique user identifier
+        prompt_id: Unique prompt/request identifier (e.g., UUID or segment_id)
+        profile_signals: Validated profile signals from extraction result
+        
+    Returns:
+        Profile Service response if dispatched, None otherwise
+    """
+    if not profile_signals:
+        logger.debug(f"No profile_signals to dispatch for user={user_id}")
+        return None
+    
+    try:
+        from services.coldStartDispatcher import get_cold_start_dispatcher
+        
+        dispatcher = get_cold_start_dispatcher()
+        result = await dispatcher.dispatch(user_id, prompt_id, profile_signals)
+        
+        if result:
+            logger.info(
+                f"Profile signals dispatched for user={user_id}: "
+                f"status={result.get('status')}"
+            )
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to dispatch profile_signals for user={user_id}: {e}")
+        return None
+
+
+def dispatch_profile_signals_sync(
+    user_id: str,
+    prompt_id: str,
+    profile_signals: Optional[dict]
+) -> Optional[dict]:
+    """
+    Synchronous wrapper for dispatch_profile_signals.
+    
+    For use in synchronous contexts where async/await is not available.
+    """
+    import asyncio
+    
+    if not profile_signals:
+        return None
+    
+    try:
+        # Try to get existing event loop
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, create a task
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(
+                    asyncio.run,
+                    dispatch_profile_signals(user_id, prompt_id, profile_signals)
+                )
+                return future.result(timeout=15)
+        except RuntimeError:
+            # No running event loop, safe to use asyncio.run
+            return asyncio.run(
+                dispatch_profile_signals(user_id, prompt_id, profile_signals)
+            )
+    except Exception as e:
+        logger.error(f"Sync dispatch failed for user={user_id}: {e}")
+        return None
+
+
+def save_profile_signals_per_behavior(
+    user_id: str,
+    prompt_id: str,
+    profile_signals: Optional[dict],
+    stored_behaviors: List
+) -> None:
+    """
+    Save profile signals for each stored behavior.
+    
+    This function links profile signals to specific behavior IDs, enabling
+    the /api/behaviors/by-ids endpoint to return profile signals for
+    specific behaviors.
+    
+    Args:
+        user_id: Unique user identifier
+        prompt_id: Unique prompt/request identifier
+        profile_signals: Validated profile signals from extraction
+        stored_behaviors: List of StoredBehavior objects with behavior_ids
+    """
+    if not profile_signals or not stored_behaviors:
+        return
+    
+    try:
+        from services.profileSignalRepository import get_profile_signal_repository
+        
+        signal_repo = get_profile_signal_repository()
+        
+        for behavior in stored_behaviors:
+            try:
+                # Save profile signals with behavior_id link
+                signal_repo.save(
+                    user_id=user_id,
+                    prompt_id=f"{prompt_id}_{behavior.behavior_id}",  # Unique prompt_id per behavior
+                    profile_signals=profile_signals,
+                    behavior_id=behavior.behavior_id
+                )
+                logger.debug(
+                    f"Saved profile_signals for behavior_id={behavior.behavior_id}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to save profile_signals for behavior_id={behavior.behavior_id}: {e}"
+                )
+        
+        logger.info(
+            f"Saved profile_signals for {len(stored_behaviors)} behaviors "
+            f"(user={user_id})"
+        )
+        
+    except Exception as e:
+        logger.error(
+            f"Failed to save profile_signals per behavior for user={user_id}: {e}"
+        )
 
     

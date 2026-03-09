@@ -4,10 +4,14 @@ __pycache__/
 *.pyo
 *.pyd
 *.egg-info/
+*$py.class
 dist/
 build/
 .eggs/
 *.egg
+*.so
+.Python
+
 
 # Virtual environments
 venv/
@@ -33,18 +37,33 @@ coverage.xml
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
 
+# Git
+.git/
+.gitignore
+.gitattributes
+
 # Docs (not needed at runtime)
 docs/
 *.md
 
-# Git
-.git/
-.gitignore
+# Logs
+*.log
 
-# Local scripts / scratch
+# Database scripts (not needed in container)
+db/setup_profile_signals_table.ps1
+db/setup_profile_signals_table.sh
+"db/db scripts.txt"
+db/existing_db_scripts.txt
+
+# Local / development scripts
 run.py
+check_db.py
+check_redis.py
+populate_data.py
+test_extraction.py

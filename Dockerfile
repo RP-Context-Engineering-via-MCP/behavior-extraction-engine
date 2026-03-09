@@ -9,6 +9,7 @@ FROM python:3.11-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gcc \
       libpq-dev \
+      postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -29,6 +30,7 @@ FROM python:3.11-slim AS runtime
 # Runtime system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libpq5 \
+      postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user for security best practice
@@ -54,16 +56,15 @@ RUN chown -R appuser:appgroup /app
 
 USER appuser
 
-# Expose the port uvicorn listens on
+# Expose the port uvicorn listens on (default 8000, override with PORT env var)
 EXPOSE 8000
 
 # Health check — Docker / Kubernetes will use this to know the container is ready
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-8000}/health')" || exit 1
 
 # Entrypoint:
 #   --workers 1        single worker — scale horizontally with replicas, not threads
-#   --log-config       path to JSON logging config (see logging-config.json)
 #   --no-access-log    uvicorn's own access log; we handle this in middleware
 # Environment variable overrides are supported: PORT, LOG_LEVEL
 CMD ["sh", "-c", \
