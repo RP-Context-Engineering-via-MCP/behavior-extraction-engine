@@ -588,7 +588,7 @@ def extract_behaviors_with_history(
         )
 
         # STEP 2: Search for related behaviors using 3D hybrid retrieval (FAST)
-        related_behaviors = []
+        behavior_texts = []  # flat list of behavior_text strings
         hybrid_response = None
         if extraction_result.standalone_query:
             try:
@@ -596,7 +596,6 @@ def extract_behaviors_with_history(
 
                 query_embedding = embed_text(extraction_result.standalone_query)
 
-                # 3D Hybrid Search: Dense + Sparse (BM25) + Metadata (intent filter)
                 hybrid_response = search_similar_behavior_3D(
                     user_id=request.user_id,
                     query_embedding=query_embedding,
@@ -604,60 +603,34 @@ def extract_behaviors_with_history(
                     session_id=request.session_id,
                     required_intents=extraction_result.required_intents,
                 )
-                logger.info(
-                    f"[3D] Found {len(hybrid_response.results)} similar behaviors "
-                    f"for standalone query: '{extraction_result.standalone_query}'"
-                )
-                logger.info(
-                    f"[3D] Required intents boost: {extraction_result.required_intents}"
-                )
-                logger.info(
-                    f"[3D] Hybrid search returned {len(hybrid_response.results)} results, "
-                    f"{len(hybrid_response.decay_updates)} pending decay updates, "
-                    f"{len(hybrid_response.accessed_behavior_ids)} access timestamps to update"
-                )
 
-                related_behaviors = [
-                    {
-                        "behavior_id": b.behavior_id,
-                        "behavior_text": b.behavior_text,
-                        "distance": b.distance,
-                        "intent": b.intent,
-                        "target": b.target,
-                        "context": b.context,
-                        "polarity": b.polarity,
-                        "credibility": b.credibility,
-                    }
-                    for b in hybrid_response.results
-                    if b.distance <= RELATED_BEHAVIORS_DISTANCE_THRESHOLD
-                ]
+                # Collect behavior IDs that pass the distance threshold
+                related_ids = []
+                for b in hybrid_response.results:
+                    if b.distance <= RELATED_BEHAVIORS_DISTANCE_THRESHOLD:
+                        behavior_texts.append(b.behavior_text)
+                        related_ids.append(b.behavior_id)
+
+                # Graph expansion — 1-hop co-occurrence walk
+                if related_ids:
+                    try:
+                        associated = get_graph_expanded_behaviors(
+                            user_id=request.user_id,
+                            seed_behavior_ids=related_ids,
+                            limit=10,
+                        )
+                        for a in associated:
+                            if a["behavior_text"] not in behavior_texts:
+                                behavior_texts.append(a["behavior_text"])
+                    except Exception as e:
+                        logger.error(f"Graph expansion failed: {str(e)}")
 
                 logger.info(
-                    f"[3D] Returning {len(related_behaviors)} related behaviors "
-                    f"(filtered "
-                    f"{len(hybrid_response.results) - len(related_behaviors)} "
-                    f"below threshold, "
-                    f"distance_threshold: {RELATED_BEHAVIORS_DISTANCE_THRESHOLD})"
+                    f"Returning {len(behavior_texts)} behaviors "
+                    f"for query: '{extraction_result.standalone_query}'"
                 )
             except Exception as e:
                 logger.error(f"Failed to search related behaviors: {str(e)}")
-
-        # STEP 2b: Graph expansion — 1-hop co-occurrence walk from embedding results
-        associated_behaviors = []
-        if related_behaviors:
-            try:
-                seed_ids = [b["behavior_id"] for b in related_behaviors]
-                associated_behaviors = get_graph_expanded_behaviors(
-                    user_id=request.user_id,
-                    seed_behavior_ids=seed_ids,
-                    limit=10,
-                )
-                logger.info(
-                    f"[GRAPH] {len(seed_ids)} seed(s) → "
-                    f"{len(associated_behaviors)} associated behavior(s)"
-                )
-            except Exception as e:
-                logger.error(f"[GRAPH] Failed to expand graph: {str(e)}")
 
         # STEP 3: Schedule behavior storage in background (ASYNC - non-blocking)
         background_tasks.add_task(
@@ -665,9 +638,6 @@ def extract_behaviors_with_history(
             extraction_result,
             request.user_id,
             request.session_id,
-        )
-        logger.info(
-            f"Scheduled async storage of behaviors for user: {request.user_id}"
         )
 
         # STEP 3b: Schedule retrieval updates in background
@@ -680,25 +650,14 @@ def extract_behaviors_with_history(
                 hybrid_response.accessed_behavior_ids,
                 request.user_id,
             )
-            logger.info(
-                f"Scheduled async retrieval updates: "
-                f"{len(hybrid_response.decay_updates)} decay updates, "
-                f"{len(hybrid_response.accessed_behavior_ids)} access timestamps"
-            )
 
-        # STEP 4: Return response IMMEDIATELY with related behaviors only
+        # STEP 4: Return flat list of behavior texts
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
                 "success": True,
                 "data": {
-                    "standalone_query": extraction_result.standalone_query,
-                    "required_intents": extraction_result.required_intents,
-                    "original_prompt": request.prompt,
-                    "related_behaviors": related_behaviors,
-                    "associated_behaviors": associated_behaviors,
-                    "extraction_time_ms": extraction_result.extraction_time,
-                    "user_id": request.user_id,
+                    "behaviors": behavior_texts,
                 },
                 "error": None,
             },

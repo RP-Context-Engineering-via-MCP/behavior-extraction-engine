@@ -109,9 +109,4 @@ class ConflictListResponseData(BaseModel):
 
 
 class V2ExtractionResponseData(BaseModel):
-    standalone_query: Optional[str]
-    required_intents: Optional[List[str]]
-    original_prompt: str
-    related_behaviors: List[Any]
-    extraction_time_ms: float
-    user_id: str
+    behaviors: List[str]

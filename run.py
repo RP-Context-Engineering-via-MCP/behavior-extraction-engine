@@ -8,7 +8,7 @@ import uvicorn
 
 from config.logging_config import setup_logging
 
-# Structured JSON logging — must be called before uvicorn starts
+# Configure logging before uvicorn starts
 setup_logging()
 
 if __name__ == "__main__":

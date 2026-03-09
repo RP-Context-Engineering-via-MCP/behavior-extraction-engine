@@ -23,7 +23,7 @@ from api.router import router
 from config.logging_config import setup_logging
 from db.connection import close_db_pool, init_db_pool
 
-# Initialise structured JSON logging before anything else logs a message
+# Initialise logging before anything else logs a message
 setup_logging()
 logger = logging.getLogger(__name__)
 

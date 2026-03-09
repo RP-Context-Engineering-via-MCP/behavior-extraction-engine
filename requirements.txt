@@ -32,9 +32,6 @@ redis==5.0.1
 # Utility
 typing-extensions==4.12.2
 
-# Structured JSON logging (for Loki / Grafana observability)
-python-json-logger==2.0.7
-
 # Testing
 pytest==8.3.4
 pytest-asyncio==0.24.0
