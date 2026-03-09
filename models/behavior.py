@@ -174,9 +174,9 @@ class StoredBehavior(BaseModel):
 
     @field_validator('embedding')
     def validate_embedding_dimension(cls, v):
-        """Ensure embedding has correct dimensions for text-embedding-3-large."""
-        if v is not None and len(v) != 3072:
-            raise ValueError(f"Embedding must be 3072-dimensional, got {len(v)}")
+        """Ensure embedding has correct dimensions for all-MiniLM-L6-v2."""
+        if v is not None and len(v) != 384:
+            raise ValueError(f"Embedding must be 384-dimensional, got {len(v)}")
         return v
     
 

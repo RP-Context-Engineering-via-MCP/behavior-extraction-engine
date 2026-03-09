@@ -1,5 +1,5 @@
 """
-Comprehensive E2E Benchmark: 3D Hybrid Retrieval (TGHR) — 50 Test Cases
+Comprehensive E2E Benchmark: 3D Hybrid Retrieval + Co-Occurrence Graph
 ========================================================================
 
 Covers 10 behavior categories:
@@ -8,8 +8,16 @@ Covers 10 behavior categories:
   Reading & Pets & Technology
 
 Phase 1 — SEED:      15 diverse prompts via /extract (v1, synchronous storage)
+                      CO_PROMPT graph edges are created per prompt.
 Phase 2 — RETRIEVE:  25 prompt-only tests via /v2/extract
 Phase 3 — HISTORY:   25 prompt + history tests via /v2/extract
+
+Both Phase 2 and 3 validate:
+  - related_behaviors  (from embedding / LRA search)
+  - associated_behaviors (from 1-hop graph expansion)
+
+Each run uses a unique user_id to avoid interference with previous runs.
+All actions within a run share the same session_id.
 
 Results saved to: docs/behavior retrieval testing/YYYY_MM_DD_HHMM_testN.txt
 
@@ -19,6 +27,7 @@ Run:
 Prerequisites:
     - Server running on http://localhost:8000
     - Database migrated with search_vector column + GIN index
+    - Database migrated with behavior_co_occurrences table
 """
 
 import requests
@@ -31,8 +40,12 @@ from datetime import datetime
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 BASE_URL = "http://localhost:8000"
-USER_ID = "test_3d_bench_001"
-SESSION_ID = "test_3d_bench_session_001"
+
+# Unique per-run IDs — prevents contamination from previous test runs
+RUN_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
+USER_ID = f"test_graph_{RUN_TS}"
+SESSION_ID = f"sess_{RUN_TS}"
+
 RESULTS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "docs", "behavior retrieval testing"
@@ -84,14 +97,15 @@ def warn(msg):
 
 
 # ─── API Helpers ─────────────────────────────────────────────────────────────
-def call_v1_extract(prompt: str, max_retries: int = 3) -> dict:
+def call_v1_extract(prompt: str, session_id: str = None, max_retries: int = 3) -> dict:
     """POST /extract — synchronous extraction + storage, with retry on transient errors."""
+    sid = session_id or SESSION_ID
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
             resp = requests.post(
                 f"{BASE_URL}/extract",
-                json={"prompt": prompt, "user_id": USER_ID, "session_id": SESSION_ID},
+                json={"prompt": prompt, "user_id": USER_ID, "session_id": sid},
                 timeout=60,
             )
             resp.raise_for_status()
@@ -114,9 +128,10 @@ def call_v1_extract(prompt: str, max_retries: int = 3) -> dict:
     raise last_error
 
 
-def call_v2_extract(prompt: str, recent_history: list = None) -> dict:
-    """POST /v2/extract — extraction + 3D hybrid retrieval."""
-    body = {"prompt": prompt, "user_id": USER_ID, "session_id": SESSION_ID}
+def call_v2_extract(prompt: str, recent_history: list = None, session_id: str = None) -> dict:
+    """POST /v2/extract — extraction + 3D hybrid retrieval + graph expansion."""
+    sid = session_id or SESSION_ID
+    body = {"prompt": prompt, "user_id": USER_ID, "session_id": sid}
     if recent_history:
         body["recent_history"] = recent_history
     resp = requests.post(f"{BASE_URL}/v2/extract", json=body, timeout=60)
@@ -650,19 +665,31 @@ def get_next_test_number():
     return max(numbers, default=0) + 1
 
 
-def check_keywords(related_behaviors: list, expected_keywords: list) -> list:
-    """Return which expected keywords appear in the returned behavior texts."""
-    all_text = " ".join(b.get("behavior_text", "").lower() for b in related_behaviors)
+def check_keywords(behaviors: list, expected_keywords: list) -> list:
+    """Return which expected keywords appear in the behavior texts.
+    Works for both related_behaviors and associated_behaviors."""
+    all_text = " ".join(b.get("behavior_text", "").lower() for b in behaviors)
     return [kw for kw in expected_keywords if kw.lower() in all_text]
 
 
-def print_behaviors(related: list, indent="    "):
-    """Log each returned behavior."""
-    for b in related:
-        log(
-            f"{indent}• [{b.get('intent','?')}] {b['behavior_text'][:80]}  "
-            f"(distance={b['distance']:.4f}, credibility={b['credibility']:.4f})"
-        )
+def print_behaviors(behaviors: list, label: str = "related", indent: str = "    "):
+    """Log each returned behavior. Handles both related (distance) and associated (edge_weight)."""
+    for b in behaviors:
+        source = b.get("source", "embedding")
+        if source == "graph":
+            log(
+                f"{indent}• [{b.get('intent','?')}] {b['behavior_text'][:80]}  "
+                f"(edge_weight={b.get('edge_weight', 0):.2f}, "
+                f"edge_type={b.get('edge_type','?')}, "
+                f"credibility={b.get('credibility', 0):.4f}) [{label}/graph]"
+            )
+        else:
+            dist_val = b.get('distance', 0)
+            log(
+                f"{indent}• [{b.get('intent','?')}] {b['behavior_text'][:80]}  "
+                f"(distance={dist_val:.4f}, "
+                f"credibility={b.get('credibility', 0):.4f}) [{label}]"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -711,8 +738,12 @@ def phase_1_seed():
 
 def run_single_test(test: dict, test_num: int, total: int, use_history: bool = False) -> dict:
     """
-    Run a single retrieval test and return a result dict:
-      {test_num, prompt, category, retrieved, matched_kw, total_kw, passed, error}
+    Run a single retrieval test and return a result dict.
+
+    Validates both embedding-based related_behaviors AND graph-based
+    associated_behaviors.  Keywords are matched against the UNION of
+    both lists so that graph-surfaced behaviors can contribute to the
+    pass criteria.
     """
     prompt = test["prompt"]
     category = test.get("category", "General")
@@ -731,49 +762,79 @@ def run_single_test(test: dict, test_num: int, total: int, use_history: bool = F
             fail(f"API returned error: {result.get('error')}")
             return {
                 "test_num": test_num, "prompt": prompt, "category": category,
-                "retrieved": 0, "matched_kw": 0, "total_kw": len(expected_kw),
+                "retrieved": 0, "associated": 0,
+                "matched_kw": 0, "matched_kw_embedding": 0,
+                "matched_kw_graph": 0, "total_kw": len(expected_kw),
                 "passed": False, "error": result.get("error"),
                 "standalone_query": "", "required_intents": [],
-                "matched_keywords": [],
+                "matched_keywords": [], "graph_keywords": [],
             }
 
         data = result.get("data", {})
         related = data.get("related_behaviors", [])
+        associated = data.get("associated_behaviors", [])
         standalone = data.get("standalone_query", "")
         intents = data.get("required_intents", [])
 
-        log(f"  Standalone query : {standalone}")
-        log(f"  Required intents : {intents}")
-        log(f"  Related behaviors: {len(related)}")
-        print_behaviors(related)
+        log(f"  Standalone query      : {standalone}")
+        log(f"  Required intents      : {intents}")
+        log(f"  Related behaviors     : {len(related)}  (embedding/LRA)")
+        print_behaviors(related, label="embedding")
 
-        matched = check_keywords(related, expected_kw)
-        passed = len(related) >= 1 and len(matched) >= 1
-
-        if passed:
-            ok(f"PASS — {len(related)} behavior(s), keywords: {len(matched)}/{len(expected_kw)} {matched}")
+        if associated:
+            log(f"  Associated behaviors  : {len(associated)}  (graph expansion)")
+            print_behaviors(associated, label="graph")
         else:
+            log(f"  Associated behaviors  : 0  (no graph neighbors)")
+
+        # Keyword matching — embedding results
+        matched_emb = check_keywords(related, expected_kw)
+        # Keyword matching — graph results (new keywords only)
+        matched_graph = check_keywords(associated, expected_kw)
+        # UNION: unique keywords matched by either source
+        matched_all = sorted(set(matched_emb + matched_graph))
+
+        # Pass: at least 1 behavior (from either source) + at least 1 keyword
+        total_behaviors = len(related) + len(associated)
+        passed = total_behaviors >= 1 and len(matched_all) >= 1
+
+        # Report
+        graph_only_kw = sorted(set(matched_graph) - set(matched_emb))
+        if passed:
+            msg = (
+                f"PASS — {len(related)} related + {len(associated)} associated, "
+                f"keywords: {len(matched_all)}/{len(expected_kw)} {matched_all}"
+            )
+            if graph_only_kw:
+                msg += f"  [GRAPH added: {graph_only_kw}]"
+            ok(msg)
+        else:
+            reason = "(no behaviors returned)" if total_behaviors == 0 else "(no keyword match)"
             fail(
-                f"FAIL — {len(related)} behavior(s), keywords: {len(matched)}/{len(expected_kw)} "
-                f"{'(no behaviors returned)' if len(related) == 0 else '(no keyword match)'}"
+                f"FAIL — {len(related)} related + {len(associated)} associated, "
+                f"keywords: {len(matched_all)}/{len(expected_kw)} {reason}"
             )
 
         return {
             "test_num": test_num, "prompt": prompt, "category": category,
-            "retrieved": len(related), "matched_kw": len(matched),
-            "total_kw": len(expected_kw), "passed": passed, "error": None,
+            "retrieved": len(related), "associated": len(associated),
+            "matched_kw": len(matched_all), "matched_kw_embedding": len(matched_emb),
+            "matched_kw_graph": len(matched_graph), "total_kw": len(expected_kw),
+            "passed": passed, "error": None,
             "standalone_query": standalone, "required_intents": intents,
-            "matched_keywords": matched,
+            "matched_keywords": matched_all, "graph_keywords": graph_only_kw,
         }
 
     except Exception as e:
         fail(f"Exception: {e}")
         return {
             "test_num": test_num, "prompt": prompt, "category": category,
-            "retrieved": 0, "matched_kw": 0, "total_kw": len(expected_kw),
+            "retrieved": 0, "associated": 0,
+            "matched_kw": 0, "matched_kw_embedding": 0,
+            "matched_kw_graph": 0, "total_kw": len(expected_kw),
             "passed": False, "error": str(e),
             "standalone_query": "", "required_intents": [],
-            "matched_keywords": [],
+            "matched_keywords": [], "graph_keywords": [],
         }
 
 
@@ -810,81 +871,110 @@ def print_summary(total_seeded, p2_results, p3_results):
 
     all_results = p2_results + p3_results
 
-    # Phase 2 stats
+    # ── Phase 2 stats ────────────────────────────────────────────────────
     p2_pass = sum(1 for r in p2_results if r["passed"])
     p2_total = len(p2_results)
     p2_avg_ret = sum(r["retrieved"] for r in p2_results) / max(p2_total, 1)
+    p2_avg_assoc = sum(r.get("associated", 0) for r in p2_results) / max(p2_total, 1)
     p2_avg_kw = sum(r["matched_kw"] / max(r["total_kw"], 1) for r in p2_results) / max(p2_total, 1) * 100
 
-    # Phase 3 stats
+    # ── Phase 3 stats ────────────────────────────────────────────────────
     p3_pass = sum(1 for r in p3_results if r["passed"])
     p3_total = len(p3_results)
     p3_avg_ret = sum(r["retrieved"] for r in p3_results) / max(p3_total, 1)
+    p3_avg_assoc = sum(r.get("associated", 0) for r in p3_results) / max(p3_total, 1)
     p3_avg_kw = sum(r["matched_kw"] / max(r["total_kw"], 1) for r in p3_results) / max(p3_total, 1) * 100
 
-    # Overall
+    # ── Overall ──────────────────────────────────────────────────────────
     total_pass = p2_pass + p3_pass
     total_tests = p2_total + p3_total
     overall_pct = total_pass / max(total_tests, 1) * 100
 
-    log(f"  Behaviors seeded: {total_seeded}")
+    log(f"  User ID          : {USER_ID}")
+    log(f"  Session ID       : {SESSION_ID}")
+    log(f"  Behaviors seeded : {total_seeded}")
     log()
 
-    # Phase 2
+    # ── Graph Impact ─────────────────────────────────────────────────────
+    total_assoc = sum(r.get("associated", 0) for r in all_results)
+    tests_with_assoc = sum(1 for r in all_results if r.get("associated", 0) > 0)
+    graph_only_kw_count = sum(len(r.get("graph_keywords", [])) for r in all_results)
+    # Tests that ONLY passed because graph-surfaced behaviors matched keywords
+    graph_rescued = sum(
+        1 for r in all_results
+        if r["passed"] and r.get("matched_kw_embedding", 0) == 0 and r.get("matched_kw_graph", 0) > 0
+    )
+
+    log(f"  ── Graph Expansion Stats ──")
+    log(f"    Tests with graph neighbors  : {tests_with_assoc}/{total_tests}")
+    log(f"    Total associated behaviors  : {total_assoc}")
+    log(f"    Unique graph-only keywords  : {graph_only_kw_count}  (matched by graph but not embedding)")
+    log(f"    Tests rescued by graph      : {graph_rescued}  (would have failed without graph)")
+    log()
+
+    # ── Phase 2 Detail ───────────────────────────────────────────────────
     log(f"  Phase 2 — Prompt Only ({p2_total} tests):")
-    log(f"    Passed:                {p2_pass}/{p2_total} ({p2_pass/max(p2_total,1)*100:.1f}%)")
-    log(f"    Failed:                {p2_total - p2_pass}/{p2_total}")
-    log(f"    Avg behaviors/query:   {p2_avg_ret:.1f}")
-    log(f"    Avg keyword coverage:  {p2_avg_kw:.1f}%")
+    log(f"    Passed:                  {p2_pass}/{p2_total} ({p2_pass/max(p2_total,1)*100:.1f}%)")
+    log(f"    Failed:                  {p2_total - p2_pass}/{p2_total}")
+    log(f"    Avg related/query:       {p2_avg_ret:.1f}")
+    log(f"    Avg associated/query:    {p2_avg_assoc:.1f}")
+    log(f"    Avg keyword coverage:    {p2_avg_kw:.1f}%")
     log()
 
     for r in p2_results:
         icon = "✓" if r["passed"] else "✗"
-        log(f"    {icon} [{r['retrieved']:>2} matched] (kw: {r['matched_kw']}/{r['total_kw']}) {r['prompt'][:55]}")
-    log(f"    → {sum(r['retrieved'] for r in p2_results)} total behaviors retrieved")
+        g = f" +{r.get('associated',0)}g" if r.get("associated", 0) > 0 else ""
+        log(f"    {icon} [{r['retrieved']:>2} ret{g}] (kw: {r['matched_kw']}/{r['total_kw']}) {r['prompt'][:55]}")
+    log(f"    → {sum(r['retrieved'] for r in p2_results)} related + {sum(r.get('associated',0) for r in p2_results)} associated")
     log()
 
-    # Phase 3
+    # ── Phase 3 Detail ───────────────────────────────────────────────────
     log(f"  Phase 3 — With History ({p3_total} tests):")
-    log(f"    Passed:                {p3_pass}/{p3_total} ({p3_pass/max(p3_total,1)*100:.1f}%)")
-    log(f"    Failed:                {p3_total - p3_pass}/{p3_total}")
-    log(f"    Avg behaviors/query:   {p3_avg_ret:.1f}")
-    log(f"    Avg keyword coverage:  {p3_avg_kw:.1f}%")
+    log(f"    Passed:                  {p3_pass}/{p3_total} ({p3_pass/max(p3_total,1)*100:.1f}%)")
+    log(f"    Failed:                  {p3_total - p3_pass}/{p3_total}")
+    log(f"    Avg related/query:       {p3_avg_ret:.1f}")
+    log(f"    Avg associated/query:    {p3_avg_assoc:.1f}")
+    log(f"    Avg keyword coverage:    {p3_avg_kw:.1f}%")
     log()
 
     for r in p3_results:
         icon = "✓" if r["passed"] else "✗"
-        log(f"    {icon} [{r['retrieved']:>2} matched] (kw: {r['matched_kw']}/{r['total_kw']}) {r['prompt'][:55]}")
-    log(f"    → {sum(r['retrieved'] for r in p3_results)} total behaviors retrieved")
+        g = f" +{r.get('associated',0)}g" if r.get("associated", 0) > 0 else ""
+        log(f"    {icon} [{r['retrieved']:>2} ret{g}] (kw: {r['matched_kw']}/{r['total_kw']}) {r['prompt'][:55]}")
+    log(f"    → {sum(r['retrieved'] for r in p3_results)} related + {sum(r.get('associated',0) for r in p3_results)} associated")
     log()
 
-    # Category breakdown
+    # ── Category Breakdown ───────────────────────────────────────────────
     log(f"  Category Breakdown:")
     categories = {}
     for r in all_results:
         cat = r["category"]
         if cat not in categories:
-            categories[cat] = {"pass": 0, "total": 0}
+            categories[cat] = {"pass": 0, "total": 0, "assoc": 0}
         categories[cat]["total"] += 1
+        categories[cat]["assoc"] += r.get("associated", 0)
         if r["passed"]:
             categories[cat]["pass"] += 1
 
     for cat, stats in sorted(categories.items()):
         pct = stats["pass"] / max(stats["total"], 1) * 100
-        log(f"    {cat:<25} {stats['pass']}/{stats['total']} ({pct:.0f}%)")
+        log(f"    {cat:<25} {stats['pass']}/{stats['total']} ({pct:.0f}%)  graph_assoc={stats['assoc']}")
     log()
 
-    # Failed tests detail
+    # ── Failed Tests Detail ──────────────────────────────────────────────
     failed = [r for r in all_results if not r["passed"]]
     if failed:
         log(f"  Failed Tests:")
         for r in failed:
             phase = "P2" if r in p2_results else "P3"
-            reason = r.get("error") or ("no behaviors" if r["retrieved"] == 0 else "no keyword match")
+            reason = r.get("error") or (
+                "no behaviors" if (r["retrieved"] + r.get("associated", 0)) == 0
+                else "no keyword match"
+            )
             log(f"    ✗ [{phase}] Test {r['test_num']}: \"{r['prompt'][:50]}...\" ({reason})")
         log()
 
-    # Overall
+    # ── Overall ──────────────────────────────────────────────────────────
     log(f"  {'='*60}")
     if overall_pct >= 90:
         log_c(f"  OVERALL: {total_pass}/{total_tests} PASSED ({overall_pct:.1f}%)", GREEN)
@@ -901,6 +991,8 @@ def print_summary(total_seeded, p2_results, p3_results):
         "overall_pct": overall_pct,
         "p2_pass": p2_pass,
         "p3_pass": p3_pass,
+        "graph_rescued": graph_rescued,
+        "total_associated": total_assoc,
     }
 
 
@@ -926,13 +1018,14 @@ def save_results():
 def main():
     start_time = time.time()
 
-    section("3D HYBRID RETRIEVAL — COMPREHENSIVE BENCHMARK (50 TESTS)")
-    log(f"  User ID    : {USER_ID}")
+    section("3D HYBRID RETRIEVAL + CO-OCCURRENCE GRAPH — E2E BENCHMARK")
+    log(f"  User ID    : {USER_ID}  (unique per run)")
     log(f"  Session ID : {SESSION_ID}")
     log(f"  Server     : {BASE_URL}")
     log(f"  Date       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"  Test Count : {len(PROMPT_ONLY_TESTS) + len(HISTORY_TESTS)} "
         f"({len(PROMPT_ONLY_TESTS)} prompt-only + {len(HISTORY_TESTS)} with-history)")
+    log(f"  Graph      : CO_PROMPT edges created per seed prompt")
 
     # Verify server
     try:
