@@ -1883,7 +1883,13 @@ def get_user_conflicts(user_id: str) -> List[dict]:
                         b1.credibility as behavior_1_credibility,
                         b2.credibility as behavior_2_credibility,
                         b1.behavior_state as behavior_1_state,
-                        b2.behavior_state as behavior_2_state
+                        b2.behavior_state as behavior_2_state,
+                        b1.reinforcement_count as behavior_1_reinforcement_count,
+                        b2.reinforcement_count as behavior_2_reinforcement_count,
+                        b1.intent as behavior_1_intent,
+                        b2.intent as behavior_2_intent,
+                        b1.polarity as behavior_1_polarity,
+                        b2.polarity as behavior_2_polarity
                     FROM behavior_conflicts c
                     LEFT JOIN behaviors b1 ON c.behavior_id_1 = b1.behavior_id
                     LEFT JOIN behaviors b2 ON c.behavior_id_2 = b2.behavior_id
@@ -1912,7 +1918,13 @@ def get_user_conflicts(user_id: str) -> List[dict]:
                         "behavior_1_credibility": row[13],
                         "behavior_2_credibility": row[14],
                         "behavior_1_state": row[15],
-                        "behavior_2_state": row[16]
+                        "behavior_2_state": row[16],
+                        "behavior_1_reinforcement_count": row[17],
+                        "behavior_2_reinforcement_count": row[18],
+                        "behavior_1_intent": row[19],
+                        "behavior_2_intent": row[20],
+                        "behavior_1_polarity": row[21],
+                        "behavior_2_polarity": row[22],
                     })
                 
                 return conflicts

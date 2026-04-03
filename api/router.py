@@ -27,11 +27,18 @@ from services.behaviorRepository import (
     resolve_conflict,
     search_similar_behavior_3D,
 )
+from services.credibilityCalculator import apply_lazy_decay, get_decay_rate
+from config.constants import (
+    DEFAULT_DECAY_RATE,
+    DECAY_GRACE_PERIOD_DAYS,
+    INTENT_DECAY_RATES,
+)
 from services.profileSignalRepository import get_profile_signal_repository
 from services.extractor import (
     run_behavior_extraction,
     run_behavior_extraction_with_history,
     store_behavior,
+    store_behavior_with_tracking,
     dispatch_profile_signals_sync,
     save_profile_signals_per_behavior,
 )
@@ -39,6 +46,8 @@ from utils.embedding_utils import get_behavior_embedding
 from utils.similarity_utils import calculate_behavior_distance
 
 import logging
+import math
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -893,3 +902,664 @@ def get_recent_profile_signals(
                 "error": f"Failed to retrieve recent signals: {str(e)}"
             }
         )
+
+
+# ==============================================================================
+# DEMO / UI ENDPOINTS — Detailed pipeline visualization
+# ==============================================================================
+
+
+@router.post(
+    "/v2/extract/detailed",
+    summary="[DEMO] Extract behaviors with full pipeline visibility",
+    description="""
+    Demo endpoint that runs the FULL extraction + storage pipeline SYNCHRONOUSLY
+    and returns detailed information about every decision made.
+
+    Unlike `/v2/extract` (which returns only related behavior texts and runs
+    storage in the background), this endpoint exposes:
+
+    1. **Extraction phase**: segments, behaviors, canonical forms, confidence scores
+    2. **Standalone query**: the enriched self-contained query for similarity search
+    3. **Similarity search**: matching behaviors with distances from 3D hybrid retrieval
+    4. **Graph expansion**: associated behaviors from co-occurrence graph
+    5. **Storage phase**: per-behavior flow tracking (new, reinforced, conflict, pruned)
+    6. **Pipeline summary**: counts of stored, reinforced, conflicts, pruned
+
+    ⚠️ This is a SYNCHRONOUS endpoint intended for demos — not for production use.
+    """,
+    response_description="Full pipeline details including extraction, retrieval, and storage decisions",
+)
+def extract_behaviors_detailed(request: ExtractRequestWithHistory):
+    """
+    Demo endpoint: Extract + Store synchronously with full pipeline visibility.
+    """
+    try:
+        logger.info(f"[DEMO] Detailed extraction request for user: {request.user_id}")
+
+        # Convert history
+        history_dicts = []
+        if request.recent_history:
+            history_dicts = [
+                {"role": msg.role, "text": msg.text}
+                for msg in request.recent_history
+            ]
+
+        # STEP 1: Extract behaviors (LLM call)
+        extraction_result = run_behavior_extraction_with_history(
+            prompt=request.prompt,
+            recent_history=history_dicts,
+        )
+
+        if not extraction_result.success:
+            return JSONResponse(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content={
+                    "success": False,
+                    "phase": "extraction",
+                    "error": extraction_result.error or "Extraction failed",
+                },
+            )
+
+        # STEP 2: Similarity search using 3D hybrid retrieval
+        retrieval_results = []
+        graph_expanded = []
+        behavior_texts = []
+
+        if extraction_result.standalone_query:
+            try:
+                from services.openAiClient import embed_text
+
+                query_embedding = embed_text(extraction_result.standalone_query)
+
+                hybrid_response = search_similar_behavior_3D(
+                    user_id=request.user_id,
+                    query_embedding=query_embedding,
+                    query_text=extraction_result.standalone_query,
+                    session_id=request.session_id,
+                    required_intents=extraction_result.required_intents,
+                )
+
+                related_ids = []
+                for b in hybrid_response.results:
+                    entry = {
+                        "behavior_id": b.behavior_id,
+                        "behavior_text": b.behavior_text,
+                        "distance": round(b.distance, 4),
+                        "credibility": round(b.credibility, 4),
+                        "reinforcement_count": b.reinforcement_count,
+                        "intent": b.intent,
+                        "target": b.target,
+                        "context": b.context,
+                        "polarity": b.polarity,
+                        "within_threshold": b.distance <= RELATED_BEHAVIORS_DISTANCE_THRESHOLD,
+                    }
+                    retrieval_results.append(entry)
+                    if b.distance <= RELATED_BEHAVIORS_DISTANCE_THRESHOLD:
+                        behavior_texts.append(b.behavior_text)
+                        related_ids.append(b.behavior_id)
+
+                # Graph expansion
+                if related_ids:
+                    try:
+                        associated = get_graph_expanded_behaviors(
+                            user_id=request.user_id,
+                            seed_behavior_ids=related_ids,
+                            limit=10,
+                        )
+                        for a in associated:
+                            graph_expanded.append(a)
+                            if a["behavior_text"] not in behavior_texts:
+                                behavior_texts.append(a["behavior_text"])
+                    except Exception as e:
+                        logger.error(f"[DEMO] Graph expansion failed: {str(e)}")
+
+                # Persist retrieval updates synchronously for demo
+                if hybrid_response.decay_updates or hybrid_response.accessed_behavior_ids:
+                    try:
+                        persist_retrieval_updates_batch(
+                            hybrid_response.decay_updates,
+                            hybrid_response.accessed_behavior_ids,
+                            request.user_id,
+                        )
+                    except Exception as e:
+                        logger.warning(f"[DEMO] Retrieval update failed: {str(e)}")
+
+            except Exception as e:
+                logger.error(f"[DEMO] Similarity search failed: {str(e)}")
+
+        # STEP 3: Store behaviors SYNCHRONOUSLY with full tracking
+        detailed_result = store_behavior_with_tracking(
+            extraction_result,
+            user_id=request.user_id,
+            session_id=request.session_id,
+        )
+
+        # Save profile signals synchronously
+        stored_behaviors_list = []
+        if detailed_result.flow_info:
+            for fi in detailed_result.flow_info:
+                if fi.stored_behavior_id:
+                    # Find corresponding StoredBehavior if available
+                    pass
+
+        if hasattr(extraction_result, 'profile_signals') and extraction_result.profile_signals:
+            try:
+                dispatch_profile_signals_sync(
+                    user_id=request.user_id,
+                    prompt_id=request.session_id,
+                    profile_signals=extraction_result.profile_signals
+                )
+            except Exception as e:
+                logger.warning(f"[DEMO] Profile signal dispatch failed: {str(e)}")
+
+        # Build extraction segments for response
+        segments_data = []
+        for segment in extraction_result.segments:
+            segments_data.append({
+                "text": segment.text,
+                "behaviors": [
+                    {
+                        "description": b.description,
+                        "confidence": b.confidence,
+                        "clarity": b.clarity,
+                        "linguistic_strength": b.linguistic_strength,
+                        "canonical": {
+                            "intent": b.intent,
+                            "target": b.target,
+                            "context": b.context,
+                            "polarity": b.polarity,
+                        },
+                    }
+                    for b in segment.behaviors
+                ],
+            })
+
+        # Build flow info for response
+        flow_data = []
+        for fi in detailed_result.flow_info:
+            flow_data.append({
+                "behavior_description": fi.behavior_description,
+                "action": fi.action.value if hasattr(fi.action, 'value') else fi.action,
+                "credibility": round(fi.credibility, 4),
+                "canonical": fi.canonical,
+                "matched_behavior_id": fi.matched_behavior_id,
+                "matched_behavior_text": fi.matched_behavior_text,
+                "distance": round(fi.distance, 4) if fi.distance is not None else None,
+                "conflict_info": fi.conflict_info,
+                "reinforcement_info": fi.reinforcement_info,
+                "stored_behavior_id": fi.stored_behavior_id,
+                "details": fi.details,
+            })
+
+        total_behaviors = sum(len(seg.behaviors) for seg in extraction_result.segments)
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "pipeline": {
+                    "extraction": {
+                        "segments": segments_data,
+                        "total_segments": len(extraction_result.segments),
+                        "total_behaviors_extracted": total_behaviors,
+                        "standalone_query": extraction_result.standalone_query,
+                        "required_intents": extraction_result.required_intents,
+                        "extraction_time_ms": extraction_result.extraction_time,
+                    },
+                    "retrieval": {
+                        "query_used": extraction_result.standalone_query,
+                        "results": retrieval_results,
+                        "total_candidates": len(retrieval_results),
+                        "within_threshold": sum(1 for r in retrieval_results if r["within_threshold"]),
+                        "distance_threshold": RELATED_BEHAVIORS_DISTANCE_THRESHOLD,
+                    },
+                    "graph_expansion": {
+                        "seed_behavior_ids": [r["behavior_id"] for r in retrieval_results if r["within_threshold"]],
+                        "expanded_behaviors": graph_expanded,
+                        "total_expanded": len(graph_expanded),
+                    },
+                    "storage": {
+                        "flow": flow_data,
+                        "summary": {
+                            "total_extracted": detailed_result.total_extracted,
+                            "total_stored": detailed_result.total_stored,
+                            "total_reinforced": detailed_result.total_reinforced,
+                            "total_conflicts": detailed_result.total_conflicts,
+                            "total_pruned": detailed_result.total_pruned,
+                        },
+                    },
+                    "related_behaviors": behavior_texts,
+                },
+                "user_id": request.user_id,
+                "session_id": request.session_id,
+                "error": None,
+            },
+        )
+
+    except ValueError as e:
+        logger.exception("[DEMO] Validation error")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"success": False, "error": f"Validation error: {str(e)}"},
+        )
+    except Exception as e:
+        logger.exception("[DEMO] Unexpected error during detailed extraction")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "error": f"Internal server error: {str(e)}"},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Decay Demo Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/decay/config",
+    summary="Get decay configuration",
+    description="Return the current decay rate configuration and algorithm parameters",
+)
+def get_decay_config():
+    """Return the complete decay configuration for display in the UI."""
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "success": True,
+            "data": {
+                "default_decay_rate": DEFAULT_DECAY_RATE,
+                "grace_period_days": DECAY_GRACE_PERIOD_DAYS,
+                "intent_decay_rates": INTENT_DECAY_RATES,
+                "formula": "C_current = C_stored × e^(-λ × days_elapsed)",
+                "notes": [
+                    "Decay is only applied for FULL days elapsed (86400s granularity)",
+                    "New behaviors have a 7-day grace period before decay begins",
+                    "Different intent types decay at different rates",
+                    "Credibility is clamped to [0.0, 1.0] range",
+                ],
+            },
+            "error": None,
+        },
+    )
+
+
+@router.get(
+    "/decay/preview/{user_id}",
+    summary="Preview decay state for all behaviors",
+    description=(
+        "Show all behaviors for a user with current stored credibility, "
+        "what the decayed credibility WOULD be right now, and how many days "
+        "since last decay was applied. Does NOT persist any changes."
+    ),
+)
+def preview_decay_state(user_id: str):
+    """
+    Preview the decay state of all behaviors WITHOUT persisting.
+    Shows stored vs decayed credibility for each behavior.
+    """
+    try:
+        from db.connection import get_db_pool_connection
+
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        behavior_id,
+                        behavior_text,
+                        credibility,
+                        decay_rate,
+                        reinforcement_count,
+                        created_at,
+                        last_seen_at,
+                        last_decay_applied_at,
+                        intent,
+                        target,
+                        context,
+                        polarity,
+                        behavior_state,
+                        session_id
+                    FROM behaviors
+                    WHERE user_id = %s
+                    ORDER BY last_seen_at DESC
+                    """,
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+
+        current_time = int(time.time())
+        behaviors = []
+
+        for row in rows:
+            (
+                behavior_id, behavior_text, stored_cred, decay_rate_val,
+                reinforcement_count, created_at, last_seen_at,
+                last_decay_applied_at, intent, target, context,
+                polarity, behavior_state, session_id
+            ) = row
+
+            # Simulate lazy decay without persisting
+            new_cred, would_apply, days_elapsed = apply_lazy_decay(
+                stored_credibility=float(stored_cred),
+                decay_rate=float(decay_rate_val),
+                last_decay_applied_at=last_decay_applied_at,
+                current_time=current_time,
+            )
+
+            # Calculate time info
+            age_days = (current_time - created_at) / 86400 if created_at else 0
+            since_last_decay = (
+                (current_time - last_decay_applied_at) / 86400
+                if last_decay_applied_at
+                else None
+            )
+
+            # Check grace period
+            in_grace_period = (
+                last_decay_applied_at is not None
+                and current_time < last_decay_applied_at
+            )
+
+            behaviors.append({
+                "behavior_id": behavior_id,
+                "behavior_text": behavior_text,
+                "stored_credibility": float(stored_cred),
+                "decayed_credibility": new_cred,
+                "credibility_loss": float(stored_cred) - new_cred,
+                "decay_rate": float(decay_rate_val),
+                "intent": intent,
+                "target": target,
+                "context": context,
+                "polarity": polarity,
+                "reinforcement_count": reinforcement_count,
+                "behavior_state": behavior_state,
+                "session_id": session_id,
+                "days_since_last_decay": round(since_last_decay, 2) if since_last_decay is not None else None,
+                "full_days_for_decay": days_elapsed,
+                "age_days": round(age_days, 1),
+                "in_grace_period": in_grace_period,
+                "would_decay_apply": would_apply,
+                "last_decay_applied_at": last_decay_applied_at,
+                "created_at": created_at,
+            })
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "data": {
+                    "user_id": user_id,
+                    "current_timestamp": current_time,
+                    "total_behaviors": len(behaviors),
+                    "behaviors_needing_decay": sum(
+                        1 for b in behaviors if b["would_decay_apply"]
+                    ),
+                    "behaviors": behaviors,
+                },
+                "error": None,
+            },
+        )
+    except Exception as e:
+        logger.exception(f"[DECAY] Error previewing decay for user {user_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "data": None, "error": str(e)},
+        )
+
+
+@router.post(
+    "/decay/apply-lazy/{user_id}",
+    summary="Trigger lazy decay for a user's behaviors",
+    description=(
+        "Demonstrates the LAZY DECAY approach: retrieves all behaviors for a user, "
+        "applies exponential decay on-the-fly, and persists updated credibilities. "
+        "Returns before/after comparison."
+    ),
+)
+def trigger_lazy_decay(user_id: str):
+    """
+    Trigger lazy decay (on-demand) for all behaviors of a user.
+    This mimics what happens when behaviors are retrieved via search_similar_behaviors.
+    """
+    try:
+        from db.connection import get_db_pool_connection
+
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        behavior_id, behavior_text, credibility, decay_rate,
+                        last_decay_applied_at, intent, reinforcement_count,
+                        behavior_state
+                    FROM behaviors
+                    WHERE user_id = %s
+                    ORDER BY last_seen_at DESC
+                    """,
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+
+                current_time = int(time.time())
+                results = []
+                updates = []
+
+                for row in rows:
+                    (
+                        behavior_id, behavior_text, stored_cred, decay_rate_val,
+                        last_decay_applied_at, intent, reinforcement_count,
+                        behavior_state
+                    ) = row
+
+                    new_cred, applied, days_elapsed = apply_lazy_decay(
+                        stored_credibility=float(stored_cred),
+                        decay_rate=float(decay_rate_val),
+                        last_decay_applied_at=last_decay_applied_at,
+                        current_time=current_time,
+                    )
+
+                    entry = {
+                        "behavior_id": behavior_id,
+                        "behavior_text": behavior_text,
+                        "intent": intent,
+                        "before_credibility": float(stored_cred),
+                        "after_credibility": new_cred,
+                        "credibility_loss": float(stored_cred) - new_cred,
+                        "decay_rate": float(decay_rate_val),
+                        "days_elapsed": days_elapsed,
+                        "decay_applied": applied,
+                    }
+                    results.append(entry)
+
+                    if applied:
+                        updates.append((new_cred, current_time, behavior_id, user_id))
+
+                # Persist all decay updates
+                if updates:
+                    cur.executemany(
+                        """
+                        UPDATE behaviors
+                        SET credibility = %s,
+                            last_decay_applied_at = %s
+                        WHERE behavior_id = %s AND user_id = %s
+                        """,
+                        updates,
+                    )
+                    conn.commit()
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "data": {
+                    "user_id": user_id,
+                    "mode": "lazy",
+                    "applied_at": current_time,
+                    "total_behaviors": len(results),
+                    "total_decayed": len(updates),
+                    "total_unchanged": len(results) - len(updates),
+                    "behaviors": results,
+                },
+                "error": None,
+            },
+        )
+    except Exception as e:
+        logger.exception(f"[DECAY] Error applying lazy decay for user {user_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "data": None, "error": str(e)},
+        )
+
+
+@router.post(
+    "/decay/apply-cron/{user_id}",
+    summary="Simulate cron-based batch decay",
+    description=(
+        "Demonstrates the CRON JOB approach: applies decay to ALL behaviors for a user "
+        "in a single batch operation, regardless of whether they are being accessed. "
+        "This simulates what a scheduled background job would do."
+    ),
+)
+def trigger_cron_decay(user_id: str):
+    """
+    Simulate a cron-job-style batch decay for all behaviors.
+    Unlike lazy decay (triggered during retrieval), this applies to all behaviors
+    proactively, like a scheduled background task would.
+    """
+    try:
+        from db.connection import get_db_pool_connection
+
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        behavior_id, behavior_text, credibility, decay_rate,
+                        last_decay_applied_at, intent, reinforcement_count,
+                        behavior_state
+                    FROM behaviors
+                    WHERE user_id = %s
+                    ORDER BY last_seen_at DESC
+                    """,
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+
+                current_time = int(time.time())
+                results = []
+                updates = []
+
+                for row in rows:
+                    (
+                        behavior_id, behavior_text, stored_cred, decay_rate_val,
+                        last_decay_applied_at, intent, reinforcement_count,
+                        behavior_state
+                    ) = row
+
+                    new_cred, applied, days_elapsed = apply_lazy_decay(
+                        stored_credibility=float(stored_cred),
+                        decay_rate=float(decay_rate_val),
+                        last_decay_applied_at=last_decay_applied_at,
+                        current_time=current_time,
+                    )
+
+                    entry = {
+                        "behavior_id": behavior_id,
+                        "behavior_text": behavior_text,
+                        "intent": intent,
+                        "before_credibility": float(stored_cred),
+                        "after_credibility": new_cred,
+                        "credibility_loss": float(stored_cred) - new_cred,
+                        "decay_rate": float(decay_rate_val),
+                        "days_elapsed": days_elapsed,
+                        "decay_applied": applied,
+                    }
+                    results.append(entry)
+
+                    if applied:
+                        updates.append((new_cred, current_time, behavior_id, user_id))
+
+                # Cron approach: batch update ALL in a single transaction
+                if updates:
+                    cur.executemany(
+                        """
+                        UPDATE behaviors
+                        SET credibility = %s,
+                            last_decay_applied_at = %s
+                        WHERE behavior_id = %s AND user_id = %s
+                        """,
+                        updates,
+                    )
+                    conn.commit()
+                    logger.info(
+                        f"[CRON DECAY] Batch-updated {len(updates)} behaviors "
+                        f"for user {user_id}"
+                    )
+
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "data": {
+                    "user_id": user_id,
+                    "mode": "cron",
+                    "applied_at": current_time,
+                    "total_behaviors": len(results),
+                    "total_decayed": len(updates),
+                    "total_unchanged": len(results) - len(updates),
+                    "behaviors": results,
+                },
+                "error": None,
+            },
+        )
+    except Exception as e:
+        logger.exception(f"[DECAY] Error applying cron decay for user {user_id}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "data": None, "error": str(e)},
+        )
+
+
+@router.get(
+    "/decay/simulate",
+    summary="Simulate decay curves",
+    description=(
+        "Generate simulated decay curves for all intent types over a specified number "
+        "of days. Useful for visualising how different intent types decay over time."
+    ),
+)
+def simulate_decay_curves(
+    days: int = Query(90, description="Number of days to simulate", ge=1, le=365),
+    initial_credibility: float = Query(
+        0.85, description="Starting credibility", ge=0.0, le=1.0
+    ),
+):
+    """Generate decay curve data points for visualization."""
+    curves = {}
+    for intent, rate in INTENT_DECAY_RATES.items():
+        points = []
+        for day in range(0, days + 1):
+            cred = initial_credibility * math.exp(-rate * day)
+            points.append({"day": day, "credibility": round(cred, 4)})
+        curves[intent] = {"decay_rate": rate, "points": points}
+
+    # Also add DEFAULT
+    default_points = []
+    for day in range(0, days + 1):
+        cred = initial_credibility * math.exp(-DEFAULT_DECAY_RATE * day)
+        default_points.append({"day": day, "credibility": round(cred, 4)})
+    curves["DEFAULT"] = {"decay_rate": DEFAULT_DECAY_RATE, "points": default_points}
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "success": True,
+            "data": {
+                "initial_credibility": initial_credibility,
+                "days_simulated": days,
+                "grace_period_days": DECAY_GRACE_PERIOD_DAYS,
+                "curves": curves,
+            },
+            "error": None,
+        },
+    )

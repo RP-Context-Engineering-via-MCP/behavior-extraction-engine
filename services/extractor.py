@@ -1810,7 +1810,7 @@ def _process_candidate_with_tracking(
         # Same polarity → duplicate if context matches
         if same_context:
             logger.info(f"DUPLICATE ({context_relation}) → reinforcing {existing.behavior_id}")
-            reinforce_behavior(
+            reinforce_result = reinforce_behavior(
                 behavior_id=existing.behavior_id,
                 user_id=user_id,
                 segment_id=segment_id
@@ -1824,6 +1824,13 @@ def _process_candidate_with_tracking(
                 matched_behavior_id=existing.behavior_id,
                 matched_behavior_text=existing.behavior_text,
                 distance=existing.distance,
+                reinforcement_info={
+                    "credibility_before": round(existing.credibility, 4),
+                    "credibility_after": round(reinforce_result.new_credibility, 4) if reinforce_result.success else None,
+                    "credibility_boost": round(reinforce_result.credibility_boost, 4) if reinforce_result.success else None,
+                    "reinforcement_count_before": existing.reinforcement_count if hasattr(existing, 'reinforcement_count') else None,
+                    "reinforcement_count_after": reinforce_result.new_reinforcement_count if reinforce_result.success else None,
+                },
                 details=f"Reinforced existing behavior (context match: {context_relation})"
             )
             return (True, flow_info)

@@ -490,6 +490,7 @@ class BehaviorFlowInfo(BaseModel):
     matched_behavior_text: Optional[str] = Field(None, description="Text of matched existing behavior")
     distance: Optional[float] = Field(None, description="Semantic distance to matched behavior")
     conflict_info: Optional[dict] = Field(None, description="Conflict details if conflict detected")
+    reinforcement_info: Optional[dict] = Field(None, description="Reinforcement details (credibility before/after, boost, count)")
     stored_behavior_id: Optional[str] = Field(None, description="ID of stored behavior (if saved)")
     details: Optional[str] = Field(None, description="Additional details about the action taken")
 
