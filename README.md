@@ -162,8 +162,7 @@ Content-Type: application/json
 
 {
   "prompt": "I prefer Python over JavaScript for backend development.",
-  "user_id": "user_12345",
-  "session_id": "session_001"  // Optional, defaults to "default"
+  "session_id": "user_12345"
 }
 ```
 
@@ -183,7 +182,7 @@ Content-Type: application/json
       "total_behaviors_stored": 1,
       "behaviors_filtered": 0
     },
-    "user_id": "user_12345"
+    "session_id": "user_12345"
   }
 }
 ```
@@ -197,8 +196,7 @@ Content-Type: application/json
 
 {
   "prompt": "I like working on frontend projects in React",
-  "user_id": "user_12345",
-  "session_id": "session_001"  // Optional, defaults to "default"
+  "session_id": "user_12345"
 }
 ```
 
