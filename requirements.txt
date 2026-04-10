@@ -7,11 +7,13 @@ openai==1.57.4
 
 # Database & Vector Support
 psycopg[binary]==3.2.3
+psycopg-pool==3.2.3
 pgvector==0.3.6
 supabase==2.11.0
 
 # Data Validation
 pydantic==2.10.4
+pydantic-settings==2.7.1
 
 # Environment Variables
 python-dotenv==1.0.1
@@ -19,5 +21,17 @@ python-dotenv==1.0.1
 # HTTP Client (dependency for openai/supabase)
 httpx==0.28.1
 
+# Sentence Transformers — local embedding model (all-MiniLM-L6-v2, 384 dimensions)
+# torch is installed as a transitive dep; pin CPU-only wheel via Dockerfile pip index
+sentence-transformers==3.3.0
+torch==2.3.0
+
+# Redis (for event publishing to Drift Detection Service)
+redis==5.0.1
+
 # Utility
 typing-extensions==4.12.2
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0

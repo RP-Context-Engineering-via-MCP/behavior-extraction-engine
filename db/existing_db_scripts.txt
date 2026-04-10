@@ -1,0 +1,329 @@
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- CREATE TABLE public.prompt_segments (
+--   segment_id        text PRIMARY KEY,
+--   user_id           text NOT NULL,
+--   segment_text      text NOT NULL,
+--   created_at        bigint NOT NULL
+-- );
+
+CREATE TABLE prompt_segments (
+    segment_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id TEXT NOT NULL,
+    segment_text TEXT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+
+CREATE INDEX idx_user_segments
+  ON public.prompt_segments (user_id);
+
+
+CREATE TABLE public.behaviors (
+  behavior_id            text,
+  user_id                text NOT NULL,
+  session_id             text NOT NULL,
+  behavior_text          text NOT NULL,
+  embedding              vector(3072),
+  credibility             double precision,
+  extraction_confidence   double precision,
+  clarity_score           double precision,
+  linguistic_strength     double precision,
+  decay_rate              double precision,
+  reinforcement_count     integer,
+  created_at              bigint,
+  last_seen_at            bigint,
+  prompt_history_ids      text[],
+  PRIMARY KEY (behavior_id, user_id)
+)
+PARTITION BY LIST (user_id);
+
+-- Create default partition to catch all user_ids
+CREATE TABLE IF NOT EXISTS public.behaviors_default
+  PARTITION OF public.behaviors
+  DEFAULT;
+
+-- Add behavior_state column with constraint
+ALTER TABLE behaviors 
+ADD COLUMN behavior_state TEXT DEFAULT 'ACTIVE' 
+CHECK (behavior_state IN ('NEW', 'ACTIVE', 'SUPERSEDED', 'FLAGGED', 'ARCHIVED'));
+
+-- Add superseded_by_id for tracking replacements
+ALTER TABLE behaviors 
+ADD COLUMN superseded_by_id TEXT;
+
+-- Add related_behaviors for storing similarity relationships
+ALTER TABLE behaviors 
+ADD COLUMN related_behaviors JSONB DEFAULT '[]';
+
+-- Add last_decay_applied_at for tracking decay application
+ALTER TABLE behaviors 
+ADD COLUMN last_decay_applied_at BIGINT;
+
+-- Add context_notes for context-dependent behaviors
+ALTER TABLE behaviors 
+ADD COLUMN context_notes TEXT;
+
+-- Create indexes for efficient queries
+CREATE INDEX idx_behaviors_state 
+ON behaviors(user_id, behavior_state);
+
+CREATE INDEX idx_behaviors_last_seen 
+ON behaviors(user_id, last_seen_at);
+
+CREATE INDEX idx_behaviors_credibility 
+ON behaviors(user_id, credibility DESC) 
+WHERE behavior_state = 'ACTIVE';
+
+
+-- Check if columns added successfully
+SELECT column_name, data_type, column_default 
+FROM information_schema.columns 
+WHERE table_name = 'behaviors' 
+AND column_name IN ('behavior_state', 'superseded_by_id', 'related_behaviors', 'last_decay_applied_at', 'context_notes');
+
+
+
+-- Create behavior_conflicts table
+CREATE TABLE behavior_conflicts (
+    conflict_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id TEXT NOT NULL,
+    behavior_id_1 TEXT NOT NULL,
+    behavior_id_2 TEXT NOT NULL,
+    conflict_type TEXT NOT NULL CHECK (conflict_type IN ('RESOLVABLE', 'USER_DECISION_NEEDED')),
+    similarity_distance FLOAT NOT NULL,
+    llm_analysis TEXT,
+    resolution_status TEXT NOT NULL DEFAULT 'PENDING' 
+        CHECK (resolution_status IN ('PENDING', 'AUTO_RESOLVED', 'USER_RESOLVED', 'EXPIRED')),
+    resolved_at BIGINT,
+    resolution_choice TEXT,
+    created_at BIGINT NOT NULL,
+    
+    -- Foreign key constraints reference composite PK (behavior_id, user_id)
+    -- Both behaviors must belong to the same user (enforced by conflict detection logic)
+    CONSTRAINT fk_conflict_behavior_1 
+        FOREIGN KEY (behavior_id_1, user_id) 
+        REFERENCES behaviors(behavior_id, user_id) 
+        ON DELETE CASCADE,
+    
+    CONSTRAINT fk_conflict_behavior_2 
+        FOREIGN KEY (behavior_id_2, user_id) 
+        REFERENCES behaviors(behavior_id, user_id) 
+        ON DELETE CASCADE
+);
+
+-- Create indexes for efficient conflict queries
+CREATE INDEX idx_conflicts_user 
+ON behavior_conflicts(user_id, resolution_status);
+
+CREATE INDEX idx_conflicts_pending 
+ON behavior_conflicts(user_id, created_at) 
+WHERE resolution_status = 'PENDING';
+
+CREATE INDEX idx_conflicts_behaviors 
+ON behavior_conflicts(behavior_id_1, behavior_id_2);
+
+
+CREATE TABLE user_confirmation_queue (
+    request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id TEXT NOT NULL,
+    conflict_id UUID,
+    question TEXT NOT NULL,
+    options JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING' 
+        CHECK (status IN ('PENDING', 'RESOLVED', 'EXPIRED')),
+    user_response TEXT,
+    responded_at BIGINT,
+    created_at BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    
+    -- Foreign key constraint
+    CONSTRAINT fk_confirmation_conflict 
+        FOREIGN KEY (conflict_id) 
+        REFERENCES behavior_conflicts(conflict_id) 
+        ON DELETE CASCADE
+);
+
+-- Create indexes for efficient queries
+CREATE INDEX idx_confirmation_user 
+ON user_confirmation_queue(user_id, status);
+
+CREATE INDEX idx_confirmation_pending 
+ON user_confirmation_queue(status, expires_at) 
+WHERE status = 'PENDING';
+
+CREATE INDEX idx_confirmation_user_pending 
+ON user_confirmation_queue(user_id, created_at) 
+WHERE status = 'PENDING';
+
+SELECT COUNT(*) as total_behaviors,
+       COUNT(DISTINCT user_id) as unique_users
+FROM behaviors;
+
+
+-- Add behavior_state column with constraint
+ALTER TABLE behaviors 
+ADD COLUMN behavior_state TEXT DEFAULT 'ACTIVE' 
+CHECK (behavior_state IN ('NEW', 'ACTIVE', 'SUPERSEDED', 'FLAGGED', 'ARCHIVED'));
+
+-- Add superseded_by_id for tracking replacements
+ALTER TABLE behaviors 
+ADD COLUMN superseded_by_id TEXT;
+
+-- Add related_behaviors for storing similarity relationships
+ALTER TABLE behaviors 
+ADD COLUMN related_behaviors JSONB DEFAULT '[]';
+
+-- Add last_decay_applied_at for tracking decay application
+ALTER TABLE behaviors 
+ADD COLUMN last_decay_applied_at BIGINT;
+
+-- Add context_notes for context-dependent behaviors
+ALTER TABLE behaviors 
+ADD COLUMN context_notes TEXT;
+
+-- Create indexes for efficient queries
+CREATE INDEX idx_behaviors_state 
+ON behaviors(user_id, behavior_state);
+
+CREATE INDEX idx_behaviors_last_seen 
+ON behaviors(user_id, last_seen_at);
+
+CREATE INDEX idx_behaviors_credibility 
+ON behaviors(user_id, credibility DESC) 
+WHERE behavior_state = 'ACTIVE';
+
+
+-- Check if columns added successfully
+SELECT column_name, data_type, column_default 
+FROM information_schema.columns 
+WHERE table_name = 'behaviors' 
+AND column_name IN ('behavior_state', 'superseded_by_id', 'related_behaviors', 'last_decay_applied_at', 'context_notes');
+
+
+
+-- Create behavior_conflicts table
+CREATE TABLE behavior_conflicts (
+    conflict_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id TEXT NOT NULL,
+    behavior_id_1 TEXT NOT NULL,
+    behavior_id_2 TEXT NOT NULL,
+    conflict_type TEXT NOT NULL CHECK (conflict_type IN ('RESOLVABLE', 'USER_DECISION_NEEDED')),
+    similarity_distance FLOAT NOT NULL,
+    llm_analysis TEXT,
+    resolution_status TEXT NOT NULL DEFAULT 'PENDING' 
+        CHECK (resolution_status IN ('PENDING', 'AUTO_RESOLVED', 'USER_RESOLVED', 'EXPIRED')),
+    resolved_at BIGINT,
+    resolution_choice TEXT,
+    created_at BIGINT NOT NULL,
+    
+    -- Foreign key constraints reference composite PK (behavior_id, user_id)
+    -- Both behaviors must belong to the same user (enforced by conflict detection logic)
+    CONSTRAINT fk_conflict_behavior_1 
+        FOREIGN KEY (behavior_id_1, user_id) 
+        REFERENCES behaviors(behavior_id, user_id) 
+        ON DELETE CASCADE,
+    
+    CONSTRAINT fk_conflict_behavior_2 
+        FOREIGN KEY (behavior_id_2, user_id) 
+        REFERENCES behaviors(behavior_id, user_id) 
+        ON DELETE CASCADE
+);
+
+-- Create indexes for efficient conflict queries
+CREATE INDEX idx_conflicts_user 
+ON behavior_conflicts(user_id, resolution_status);
+
+CREATE INDEX idx_conflicts_pending 
+ON behavior_conflicts(user_id, created_at) 
+WHERE resolution_status = 'PENDING';
+
+CREATE INDEX idx_conflicts_behaviors 
+ON behavior_conflicts(behavior_id_1, behavior_id_2);
+
+
+CREATE TABLE user_confirmation_queue (
+    request_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id TEXT NOT NULL,
+    conflict_id UUID,
+    question TEXT NOT NULL,
+    options JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING' 
+        CHECK (status IN ('PENDING', 'RESOLVED', 'EXPIRED')),
+    user_response TEXT,
+    responded_at BIGINT,
+    created_at BIGINT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    
+    -- Foreign key constraint
+    CONSTRAINT fk_confirmation_conflict 
+        FOREIGN KEY (conflict_id) 
+        REFERENCES behavior_conflicts(conflict_id) 
+        ON DELETE CASCADE
+);
+
+-- Create indexes for efficient queries
+CREATE INDEX idx_confirmation_user 
+ON user_confirmation_queue(user_id, status);
+
+CREATE INDEX idx_confirmation_pending 
+ON user_confirmation_queue(status, expires_at) 
+WHERE status = 'PENDING';
+
+CREATE INDEX idx_confirmation_user_pending 
+ON user_confirmation_queue(user_id, created_at) 
+WHERE status = 'PENDING';
+
+ALTER TABLE behaviors 
+ADD COLUMN IF NOT EXISTS intent VARCHAR(20),
+ADD COLUMN IF NOT EXISTS target VARCHAR(200),
+ADD COLUMN IF NOT EXISTS context VARCHAR(100),
+ADD COLUMN IF NOT EXISTS polarity VARCHAR(10);
+
+CREATE INDEX IF NOT EXISTS idx_behaviors_intent_target 
+ON behaviors(user_id, intent, target) 
+WHERE behavior_state = 'ACTIVE';
+
+CREATE INDEX IF NOT EXISTS idx_behaviors_canonical_lookup 
+ON behaviors(user_id, intent, target, context) 
+WHERE behavior_state = 'ACTIVE';
+
+CREATE INDEX IF NOT EXISTS idx_behaviors_polarity 
+ON behaviors(user_id, polarity) 
+WHERE behavior_state IN ('ACTIVE', 'FLAGGED');
+
+-- ============================================================================
+-- TGHR (Tuple-Guided Hybrid Retrieval) Migration
+-- Adds tsvector column for BM25/sparse text search alongside dense embeddings
+-- ============================================================================
+
+-- 1. Add the tsvector column for full-text search (sparse retrieval)
+ALTER TABLE behaviors
+ADD COLUMN IF NOT EXISTS search_vector tsvector;
+
+-- 2. Create GIN index on tsvector column for fast full-text search
+CREATE INDEX IF NOT EXISTS idx_behaviors_search_vector
+ON behaviors USING GIN (search_vector);
+
+-- 3. Backfill existing rows: generate search_vector from behavior_text + target + context
+-- Using enriched tsvector for better BM25 recall — matches on target ("running", "sleep")
+-- and context ("before morning workout") that behavior_text alone may not contain.
+UPDATE behaviors
+SET search_vector = to_tsvector('english', behavior_text || ' ' || COALESCE(target, '') || ' ' || COALESCE(context, ''))
+WHERE search_vector IS NULL
+   OR search_vector = to_tsvector('english', behavior_text);  -- re-backfill old narrow vectors
+
+-- 4. Composite index for metadata pre-filtering + intent filtering used in hybrid search
+CREATE INDEX IF NOT EXISTS idx_behaviors_hybrid_filter
+ON behaviors(user_id, session_id, intent)
+WHERE behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED');
+
+-- ============================================================================
+-- Drift Detection Integration - Add polarity/target fields to behavior_conflicts
+-- Used by PreferenceReversalDetector to efficiently detect polarity flips
+-- ============================================================================
+
+ALTER TABLE behavior_conflicts 
+ADD COLUMN IF NOT EXISTS old_polarity TEXT,
+ADD COLUMN IF NOT EXISTS new_polarity TEXT,
+ADD COLUMN IF NOT EXISTS old_target TEXT,
+ADD COLUMN IF NOT EXISTS new_target TEXT;

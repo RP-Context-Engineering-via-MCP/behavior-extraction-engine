@@ -1,0 +1,54 @@
+services:
+  # FastAPI Application
+  app:
+    build: .
+    container_name: behavior-extraction-engine
+    ports:
+      - "8001:8001"   # host:8001 → container:8001
+    environment:
+      # Port uvicorn listens on inside the container
+      PORT: "8001"
+
+      # Database Configuration (using Supabase from .env)
+      DATABASE_URL: ${DATABASE_URL}
+      
+      # Redis Configuration (using shared Redis)
+      REDIS_URL: redis://shared-redis:6379/0
+      REDIS_STREAM_NAME: behavior.events
+      REDIS_EVENTS_ENABLED: "true"
+      
+      # Azure OpenAI Configuration (set these in .env file)
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY}
+      
+      # Sentence-transformers / Hugging Face model cache
+      # Must match the path baked into the image by the Dockerfile
+      HF_HOME: /app/.cache/huggingface
+      SENTENCE_TRANSFORMERS_HOME: /app/.cache/sentence_transformers
+
+      # Application Configuration
+      SAMPLE_USERID: ${SAMPLE_USERID:-user_12345}
+      USER_MANAGEMENT_SERVICE_BASE_URL: ${USER_MANAGEMENT_SERVICE_BASE_URL:-http://user-management-service:8080}
+      PROFILE_SIGNALS_DEFAULT_LIMIT: ${PROFILE_SIGNALS_DEFAULT_LIMIT:-10}
+      PROFILE_SIGNALS_MAX_LIMIT: ${PROFILE_SIGNALS_MAX_LIMIT:-50}
+    
+    volumes:
+      - ./:/app
+      # Persist the downloaded embedding model across container rebuilds.
+      # Remove this volume entry if you prefer the model to always come
+      # from the image layer baked in during docker build.
+      - model-cache:/app/.cache
+    
+    networks:
+      - shared-network
+    
+    restart: unless-stopped
+
+volumes:
+  model-cache:
+    driver: local
+
+networks:
+  shared-network:
+    external: true
+    name: shared-network
