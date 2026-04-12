@@ -37,8 +37,7 @@ A sophisticated behavior extraction and management system that uses AI to detect
 │   ├── behaviorRepository.py       # Database operations and queries
 │   ├── credibilityCalculator.py    # Credibility and reinforcement calculation
 │   ├── extractor.py                # Main behavior extraction orchestration
-│   ├── openAiClient.py             # Azure OpenAI integration
-│   └── supabaseClient.py           # Supabase client (optional)
+│   └── openAiClient.py             # Azure OpenAI integration
 ├── utils/
 │   ├── __init__.py
 │   ├── embedding_utils.py          # Embedding generation utilities
