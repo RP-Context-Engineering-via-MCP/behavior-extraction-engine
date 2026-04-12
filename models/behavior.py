@@ -156,7 +156,11 @@ class StoredBehavior(BaseModel):
     )
     embedding: Optional[List[float]] = Field(
         None,
-        description="Vector embedding of behavior_text for semantic search"
+        description="Vector embedding of behavior_text for semantic search (LLM context retrieval)"
+    )
+    canonical_embedding: Optional[List[float]] = Field(
+        None,
+        description="Vector embedding of canonical tuple for duplicate/conflict detection at store-time"
     )
     # Canonical behavior fields (added with canonical behavior refactor)
     intent: Optional[Literal["PREFERENCE", "CONSTRAINT", "HABIT", "SKILL", "COMMUNICATION"]] = Field(
@@ -181,6 +185,13 @@ class StoredBehavior(BaseModel):
         """Ensure embedding has correct dimensions for all-MiniLM-L6-v2."""
         if v is not None and len(v) != 384:
             raise ValueError(f"Embedding must be 384-dimensional, got {len(v)}")
+        return v
+
+    @field_validator('canonical_embedding')
+    def validate_canonical_embedding_dimension(cls, v):
+        """Ensure canonical_embedding has correct dimensions for all-MiniLM-L6-v2."""
+        if v is not None and len(v) != 384:
+            raise ValueError(f"Canonical embedding must be 384-dimensional, got {len(v)}")
         return v
     
 

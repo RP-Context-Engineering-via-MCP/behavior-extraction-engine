@@ -74,6 +74,7 @@ def insert_behavior(payload: dict):
                     user_id,
                     behavior_text,
                     embedding,
+                    canonical_embedding,
                     credibility,
                     extraction_confidence,
                     clarity_score,
@@ -98,6 +99,7 @@ def insert_behavior(payload: dict):
                     %(user_id)s,
                     %(behavior_text)s,
                     %(embedding)s,
+                    %(canonical_embedding)s,
                     %(credibility)s,
                     %(extraction_confidence)s,
                     %(clarity_score)s,
@@ -811,10 +813,10 @@ def search_similar_behaviors(
                 # SESSION ISOLATION: Only search within the same session_id
                 cur.execute(
                     """
-                    SELECT 
-                        behavior_id, 
+                    SELECT
+                        behavior_id,
                         behavior_text,
-                        embedding <=> %s::vector AS distance,
+                        canonical_embedding <=> %s::vector AS distance,
                         credibility,
                         last_seen_at,
                         reinforcement_count,
@@ -828,6 +830,7 @@ def search_similar_behaviors(
                     WHERE user_id = %s
                     AND session_id = %s
                     AND behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED')
+                    AND canonical_embedding IS NOT NULL
                     ORDER BY distance
                     LIMIT %s;
                     """,

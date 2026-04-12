@@ -19,6 +19,7 @@ from models.behavior import (
     DetailedExtractionResult
 )
 from services.openAiClient import extract_behavior, embed_text, analyze_conflict, extract_behavior_with_history
+from utils.embedding_utils import get_canonical_embedding
 from services.credibilityCalculator import calculate_initial_credibility, should_store_behavior, get_decay_rate
 from services.behaviorRepository import (
     insert_behavior, 
@@ -488,6 +489,7 @@ def _create_stored_behavior(
     confidence: float,
     linguistic_strength: float,
     embedding_vector: List[float],
+    canonical_embedding_vector: List[float],
     segment_id: str,
     canonical: CanonicalBehavior,
     session_id: str = "default"
@@ -515,6 +517,7 @@ def _create_stored_behavior(
         linguistic_strength=linguistic_strength,
         decay_rate=decay_rate,
         embedding=embedding_vector,
+        canonical_embedding=canonical_embedding_vector,
         created_at=current_time,
         last_seen_at=current_time,
         last_decay_applied_at=decay_starts_at,
@@ -598,6 +601,7 @@ def _handle_llm_conflict_analysis(
     confidence: float,
     linguistic_strength: float,
     embedding_vector: List[float],
+    canonical_embedding_vector: List[float],
     segment_id: str,
     canonical: CanonicalBehavior,
     stored_behaviors: List[StoredBehavior],
@@ -631,6 +635,7 @@ def _handle_llm_conflict_analysis(
         confidence=confidence,
         linguistic_strength=linguistic_strength,
         embedding_vector=embedding_vector,
+        canonical_embedding_vector=canonical_embedding_vector,
         segment_id=segment_id,
         canonical=canonical,
         session_id=session_id
@@ -680,6 +685,7 @@ def _handle_polarity_conflict(
     confidence: float,
     linguistic_strength: float,
     embedding_vector: List[float],
+    canonical_embedding_vector: List[float],
     segment_id: str,
     canonical: CanonicalBehavior,
     stored_behaviors: List[StoredBehavior],
@@ -709,7 +715,7 @@ def _handle_polarity_conflict(
             f"AUTO-RESOLVE: Superseding {existing.behavior_id} "
             f"with new behavior (credibility: {initial_credibility:.2f} > {existing.credibility:.2f})"
         )
-        
+
         stored = _create_stored_behavior(
             user_id=user_id,
             behavior_description=behavior_description,
@@ -718,11 +724,12 @@ def _handle_polarity_conflict(
             confidence=confidence,
             linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
+            canonical_embedding_vector=canonical_embedding_vector,
             segment_id=segment_id,
             canonical=canonical,
             session_id=session_id
         )
-        
+
         _supersede_existing_behavior(
             existing_behavior_id=existing.behavior_id,
             user_id=user_id,
@@ -754,6 +761,7 @@ def _handle_polarity_conflict(
             confidence=confidence,
             linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
+            canonical_embedding_vector=canonical_embedding_vector,
             segment_id=segment_id,
             canonical=canonical,
             stored_behaviors=stored_behaviors,
@@ -772,6 +780,7 @@ def _handle_potential_conflict(
     confidence: float,
     linguistic_strength: float,
     embedding_vector: List[float],
+    canonical_embedding_vector: List[float],
     segment_id: str,
     canonical: CanonicalBehavior,
     stored_behaviors: List[StoredBehavior],
@@ -812,6 +821,7 @@ def _handle_potential_conflict(
         confidence=confidence,
         linguistic_strength=linguistic_strength,
         embedding_vector=embedding_vector,
+        canonical_embedding_vector=canonical_embedding_vector,
         segment_id=segment_id,
         canonical=canonical,
         session_id=session_id
@@ -1056,6 +1066,7 @@ def _process_relationships(
     confidence: float,
     linguistic_strength: float,
     embedding_vector: List[float],
+    canonical_embedding_vector: List[float],
     segment_id: str,
     stored_behaviors: List[StoredBehavior],
     session_id: str = "default"
@@ -1130,6 +1141,7 @@ def _process_relationships(
                 confidence=confidence,
                 linguistic_strength=linguistic_strength,
                 embedding_vector=embedding_vector,
+                canonical_embedding_vector=canonical_embedding_vector,
                 segment_id=segment_id,
                 canonical=canonical,
                 stored_behaviors=stored_behaviors,
@@ -1168,6 +1180,7 @@ def _process_relationships(
                 confidence=confidence,
                 linguistic_strength=linguistic_strength,
                 embedding_vector=embedding_vector,
+                canonical_embedding_vector=canonical_embedding_vector,
                 segment_id=segment_id,
                 canonical=canonical,
                 stored_behaviors=stored_behaviors,
@@ -1175,7 +1188,7 @@ def _process_relationships(
             )
             if decision_taken:
                 return True
-    
+
     # ==================================================================
     # STEP 4: Handle POTENTIAL CONFLICTS (LLM-based analysis)
     # ==================================================================
@@ -1195,6 +1208,7 @@ def _process_relationships(
                 confidence=confidence,
                 linguistic_strength=linguistic_strength,
                 embedding_vector=embedding_vector,
+                canonical_embedding_vector=canonical_embedding_vector,
                 segment_id=segment_id,
                 canonical=canonical,
                 stored_behaviors=stored_behaviors,
@@ -1288,8 +1302,18 @@ def store_behavior(
             )
 
             # ==============================================================
-            # 4️⃣ Embed FULL behavior text (retrieval purpose)
+            # 4️⃣ Generate DUAL embeddings
+            #    a) Canonical embedding → duplicate/conflict detection
+            #    b) Prose embedding     → LLM context retrieval
             # ==============================================================
+            try:
+                canonical_embedding_vector = get_canonical_embedding(canonical)
+            except Exception as e:
+                logger.error(
+                    f"Canonical embedding failed for '{behavior.description}': {e}"
+                )
+                continue
+
             try:
                 embedding_vector = embed_text(behavior.description)
             except Exception as e:
@@ -1299,12 +1323,12 @@ def store_behavior(
                 continue
 
             # ==============================================================
-            # 5️⃣ Retrieve candidate behaviors
+            # 5️⃣ Retrieve candidate behaviors (using canonical embedding)
             # ==============================================================
             try:
                 candidates = search_similar_behaviors(
                     user_id=user_id,
-                    query_embedding=embedding_vector,
+                    query_embedding=canonical_embedding_vector,
                     session_id=session_id,
                     limit=10
                 )
@@ -1345,6 +1369,7 @@ def store_behavior(
                 confidence=behavior.confidence,
                 linguistic_strength=behavior.linguistic_strength,
                 embedding_vector=embedding_vector,
+                canonical_embedding_vector=canonical_embedding_vector,
                 segment_id=segment_id,
                 stored_behaviors=stored_behaviors,
                 session_id=session_id
@@ -1371,6 +1396,7 @@ def store_behavior(
                 confidence=behavior.confidence,
                 linguistic_strength=behavior.linguistic_strength,
                 embedding_vector=embedding_vector,
+                canonical_embedding_vector=canonical_embedding_vector,
                 segment_id=segment_id,
                 canonical=canonical,
                 session_id=session_id
@@ -1495,7 +1521,28 @@ def store_behavior_with_tracking(
                 f"context={canonical.context}, polarity={canonical.polarity}"
             )
             
-            # 4️⃣ Embed FULL behavior text
+            # 4️⃣ Generate DUAL embeddings
+            #    a) Canonical embedding → duplicate/conflict detection
+            #    b) Prose embedding     → LLM context retrieval
+            try:
+                canonical_embedding_vector = get_canonical_embedding(canonical)
+            except Exception as e:
+                logger.error(f"Canonical embedding failed for '{behavior.description}': {e}")
+                flow_tracking.append(BehaviorFlowInfo(
+                    behavior_description=behavior.description,
+                    action=BehaviorFlowAction.PRUNED,
+                    credibility=initial_credibility,
+                    canonical={
+                        "intent": canonical.intent,
+                        "target": canonical.target,
+                        "context": canonical.context,
+                        "polarity": canonical.polarity
+                    },
+                    details=f"Canonical embedding generation failed: {str(e)}"
+                ))
+                total_pruned += 1
+                continue
+
             try:
                 embedding_vector = embed_text(behavior.description)
             except Exception as e:
@@ -1514,12 +1561,12 @@ def store_behavior_with_tracking(
                 ))
                 total_pruned += 1
                 continue
-            
-            # 5️⃣ Retrieve candidate behaviors
+
+            # 5️⃣ Retrieve candidate behaviors (using canonical embedding)
             try:
                 candidates = search_similar_behaviors(
                     user_id=user_id,
-                    query_embedding=embedding_vector,
+                    query_embedding=canonical_embedding_vector,
                     session_id=session_id,
                     limit=5
                 )
@@ -1557,6 +1604,7 @@ def store_behavior_with_tracking(
                     confidence=behavior.confidence,
                     linguistic_strength=behavior.linguistic_strength,
                     embedding_vector=embedding_vector,
+                    canonical_embedding_vector=canonical_embedding_vector,
                     segment_id=segment_id,
                     stored_behaviors=stored_behaviors,
                     session_id=session_id
@@ -1590,16 +1638,17 @@ def store_behavior_with_tracking(
                     confidence=behavior.confidence,
                     linguistic_strength=behavior.linguistic_strength,
                     embedding_vector=embedding_vector,
+                    canonical_embedding_vector=canonical_embedding_vector,
                     segment_id=segment_id,
                     canonical=canonical,
                     session_id=session_id
                 )
-                
+
                 try:
                     insert_behavior(stored.model_dump())
                     stored_behaviors.append(stored)
                     total_stored += 1
-                    
+
                     flow_tracking.append(BehaviorFlowInfo(
                         behavior_description=behavior.description,
                         action=BehaviorFlowAction.NEW_BEHAVIOR,
@@ -1655,6 +1704,7 @@ def _process_candidate_with_tracking(
     confidence: float,
     linguistic_strength: float,
     embedding_vector: List[float],
+    canonical_embedding_vector: List[float],
     segment_id: str,
     stored_behaviors: List[StoredBehavior],
     session_id: str = "default"
@@ -1700,6 +1750,7 @@ def _process_candidate_with_tracking(
                     confidence=confidence,
                     linguistic_strength=linguistic_strength,
                     embedding_vector=embedding_vector,
+                    canonical_embedding_vector=canonical_embedding_vector,
                     segment_id=segment_id,
                     canonical=canonical
                 )
@@ -1709,7 +1760,7 @@ def _process_candidate_with_tracking(
                     stored=stored
                 )
                 stored_behaviors.append(stored)
-                
+
                 flow_info = BehaviorFlowInfo(
                     behavior_description=behavior_description,
                     action=BehaviorFlowAction.SUPERSEDED_EXISTING,
@@ -1759,7 +1810,7 @@ def _process_candidate_with_tracking(
                     behavior_2_text=behavior_description,
                     distance=existing.distance
                 )
-                
+
                 stored = _create_stored_behavior(
                     user_id=user_id,
                     behavior_description=behavior_description,
@@ -1768,11 +1819,12 @@ def _process_candidate_with_tracking(
                     confidence=confidence,
                     linguistic_strength=linguistic_strength,
                     embedding_vector=embedding_vector,
+                    canonical_embedding_vector=canonical_embedding_vector,
                     segment_id=segment_id,
                     canonical=canonical,
                     session_id=session_id
                 )
-                
+
                 _flag_and_create_conflict(
                     existing_behavior_id=existing.behavior_id,
                     user_id=user_id,
@@ -1856,11 +1908,12 @@ def _process_candidate_with_tracking(
             confidence=confidence,
             linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
+            canonical_embedding_vector=canonical_embedding_vector,
             segment_id=segment_id,
             canonical=canonical,
             session_id=session_id
         )
-        
+
         if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
             _flag_and_create_conflict(
                 existing_behavior_id=existing.behavior_id,
@@ -1874,7 +1927,7 @@ def _process_candidate_with_tracking(
                 new_target=canonical.target
             )
             stored_behaviors.append(stored)
-            
+
             flow_info = BehaviorFlowInfo(
                 behavior_description=behavior_description,
                 action=BehaviorFlowAction.CONFLICT_DETECTED,

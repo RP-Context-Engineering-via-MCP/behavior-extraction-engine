@@ -3,6 +3,7 @@ Utility functions for generating text embeddings.
 """
 from typing import List
 from services.openAiClient import embed_text
+from models.behavior import CanonicalBehavior
 import logging
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,40 @@ def get_text_embedding(text: str) -> List[float]:
         return embedding
     except Exception as e:
         logger.error(f"Failed to generate embedding: {str(e)}")
+        raise
+
+
+def get_canonical_embedding(canonical: CanonicalBehavior) -> List[float]:
+    """
+    Get embedding vector for a canonical behavior tuple.
+
+    Produces a normalized embedding from the structured canonical fields,
+    used for duplicate/conflict detection at store-time. This embedding
+    collapses paraphrastic variation so that behaviours with identical
+    canonical meaning land close together in vector space.
+
+    Args:
+        canonical: CanonicalBehavior with intent, target, context, polarity
+
+    Returns:
+        List of floats representing the embedding vector (384 dimensions)
+
+    Raises:
+        Exception: If embedding generation fails
+    """
+    canonical_text = (
+        f"user {canonical.polarity} {canonical.intent} "
+        f"{canonical.target} in {canonical.context}"
+    )
+    try:
+        embedding = embed_text(canonical_text)
+        logger.info(
+            f"Generated canonical embedding for "
+            f"'{canonical_text}' (dimensions: {len(embedding)})"
+        )
+        return embedding
+    except Exception as e:
+        logger.error(f"Failed to generate canonical embedding: {str(e)}")
         raise
 
 
