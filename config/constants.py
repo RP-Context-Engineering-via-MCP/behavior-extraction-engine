@@ -22,15 +22,15 @@ DECAY_GRACE_PERIOD_SECONDS: int = DECAY_GRACE_PERIOD_DAYS * 24 * 60 * 60  # 604 
 # Intent-based decay rates (per full day):
 #   HABIT       → 0.04  – habits can change quickly
 #   PREFERENCE  → 0.015 – moderately stable
-#   COMMUNICATION → 0.015 – moderately stable
-#   SKILL       → 0.005 – skills persist longer
-#   CONSTRAINT  → 0.001 – most persistent (medical, hard rules)
+#   COMMUNICATION → 0.001 – least stable
+#   SKILL       → 0.004 – skills persist longer
+#   CONSTRAINT  → 0.00015 – most persistent (medical, hard rules)
 INTENT_DECAY_RATES: dict[str, float] = {
     "HABIT": 0.04,
     "PREFERENCE": 0.015,
-    "COMMUNICATION": 0.015,
-    "SKILL": 0.005,
-    "CONSTRAINT": 0.001,
+    "COMMUNICATION": 0.001,
+    "SKILL": 0.004,
+    "CONSTRAINT": 0.00015,
 }
 
 # ---------------------------------------------------------------------------
@@ -176,7 +176,7 @@ INTENT_AFFINITY: dict[frozenset, float] = {
     # CONSTRAINT statements ("always uses dark mode" ≡ "prefers dark mode").
     # Raising these affinities ensures HABIT behaviors surface when a user
     # queries for their preferences or constraints, and vice-versa.
-    frozenset({"HABIT", "CONSTRAINT"}): 0.65,   # was 0.50
+    frozenset({"HABIT", "CON STRAINT"}): 0.65,   # was 0.50
     frozenset({"HABIT", "PREFERENCE"}): 0.60,   # was 0.40
     frozenset({"PREFERENCE", "CONSTRAINT"}): 0.35,
     frozenset({"COMMUNICATION", "PREFERENCE"}): 0.30,
