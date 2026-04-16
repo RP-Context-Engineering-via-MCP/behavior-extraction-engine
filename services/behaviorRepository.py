@@ -145,24 +145,52 @@ def insert_behavior(payload: dict):
 
 def insert_prompt_segment(segment_text: str, user_id: str) -> SegmentInsertResult:
     """
-    Insert a prompt segment into prompt_segments table
-    
+    Insert a prompt segment into prompt_segments table, or return the existing
+    segment_id if the same (user_id, segment_text) pair was already stored.
+
+    Idempotent: re-submitting the same prompt (e.g. network retry or duplicate
+    API call) returns the original segment_id rather than creating a second row,
+    preventing duplicate entries in behaviors.prompt_history_ids.
+
     Args:
         segment_text: The segment text to store
         user_id: User identifier
-        
+
     Returns:
         SegmentInsertResult with success, segment_id, and error fields
     """
     try:
-        # Create PromptSegment model instance (generates ID and timestamp)
-        segment = PromptSegment(
-            user_id=user_id,
-            segment_text=segment_text
-        )
-        
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
+                # Check whether this exact segment already exists for this user.
+                # Using an exact text match — identical prompts from retries or
+                # duplicate calls should reuse the same segment record.
+                cur.execute(
+                    """
+                    SELECT segment_id
+                    FROM prompt_segments
+                    WHERE user_id = %s AND segment_text = %s
+                    LIMIT 1;
+                    """,
+                    (user_id, segment_text)
+                )
+                existing = cur.fetchone()
+                if existing:
+                    segment_id_str = str(existing[0])
+                    logger.info(
+                        f"Reusing existing prompt segment: {segment_id_str} for user: {user_id}"
+                    )
+                    return SegmentInsertResult(
+                        success=True,
+                        segment_id=segment_id_str,
+                        error=None
+                    )
+
+                # New segment — create a PromptSegment model instance (generates ID and timestamp)
+                segment = PromptSegment(
+                    user_id=user_id,
+                    segment_text=segment_text
+                )
                 cur.execute(
                     """
                     INSERT INTO prompt_segments (
@@ -177,18 +205,18 @@ def insert_prompt_segment(segment_text: str, user_id: str) -> SegmentInsertResul
                 )
                 result = cur.fetchone()
                 conn.commit()
-                
+
                 returned_id = result[0] if result else None
                 # Convert UUID to string for Pydantic validation
                 segment_id_str = str(returned_id) if returned_id else None
                 logger.info(f"Inserted prompt segment: {segment_id_str} for user: {user_id}")
-                
+
                 return SegmentInsertResult(
                     success=True,
                     segment_id=segment_id_str,
                     error=None
                 )
-                
+
     except Exception as e:
         logger.error(f"Failed to insert prompt segment: {str(e)}")
         return SegmentInsertResult(
@@ -433,10 +461,14 @@ def _check_and_auto_resolve_conflicts(
                         c.behavior_id_1,
                         c.behavior_id_2,
                         c.created_at,
-                        b1.credibility        AS cred_1,
-                        b1.reinforcement_count AS rc_1,
-                        b2.credibility        AS cred_2,
-                        b2.reinforcement_count AS rc_2
+                        b1.credibility              AS cred_1,
+                        b1.reinforcement_count       AS rc_1,
+                        b1.decay_rate               AS decay_rate_1,
+                        b1.last_decay_applied_at    AS last_decay_1,
+                        b2.credibility              AS cred_2,
+                        b2.reinforcement_count       AS rc_2,
+                        b2.decay_rate               AS decay_rate_2,
+                        b2.last_decay_applied_at    AS last_decay_2
                     FROM behavior_conflicts c
                     JOIN behaviors b1
                       ON b1.behavior_id = c.behavior_id_1 AND b1.user_id = c.user_id
@@ -464,9 +496,26 @@ def _check_and_auto_resolve_conflicts(
                         conflict_id,
                         bid_1, bid_2,
                         created_at,
-                        cred_1, rc_1,
-                        cred_2, rc_2,
+                        stored_cred_1, rc_1, decay_rate_1, last_decay_1,
+                        stored_cred_2, rc_2, decay_rate_2, last_decay_2,
                     ) = row
+
+                    # Apply lazy decay to stored credibilities before comparing.
+                    # Without this, a behavior that hasn't been accessed in months
+                    # retains its stored (inflated) credibility and can incorrectly
+                    # win auto-resolution over a fresher, genuinely stronger behavior.
+                    cred_1, _, _ = apply_lazy_decay(
+                        stored_credibility=float(stored_cred_1),
+                        decay_rate=float(decay_rate_1),
+                        last_decay_applied_at=last_decay_1,
+                        current_time=current_timestamp,
+                    )
+                    cred_2, _, _ = apply_lazy_decay(
+                        stored_credibility=float(stored_cred_2),
+                        decay_rate=float(decay_rate_2),
+                        last_decay_applied_at=last_decay_2,
+                        current_time=current_timestamp,
+                    )
 
                     conflict_age = current_timestamp - created_at
                     reinforcement_gap = abs(int(rc_1) - int(rc_2))
