@@ -97,7 +97,7 @@ CONFLICT_EXPIRY_SECONDS: int = CONFLICT_EXPIRY_DAYS * 24 * 60 * 60  # 2 592 000 
 
 # Maximum cosine distance for a candidate to be considered semantically
 # relevant during the store_behavior pipeline (duplicate / conflict gate).
-SEMANTIC_RELEVANCE_THRESHOLD: float = 0.55
+SEMANTIC_RELEVANCE_THRESHOLD: float = 0.6
 
 # Maximum cosine *distance* value used by the /v2/extract endpoint to
 # decide which retrieved behaviors are returned to the caller as "related".
@@ -176,7 +176,7 @@ INTENT_AFFINITY: dict[frozenset, float] = {
     # CONSTRAINT statements ("always uses dark mode" ≡ "prefers dark mode").
     # Raising these affinities ensures HABIT behaviors surface when a user
     # queries for their preferences or constraints, and vice-versa.
-    frozenset({"HABIT", "CON STRAINT"}): 0.65,   # was 0.50
+    frozenset({"HABIT", "CONSTRAINT"}): 0.65,   # was 0.50
     frozenset({"HABIT", "PREFERENCE"}): 0.60,   # was 0.40
     frozenset({"PREFERENCE", "CONSTRAINT"}): 0.35,
     frozenset({"COMMUNICATION", "PREFERENCE"}): 0.30,

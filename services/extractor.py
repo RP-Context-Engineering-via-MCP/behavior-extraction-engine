@@ -1163,6 +1163,25 @@ def _collect_all_relationships(
                 f"{existing.behavior_id}"
             )
             relationships.append(relation)
+            # TODO: remove below is the test is failing due to multiple relationships being detected for the same candidate
+            # relationships = [r for r in relationships if r.existing_behavior != existing]
+        elif can_intents_conflict(existing.intent, canonical.intent):
+            # SEMANTIC FALLBACK: canonical string rules found no relationship (targets differ —
+            # synonyms, parent/child, or paraphrases like "coffee" vs "caffeine",
+            # "social events" vs "social gatherings", "late night" vs "sleep time").
+            # The candidate is semantically close (passed the distance gate) AND the intents
+            # can potentially conflict, so route to the LLM for a final verdict.
+            logger.info(
+                f"SEMANTIC FALLBACK: '{canonical.target}' vs '{existing.target}' — "
+                f"no canonical rule matched but intents can conflict "
+                f"({existing.intent}/{canonical.intent}), distance={existing.distance:.3f}. "
+                f"Routing to LLM via POTENTIAL_CONFLICT."
+            )
+            relationships.append(BehaviorRelation(
+                existing_behavior=existing,
+                relation_type=RelationType.POTENTIAL_CONFLICT,
+                context_relation="DIFFERENT"
+            ))
     
     # Sort by priority: DUPLICATE > POLARITY_CONFLICT > CROSS_INTENT > POTENTIAL > RELATED > COMPATIBLE
     priority_order = {

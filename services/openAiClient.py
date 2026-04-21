@@ -189,14 +189,36 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
       * "I don't like React, prefer Angular" → Extract ONLY Angular POSITIVE
     - This prevents creating multiple conflicting behaviors from a single preference statement
     
+    ⚠️ SLEEP SCHEDULE CONFLICTS: Behaviors about sleep timing and daily rhythm patterns
+    (night owl, morning person, early riser, staying up late, etc.) MUST use the unified
+    target "sleep schedule" — regardless of wording — so the system can detect when two
+    opposing sleep patterns exist for the same user.
+    Use POLARITY to encode the direction of the pattern:
+      - POSITIVE → night-skewed pattern: stays up late, night owl, up past midnight, goes to bed after midnight
+      - NEGATIVE → morning-skewed pattern: morning person, early bird, in bed by X pm, must sleep early
+    Context should be "general" (do not use "morning" or "night" as context for sleep schedule — these are the polarity).
+
+    Examples:
+      Input:  "I'm a night owl — I stay up past midnight every day"
+      Output: {intent: "HABIT", target: "sleep schedule", context: "general", polarity: "POSITIVE", linguistic_strength: 0.85}
+
+      Input:  "I've become a morning person — I'm in bed by 10pm and up at 5am"
+      Output: {intent: "CONSTRAINT", target: "sleep schedule", context: "general", polarity: "NEGATIVE", linguistic_strength: 0.85}
+
+      Input:  "My sleep specialist told me I must be asleep by 10pm"
+      Output: {intent: "CONSTRAINT", target: "sleep schedule", context: "general", polarity: "NEGATIVE", linguistic_strength: 0.9}
+
+    This ensures "night owl" (POSITIVE) and "morning person" (NEGATIVE) share the same
+    target so the conflict detection pipeline can recognize the contradiction.
+
     MULTI-DOMAIN EXAMPLES:
-    
+
     Input: "I'm vegetarian and cannot eat meat"
     Output: {"intent": "CONSTRAINT", "target": "meat", "context": "general", "polarity": "NEGATIVE", "linguistic_strength": 0.9}
-    
+
     Input: "I prefer working from home in the mornings"
     Output: {"intent": "PREFERENCE", "target": "remote work", "context": "morning", "polarity": "POSITIVE", "linguistic_strength": 0.7}
-    
+
     Input: "I always do yoga before breakfast"
     Output: {"intent": "HABIT", "target": "yoga", "context": "morning", "polarity": "POSITIVE", "linguistic_strength": 0.85}
     
