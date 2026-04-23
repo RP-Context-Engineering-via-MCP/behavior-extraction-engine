@@ -1038,7 +1038,7 @@ def search_similar_behavior_3D(
                 base_conditions = """
                     user_id = %s
                     AND session_id = %s
-                    AND behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED')
+                    AND behavior_state IN ('ACTIVE', 'NEW')
                 """
 
                 query = f"""
@@ -2354,6 +2354,7 @@ def insert_co_occurrences_batch(
     behavior_ids: List[str],
     user_id: str,
     edge_type: str,
+    session_id: str = "default",
 ) -> int:
     """
     Create pairwise co-occurrence edges for a list of behavior IDs.
@@ -2366,6 +2367,7 @@ def insert_co_occurrences_batch(
         behavior_ids: List of behavior IDs that co-occurred.
         user_id: The user who owns these behaviors.
         edge_type: 'CO_PROMPT' or 'CO_SESSION'.
+        session_id: Session in which these behaviors were extracted.
 
     Returns:
         Number of edges written (inserted or updated).
@@ -2392,22 +2394,22 @@ def insert_co_occurrences_batch(
                 cur.executemany(
                     """
                     INSERT INTO behavior_co_occurrences
-                        (behavior_id_1, behavior_id_2, user_id, edge_type, weight, created_at)
-                    VALUES (%s, %s, %s, %s, 1.0, %s)
+                        (behavior_id_1, behavior_id_2, user_id, session_id, edge_type, weight, created_at)
+                    VALUES (%s, %s, %s, %s, %s, 1.0, %s)
                     ON CONFLICT (behavior_id_1, behavior_id_2, edge_type)
                     DO UPDATE SET
                         weight     = behavior_co_occurrences.weight + 0.5,
                         created_at = EXCLUDED.created_at
                     """,
                     [
-                        (a, b, user_id, edge_type, current_timestamp)
+                        (a, b, user_id, session_id, edge_type, current_timestamp)
                         for a, b in pairs
                     ],
                 )
                 conn.commit()
 
         logger.info(
-            f"[GRAPH] Upserted {len(pairs)} {edge_type} edge(s) for user {user_id}"
+            f"[GRAPH] Upserted {len(pairs)} {edge_type} edge(s) for user {user_id} session {session_id}"
         )
         return len(pairs)
 
@@ -2419,6 +2421,7 @@ def insert_co_occurrences_batch(
 def get_graph_expanded_behaviors(
     user_id: str,
     seed_behavior_ids: List[str],
+    session_id: str = "default",
     limit: int = 10,
 ) -> List[dict]:
     """
@@ -2426,16 +2429,22 @@ def get_graph_expanded_behaviors(
 
     Given a set of behavior IDs returned by embedding search, walk
     the co-occurrence graph one hop to find associated behaviors.
-    Results are ranked by ``edge_weight * behavior_credibility`` so
+    Results are ranked by ``edge_weight * decayed_credibility`` so
     that strongly-associated, high-credibility behaviors bubble up.
 
     Only returns behaviors in ACTIVE / NEW state — SUPERSEDED, ARCHIVED,
     and FLAGGED behaviors are excluded.  Already-retrieved seed IDs are
-    also excluded to avoid duplicates.
+    also excluded to avoid duplicates.  Session isolation is enforced:
+    only neighbors belonging to the same session are returned.
+
+    Lazy decay is applied in Python after fetch (same pattern as LRA),
+    with a ``limit * 2`` pre-fetch from SQL to allow re-ranking post-decay
+    while still bounding the data transferred from the database.
 
     Args:
         user_id: User identifier.
         seed_behavior_ids: Behavior IDs from the embedding search.
+        session_id: Session identifier for isolation.
         limit: Maximum neighbors to return (default 10).
 
     Returns:
@@ -2445,27 +2454,19 @@ def get_graph_expanded_behaviors(
     if not seed_behavior_ids:
         return []
 
+    sql_limit = limit * 2  # pre-fetch extra candidates to allow decay re-ranking
+
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT DISTINCT ON (neighbor_id)
-                        neighbor_id,
-                        b.behavior_text,
-                        b.credibility,
-                        b.intent,
-                        b.target,
-                        b.context,
-                        b.polarity,
-                        e.edge_type,
-                        e.weight,
-                        (e.weight * b.credibility) AS rank_score
-                    FROM (
+                    WITH edges AS (
                         -- Forward edges: seed is behavior_id_1
                         SELECT behavior_id_2 AS neighbor_id, edge_type, weight
                         FROM behavior_co_occurrences
                         WHERE user_id = %s
+                          AND session_id = %s
                           AND behavior_id_1 = ANY(%s)
 
                         UNION ALL
@@ -2474,46 +2475,96 @@ def get_graph_expanded_behaviors(
                         SELECT behavior_id_1 AS neighbor_id, edge_type, weight
                         FROM behavior_co_occurrences
                         WHERE user_id = %s
+                          AND session_id = %s
                           AND behavior_id_2 = ANY(%s)
-                    ) e
-                    JOIN behaviors b
-                      ON b.behavior_id = e.neighbor_id
-                     AND b.user_id = %s
-                    WHERE b.behavior_state IN ('ACTIVE', 'NEW')
-                      AND e.neighbor_id != ALL(%s)
-                    ORDER BY neighbor_id, rank_score DESC
+                    ),
+                    ranked AS (
+                        SELECT DISTINCT ON (e.neighbor_id)
+                            e.neighbor_id,
+                            b.behavior_text,
+                            b.credibility,
+                            b.intent,
+                            b.target,
+                            b.context,
+                            b.polarity,
+                            b.decay_rate,
+                            b.last_decay_applied_at,
+                            e.edge_type,
+                            e.weight,
+                            (e.weight * b.credibility) AS rank_score
+                        FROM edges e
+                        JOIN behaviors b
+                          ON b.behavior_id = e.neighbor_id
+                         AND b.user_id = %s
+                         AND b.session_id = %s
+                        WHERE b.behavior_state IN ('ACTIVE', 'NEW')
+                          AND e.neighbor_id != ALL(%s)
+                        ORDER BY e.neighbor_id, rank_score DESC
+                    )
+                    SELECT * FROM ranked ORDER BY rank_score DESC LIMIT %s;
                     """,
                     (
-                        user_id, seed_behavior_ids,
-                        user_id, seed_behavior_ids,
-                        user_id, seed_behavior_ids,
+                        user_id, session_id, seed_behavior_ids,
+                        user_id, session_id, seed_behavior_ids,
+                        user_id, session_id, seed_behavior_ids,
+                        sql_limit,
                     ),
                 )
-
                 rows = cur.fetchall()
 
-        # Re-sort by rank_score descending and apply limit
-        rows.sort(key=lambda r: r[9], reverse=True)
-        rows = rows[:limit]
+        if not rows:
+            logger.info(
+                f"[GRAPH] No neighbors found for {len(seed_behavior_ids)} seed(s), "
+                f"user {user_id}, session {session_id}"
+            )
+            return []
+
+        # Apply lazy decay in Python and recompute rank_score before final sort
+        current_time = int(time.time())
+        decayed_rows = []
+        for row in rows:
+            (
+                neighbor_id, behavior_text, stored_credibility, intent,
+                target, context, polarity, decay_rate, last_decay_applied_at,
+                edge_type, edge_weight, _,
+            ) = row
+
+            decayed_credibility, _, _ = apply_lazy_decay(
+                stored_credibility=float(stored_credibility),
+                decay_rate=float(decay_rate),
+                last_decay_applied_at=last_decay_applied_at,
+                current_time=current_time,
+            )
+            decayed_rank_score = float(edge_weight) * decayed_credibility
+
+            decayed_rows.append((
+                neighbor_id, behavior_text, decayed_credibility, intent,
+                target, context, polarity, edge_type, float(edge_weight),
+                decayed_rank_score,
+            ))
+
+        # Re-sort by decayed rank_score and apply final limit
+        decayed_rows.sort(key=lambda r: r[9], reverse=True)
+        decayed_rows = decayed_rows[:limit]
 
         results = []
-        for row in rows:
+        for row in decayed_rows:
             results.append({
                 "behavior_id": row[0],
                 "behavior_text": row[1],
-                "credibility": float(row[2]),
+                "credibility": row[2],
                 "intent": row[3],
                 "target": row[4],
                 "context": row[5],
                 "polarity": row[6],
                 "edge_type": row[7],
-                "edge_weight": float(row[8]),
+                "edge_weight": row[8],
                 "source": "graph",
             })
 
         logger.info(
             f"[GRAPH] Expanded {len(seed_behavior_ids)} seed(s) → "
-            f"{len(results)} associated behavior(s) for user {user_id}"
+            f"{len(results)} associated behavior(s) for user {user_id}, session {session_id}"
         )
         return results
 

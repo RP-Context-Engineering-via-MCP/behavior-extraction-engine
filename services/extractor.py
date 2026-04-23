@@ -298,11 +298,20 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
             )
             validated_segments.append(validated_segment)
         
-        # Extract standalone query from response
+        # Extract standalone query from response — hard failure if missing
         standalone_query = raw_response.get("standalone_query")
         if not standalone_query or not standalone_query.strip():
-            logger.warning("No standalone_query in response, using original prompt")
-            standalone_query = prompt
+            logger.error(
+                "GPT failed to generate standalone_query — cannot perform retrieval. "
+                f"Raw response keys: {list(raw_response.keys())}"
+            )
+            return ExtractionResult(
+                segments=[],
+                success=False,
+                error="Extraction failed: GPT did not return a standalone query. Cannot perform behavior retrieval.",
+                extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+                standalone_query=None,
+            )
         
         # Extract required_intents for hybrid retrieval (3D search)
         required_intents = raw_response.get("required_intents")
@@ -1714,6 +1723,7 @@ def store_behavior(
             insert_co_occurrences_batch(
                 behavior_ids=prompt_behavior_ids,
                 user_id=user_id,
+                session_id=session_id,
                 edge_type="CO_PROMPT",
             )
         except Exception as e:

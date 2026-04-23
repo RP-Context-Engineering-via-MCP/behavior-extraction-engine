@@ -17,7 +17,6 @@ from api.schemas import (
     BehaviorsByIdsRequest,
     ConflictResolutionRequest,
 )
-from config.configurations import RELATED_BEHAVIORS_DISTANCE_THRESHOLD
 from models.behavior import ExtractRequest, ExtractRequestWithHistory
 from services.behaviorRepository import (
     get_behaviors_by_user,
@@ -583,9 +582,11 @@ def extract_behaviors_with_history(
             )
 
         logger.info(
-            f"Extraction process is successful. extracted results : "
-            f"{extraction_result.model_dump_json(indent=2)}"
+            f"Extraction successful: {len(extraction_result.segments)} segment(s), "
+            f"standalone_query='{extraction_result.standalone_query}', "
+            f"intents={extraction_result.required_intents}"
         )
+        logger.debug(f"Full extraction result: {extraction_result.model_dump_json(indent=2)}")
 
         # STEP 2: Search for related behaviors using 3D hybrid retrieval (FAST)
         behavior_texts = []  # flat list of behavior_text strings
@@ -604,12 +605,11 @@ def extract_behaviors_with_history(
                     required_intents=extraction_result.required_intents,
                 )
 
-                # Collect behavior IDs that pass the distance threshold
+                # LRA already applies thresholds internally — include all returned results
                 related_ids = []
                 for b in hybrid_response.results:
-                    if b.distance <= RELATED_BEHAVIORS_DISTANCE_THRESHOLD:
-                        behavior_texts.append(b.behavior_text)
-                        related_ids.append(b.behavior_id)
+                    behavior_texts.append(b.behavior_text)
+                    related_ids.append(b.behavior_id)
 
                 # Graph expansion — 1-hop co-occurrence walk
                 if related_ids:
@@ -617,6 +617,7 @@ def extract_behaviors_with_history(
                         associated = get_graph_expanded_behaviors(
                             user_id=request.user_id,
                             seed_behavior_ids=related_ids,
+                            session_id=request.session_id,
                             limit=10,
                         )
                         for a in associated:
@@ -750,7 +751,7 @@ def get_behaviors_by_ids_endpoint(request: BehaviorsByIdsRequest):
             content=profile_signals
         )
         
-    except Exception as e:
+    except Exception:
         logger.exception(f"Error fetching profile signals by IDs for user={request.user_id}")
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
