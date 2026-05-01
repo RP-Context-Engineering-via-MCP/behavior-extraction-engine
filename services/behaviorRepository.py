@@ -957,11 +957,12 @@ def search_similar_behaviors(
 
 def search_similar_behavior_3D(
     user_id: str,
-    query_embedding: List[float],
-    query_text: str,
+    query_embedding: Optional[List[float]] = None,
+    query_text: str = "",
     session_id: str = "default",
     required_intents: Optional[List[str]] = None,
-    limit: int = None
+    limit: int = None,
+    query_embeddings: Optional[List[List[float]]] = None,
 ) -> HybridSearchResponse:
     """
     Layered Retrieval Architecture (LRA) — 3-stage behavior search.
@@ -997,13 +998,22 @@ def search_similar_behavior_3D(
 
     Args:
         user_id: User identifier
-        query_embedding: Dense vector embedding of the standalone query
-        query_text: Plain text of the standalone query (kept for logging)
+        query_embedding: (legacy) Dense vector embedding of a single probe.
+                         Used only when query_embeddings is not provided.
+        query_text: Plain text of the (first) probe — kept for logging
         session_id: Session identifier for isolation (defaults to "default")
         required_intents: Optional list of intent types predicted by the LLM
                           (e.g., ["CONSTRAINT", "PREFERENCE"]).  If None or
                           empty, no intent re-ranking is applied.
-        limit: Maximum candidates fetched from DB (defaults to HYBRID_SEARCH_LIMIT)
+        limit: Maximum candidates fetched per probe from DB (defaults to
+               HYBRID_SEARCH_LIMIT)
+        query_embeddings: 1..N dense vector embeddings (multi-probe HyDE).
+                          Each probe runs an independent cosine-distance
+                          fetch; per-candidate `s_base` uses the BEST
+                          (minimum) cosine distance across probes, and a
+                          small multi-probe agreement boost (10% per extra
+                          probe matched) is applied to candidates that
+                          appeared in multiple probes' top-K.
 
     Returns:
         HybridSearchResponse containing:
@@ -1021,11 +1031,29 @@ def search_similar_behavior_3D(
         RELEVANCE_GAP_DROP_RATIO,
         MAX_RETRIEVAL_RESULTS,
         ALL_INTENT_TYPES,
-        INTENT_AFFINITY
+        INTENT_AFFINITY,
     )
 
     if limit is None:
         limit = HYBRID_SEARCH_LIMIT
+
+    # Normalise input: build the probe list from whichever arg the caller used.
+    probes: List[List[float]]
+    if query_embeddings and len(query_embeddings) > 0:
+        probes = [p for p in query_embeddings if p]
+    elif query_embedding is not None:
+        probes = [query_embedding]
+    else:
+        probes = []
+
+    if not probes:
+        logger.warning("[LRA] No query embeddings provided — returning empty result")
+        return HybridSearchResponse()
+
+    # Multi-probe agreement boost: candidates matched by N>1 probes get a
+    # consensus multiplier.  10% per additional probe — bounded so that a
+    # single strong-semantic match cannot be drowned out by weak duplicates.
+    AGREEMENT_BOOST_PER_PROBE: float = 0.10
 
     try:
         with get_db_pool_connection() as conn:
@@ -1033,7 +1061,9 @@ def search_similar_behavior_3D(
                 # ==========================================================
                 # STAGE 1 — Coarse Semantic Retrieval (Recall Layer)
                 # Pure dense vector search via pgvector cosine distance.
-                # No BM25, no intent scoring in SQL — just semantics.
+                # Run ONCE PER PROBE; merge candidates by behavior_id keeping
+                # the BEST (smallest) cosine distance across probes, and
+                # tracking how many probes matched each candidate.
                 # ==========================================================
                 base_conditions = """
                     user_id = %s
@@ -1061,15 +1091,46 @@ def search_similar_behavior_3D(
                     LIMIT %s;
                 """
 
-                params = [
-                    query_embedding,   # embedding <=> %s::vector
-                    user_id,           # WHERE user_id = %s
-                    session_id,        # AND session_id = %s
-                    limit,             # LIMIT %s
-                ]
+                # Map: behavior_id → merged row dict (best distance + match count)
+                merged: dict[str, dict] = {}
+                for probe_idx, probe in enumerate(probes):
+                    cur.execute(
+                        query,
+                        [probe, user_id, session_id, limit],
+                    )
+                    for row in cur.fetchall():
+                        (
+                            behavior_id, behavior_text, cosine_distance,
+                            stored_credibility, last_seen_at, reinforcement_count,
+                            intent, target, context, polarity,
+                            decay_rate, last_decay_applied_at,
+                        ) = row
+                        cd = float(cosine_distance)
+                        if behavior_id in merged:
+                            entry = merged[behavior_id]
+                            if cd < entry["cosine_distance"]:
+                                entry["cosine_distance"] = cd
+                                entry["best_probe_idx"] = probe_idx
+                            entry["probe_match_count"] += 1
+                        else:
+                            merged[behavior_id] = {
+                                "behavior_id": behavior_id,
+                                "behavior_text": behavior_text,
+                                "cosine_distance": cd,
+                                "best_probe_idx": probe_idx,
+                                "probe_match_count": 1,
+                                "stored_credibility": stored_credibility,
+                                "last_seen_at": last_seen_at,
+                                "reinforcement_count": reinforcement_count,
+                                "intent": intent,
+                                "target": target,
+                                "context": context,
+                                "polarity": polarity,
+                                "decay_rate": decay_rate,
+                                "last_decay_applied_at": last_decay_applied_at,
+                            }
 
-                cur.execute(query, params)
-                rows = cur.fetchall()
+                rows = list(merged.values())
                 current_time = int(time.time())
 
                 # ==========================================================
@@ -1106,24 +1167,39 @@ def search_similar_behavior_3D(
                 decay_updates = []
 
                 for row in rows:
-                    (
-                        behavior_id, behavior_text, cosine_distance,
-                        stored_credibility, last_seen_at, reinforcement_count,
-                        intent, target, context, polarity,
-                        decay_rate, last_decay_applied_at,
-                    ) = row
+                    behavior_id = row["behavior_id"]
+                    behavior_text = row["behavior_text"]
+                    cosine_distance = row["cosine_distance"]
+                    stored_credibility = row["stored_credibility"]
+                    last_seen_at = row["last_seen_at"]
+                    reinforcement_count = row["reinforcement_count"]
+                    intent = row["intent"]
+                    target = row["target"]
+                    context = row["context"]
+                    polarity = row["polarity"]
+                    decay_rate = row["decay_rate"]
+                    last_decay_applied_at = row["last_decay_applied_at"]
+                    probe_match_count = row["probe_match_count"]
 
-                    # S_base: convert cosine distance → similarity (bounded 0..1)
+                    # S_base: convert (best) cosine distance → similarity (0..1)
                     s_base = max(0.0, 1.0 - float(cosine_distance))
 
                     # Multiplicative intent scalar
                     if use_intent_rerank:
                         affinity = affinity_map.get(intent, 0.0)
-                        multiplier = 1.0 + (INTENT_RERANK_ALPHA * affinity)
+                        intent_multiplier = 1.0 + (INTENT_RERANK_ALPHA * affinity)
                     else:
                         affinity = 0.0
-                        multiplier = 1.0
+                        intent_multiplier = 1.0
 
+                    # Multi-probe agreement multiplier: a candidate that
+                    # matched in K>1 probes' top-K gets a consensus boost.
+                    # Single-probe queries reduce this to 1.0 (no-op).
+                    agreement_multiplier = 1.0 + (
+                        AGREEMENT_BOOST_PER_PROBE * max(0, probe_match_count - 1)
+                    )
+
+                    multiplier = intent_multiplier * agreement_multiplier
                     s_final = s_base * multiplier
 
                     # Apply lazy decay in-memory (read-only, no DB update)
@@ -1154,6 +1230,9 @@ def search_similar_behavior_3D(
                         "s_base": s_base,
                         "affinity": affinity,
                         "multiplier": multiplier,
+                        "intent_multiplier": intent_multiplier,
+                        "agreement_multiplier": agreement_multiplier,
+                        "probe_match_count": probe_match_count,
                         "s_final": s_final,
                         "credibility": new_credibility,
                         "last_seen_at": int(last_seen_at),
@@ -1296,7 +1375,9 @@ def search_similar_behavior_3D(
                         f"id={c['behavior_id']} | intent={c['intent']} | "
                         f"S_base={c['s_base']:.4f} | "
                         f"affinity={c['affinity']:.2f} | "
-                        f"M={c['multiplier']:.4f} | "
+                        f"M_intent={c['intent_multiplier']:.4f} | "
+                        f"M_agree={c['agreement_multiplier']:.4f} | "
+                        f"probes={c['probe_match_count']}/{len(probes)} | "
                         f"S_final={c['s_final']:.4f} | "
                         f"credibility={c['credibility']:.4f} | "
                         f"text='{c['behavior_text'][:80]}...'"
@@ -1309,7 +1390,9 @@ def search_similar_behavior_3D(
                 logger.info(
                     f"[LRA] Search for user {user_id} in session {session_id}: "
                     f"{len(similarity_results)} results "
-                    f"(α={INTENT_RERANK_ALPHA}, "
+                    f"(probes={len(probes)}, "
+                    f"unique_candidates={len(rows)}, "
+                    f"α={INTENT_RERANK_ALPHA}, "
                     f"τ_min={SEMANTIC_FLOOR_THRESHOLD}, "
                     f"ρ={RELEVANCE_GAP_DROP_RATIO}, "
                     f"intents={required_intents or 'NONE'}, "
@@ -2350,6 +2433,35 @@ def get_behaviors_by_ids(user_id: str, behavior_ids: List[str]) -> List[dict]:
 # Co-Occurrence Graph — edge creation, expansion, inheritance, cleanup
 # ===========================================================================
 
+def get_behavior_ids_by_session(
+    user_id: str,
+    session_id: str,
+    exclude_ids: List[str] = None,
+) -> List[str]:
+    """
+    Return behavior IDs for a given user+session, excluding the provided IDs.
+    Used to identify pre-existing session behaviors when creating CO_SESSION edges.
+    """
+    exclude_ids = exclude_ids or []
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT behavior_id FROM behaviors
+                    WHERE user_id = %s
+                      AND session_id = %s
+                      AND behavior_state IN ('ACTIVE', 'NEW')
+                      AND behavior_id != ALL(%s)
+                    """,
+                    (user_id, session_id, exclude_ids),
+                )
+                return [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"[GRAPH] get_behavior_ids_by_session failed: {e}")
+        return []
+
+
 def insert_co_occurrences_batch(
     behavior_ids: List[str],
     user_id: str,
@@ -2423,9 +2535,10 @@ def get_graph_expanded_behaviors(
     seed_behavior_ids: List[str],
     session_id: str = "default",
     limit: int = 10,
+    query_embeddings: Optional[List[List[float]]] = None,
 ) -> List[dict]:
     """
-    1-hop graph expansion from seed behaviors.
+    1-hop graph expansion from seed behaviors, gated by query relevance.
 
     Given a set of behavior IDs returned by embedding search, walk
     the co-occurrence graph one hop to find associated behaviors.
@@ -2437,6 +2550,15 @@ def get_graph_expanded_behaviors(
     also excluded to avoid duplicates.  Session isolation is enforced:
     only neighbors belonging to the same session are returned.
 
+    RELEVANCE GATE (when query_embeddings is provided):
+    Each candidate neighbor's stored prose embedding is compared against
+    every probe; the BEST cosine distance must be ≤
+    GRAPH_EXPANSION_DISTANCE_THRESHOLD.  This prevents cross-domain
+    co-occurrence noise (e.g., a user mentions Python and cooking in the
+    same prompt → write-time edge → otherwise gets replayed at read time
+    on a Python-only query).  When query_embeddings is None or empty, the
+    gate is skipped (legacy behaviour).
+
     Lazy decay is applied in Python after fetch (same pattern as LRA),
     with a ``limit * 2`` pre-fetch from SQL to allow re-ranking post-decay
     while still bounding the data transferred from the database.
@@ -2446,6 +2568,10 @@ def get_graph_expanded_behaviors(
         seed_behavior_ids: Behavior IDs from the embedding search.
         session_id: Session identifier for isolation.
         limit: Maximum neighbors to return (default 10).
+        query_embeddings: Optional probe embeddings used for the relevance
+                          gate.  When provided, neighbors farther than
+                          GRAPH_EXPANSION_DISTANCE_THRESHOLD from every
+                          probe are filtered out.
 
     Returns:
         List of dicts, each containing behavior details + edge metadata.
@@ -2454,13 +2580,39 @@ def get_graph_expanded_behaviors(
     if not seed_behavior_ids:
         return []
 
+    from config.configurations import GRAPH_EXPANSION_DISTANCE_THRESHOLD
+
     sql_limit = limit * 2  # pre-fetch extra candidates to allow decay re-ranking
+
+    # Build the optional relevance-gate SQL fragment.  Computes the MIN
+    # cosine distance from the neighbor's prose embedding to ANY probe;
+    # rows whose min-distance exceeds the threshold are dropped.
+    use_relevance_gate = bool(query_embeddings) and len(query_embeddings) > 0
+    if use_relevance_gate:
+        # LEAST(b.embedding <=> %s::vector, b.embedding <=> %s::vector, ...)
+        distance_terms = ", ".join(
+            ["b.embedding <=> %s::vector"] * len(query_embeddings)
+        )
+        if len(query_embeddings) == 1:
+            min_dist_expr = distance_terms  # LEAST() of one is invalid; use the term directly
+        else:
+            min_dist_expr = f"LEAST({distance_terms})"
+        relevance_select = f", {min_dist_expr} AS min_query_distance"
+        relevance_where = f" AND {min_dist_expr} <= %s"
+        # Probe vectors appear twice: once in SELECT, once in WHERE
+        relevance_params_select = list(query_embeddings)
+        relevance_params_where = list(query_embeddings) + [GRAPH_EXPANSION_DISTANCE_THRESHOLD]
+    else:
+        relevance_select = ""
+        relevance_where = ""
+        relevance_params_select = []
+        relevance_params_where = []
 
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     WITH edges AS (
                         -- Forward edges: seed is behavior_id_1
                         SELECT behavior_id_2 AS neighbor_id, edge_type, weight
@@ -2492,6 +2644,7 @@ def get_graph_expanded_behaviors(
                             e.edge_type,
                             e.weight,
                             (e.weight * b.credibility) AS rank_score
+                            {relevance_select}
                         FROM edges e
                         JOIN behaviors b
                           ON b.behavior_id = e.neighbor_id
@@ -2499,6 +2652,7 @@ def get_graph_expanded_behaviors(
                          AND b.session_id = %s
                         WHERE b.behavior_state IN ('ACTIVE', 'NEW')
                           AND e.neighbor_id != ALL(%s)
+                          {relevance_where}
                         ORDER BY e.neighbor_id, rank_score DESC
                     )
                     SELECT * FROM ranked ORDER BY rank_score DESC LIMIT %s;
@@ -2506,7 +2660,9 @@ def get_graph_expanded_behaviors(
                     (
                         user_id, session_id, seed_behavior_ids,
                         user_id, session_id, seed_behavior_ids,
+                        *relevance_params_select,
                         user_id, session_id, seed_behavior_ids,
+                        *relevance_params_where,
                         sql_limit,
                     ),
                 )
@@ -2519,15 +2675,24 @@ def get_graph_expanded_behaviors(
             )
             return []
 
-        # Apply lazy decay in Python and recompute rank_score before final sort
+        # Apply lazy decay in Python and recompute rank_score before final sort.
+        # Row layout: 12 fixed columns, then an optional min_query_distance
+        # column when the relevance gate was active.
         current_time = int(time.time())
         decayed_rows = []
         for row in rows:
-            (
-                neighbor_id, behavior_text, stored_credibility, intent,
-                target, context, polarity, decay_rate, last_decay_applied_at,
-                edge_type, edge_weight, _,
-            ) = row
+            neighbor_id = row[0]
+            behavior_text = row[1]
+            stored_credibility = row[2]
+            intent = row[3]
+            target = row[4]
+            context = row[5]
+            polarity = row[6]
+            decay_rate = row[7]
+            last_decay_applied_at = row[8]
+            edge_type = row[9]
+            edge_weight = row[10]
+            # row[11] is rank_score from SQL (replaced below), row[12] is optional min_query_distance
 
             decayed_credibility, _, _ = apply_lazy_decay(
                 stored_credibility=float(stored_credibility),
@@ -2562,9 +2727,15 @@ def get_graph_expanded_behaviors(
                 "source": "graph",
             })
 
+        gate_info = (
+            f", relevance_gate=ON (τ={GRAPH_EXPANSION_DISTANCE_THRESHOLD:.2f}, "
+            f"probes={len(query_embeddings) if query_embeddings else 0})"
+            if use_relevance_gate else ", relevance_gate=OFF"
+        )
         logger.info(
             f"[GRAPH] Expanded {len(seed_behavior_ids)} seed(s) → "
             f"{len(results)} associated behavior(s) for user {user_id}, session {session_id}"
+            f"{gate_info}"
         )
         return results
 

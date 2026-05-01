@@ -74,7 +74,11 @@ class ExtractionResult(BaseModel):
     )
     standalone_query: Optional[str] = Field(
         None,
-        description="Enriched standalone version of the prompt for similarity search (with conversation context resolved)"
+        description="First semantic search probe — kept as a string for backwards compatibility / logging"
+    )
+    standalone_queries: Optional[List[str]] = Field(
+        default=None,
+        description="1..3 short canonical search probes (multi-probe HyDE) used for retrieval. The retrieval pipeline embeds each and merges results via Reciprocal Rank Fusion."
     )
     required_intents: Optional[List[str]] = Field(
         default=None,

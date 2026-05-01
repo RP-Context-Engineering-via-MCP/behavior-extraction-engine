@@ -28,9 +28,9 @@ DECAY_GRACE_PERIOD_SECONDS: int = DECAY_GRACE_PERIOD_DAYS * 24 * 60 * 60  # 604 
 INTENT_DECAY_RATES: dict[str, float] = {
     "HABIT": 0.04,
     "PREFERENCE": 0.015,
-    "COMMUNICATION": 0.001,
+    "COMMUNICATION": 0.01,
     "SKILL": 0.004,
-    "CONSTRAINT": 0.00015,
+    "CONSTRAINT": 0.0015,
 }
 
 # ---------------------------------------------------------------------------
@@ -124,20 +124,27 @@ HYBRID_SEARCH_LIMIT: int = 40
 
 # Intent re-ranking alpha — multiplicative weight for intent affinity.
 # S_final = S_base * (1 + INTENT_RERANK_ALPHA * affinity)
-# At alpha=0.25, a perfect intent match lifts the score by 25%.
+# At alpha=0.35, a perfect intent match lifts the score by 35%.
 # A zero-affinity intent leaves the score unchanged.
-INTENT_RERANK_ALPHA: float = 0.25
+# Raised from 0.25 → 0.35 to better recover on-intent near-misses
+# under all-MiniLM-L6's diffuse cosine geometry.
+INTENT_RERANK_ALPHA: float = 0.35
 
 # Absolute semantic floor — any behavior with S_final below this is
 # mathematically discarded.  Prevents injecting weakly-related behaviors
 # into the LLM context window, reducing hallucination risk.
-SEMANTIC_FLOOR_THRESHOLD: float = 0.55
+# Lowered from 0.48 → 0.40 to reflect MiniLM-L6's diffuse geometry on
+# abstract↔concrete asymmetric query patterns (e.g., "QA practices" ↔
+# "always writes unit tests").
+SEMANTIC_FLOOR_THRESHOLD: float = 0.40
 
 # Soft-fallback floor — only activated when the primary floor (above)
 # drops ALL candidates to zero results.  Recovers near-miss behaviors
 # that the strict floor filters out.  Because this only fires when the
 # primary search returns nothing, it CANNOT affect already-passing queries.
-SEMANTIC_FLOOR_FALLBACK: float = 0.48
+# Must be < SEMANTIC_FLOOR_THRESHOLD to actually rescue anything (the
+# previous 0.48 == 0.48 made this branch a no-op).
+SEMANTIC_FLOOR_FALLBACK: float = 0.32
 
 # Maximum results returned in fallback mode.  Capped low to prevent
 # noise from diluting the LLM context when the match quality is marginal.
@@ -145,13 +152,45 @@ MAX_FALLBACK_RESULTS: int = 3
 
 # Relevance-gap cutoff ratio (Top-Score Relative Drop-off).
 # T_dynamic = S_max * (1 - RELEVANCE_GAP_DROP_RATIO)
-# Any behaviour below T_dynamic is cut.  Tight value (0.15) is safe now
-# that BM25 spikes are removed and all scores sit on a bounded scale.
-RELEVANCE_GAP_DROP_RATIO: float = 0.15
+# Any behaviour below T_dynamic is cut.
+# Loosened from 0.15 → 0.30 for broad multi-domain queries — at 0.15 a
+# single tight top hit nukes the entire tail, which is too aggressive on
+# diffuse 384-dim cosine.
+RELEVANCE_GAP_DROP_RATIO: float = 0.30
 
 # Hard cap on the number of results returned after gap filtering.
 # Prevents over-retrieval on broad / vague queries.
 MAX_RETRIEVAL_RESULTS: int = 10
+
+# ---------------------------------------------------------------------------
+# Multi-probe HyDE retrieval
+# ---------------------------------------------------------------------------
+# The LLM emits 1..MAX_STANDALONE_QUERIES short canonical probes per user
+# prompt.  Each probe is embedded and used to query pgvector independently.
+# Per-candidate scoring uses the BEST (minimum) cosine distance across
+# probes, with a 10%-per-extra-probe agreement multiplier when a candidate
+# appears in multiple probes' top-K.
+#
+# Multiple probes attack the abstract↔concrete vocabulary asymmetry
+# inherent to conversational-prompt → canonical-stored-behavior retrieval
+# (e.g., "modern web frontend" ↔ "uses React for frontend").  Keeping the
+# scoring on the existing s_base scale means τ_min/ρ thresholds carry over
+# without recalibration.
+MAX_STANDALONE_QUERIES: int = 3
+
+# ---------------------------------------------------------------------------
+# Graph expansion relevance gate
+# ---------------------------------------------------------------------------
+# After 1-hop co-occurrence walk in get_graph_expanded_behaviors, every
+# neighbor is checked against the query embedding(s) and dropped if its
+# best cosine distance to any probe exceeds this threshold.
+#
+# Without this gate, graph expansion replays write-time co-occurrence
+# (e.g., "Python" and "cooking" mentioned in the same prompt) into
+# read-time noise — even when dense retrieval correctly excluded them.
+#
+# 0.55 keeps strong topical neighbors while filtering cross-domain noise.
+GRAPH_EXPANSION_DISTANCE_THRESHOLD: float = 0.55
 
 # ---------------------------------------------------------------------------
 # Intent taxonomy

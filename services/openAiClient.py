@@ -407,6 +407,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     if not prompt or not prompt.strip():
         return {
             "standalone_query": None,
+            "standalone_queries": None,
             "segments": [],
             "profile_signals": None,
             "success": False,
@@ -419,6 +420,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     if len(prompt) < MIN_PROMPT_LENGTH:
         return {
             "standalone_query": None,
+            "standalone_queries": None,
             "segments": [],
             "profile_signals": None,
             "success": False,
@@ -429,6 +431,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     if len(prompt) > MAX_PROMPT_LENGTH:
         return {
             "standalone_query": None,
+            "standalone_queries": None,
             "segments": [],
             "profile_signals": None,
             "success": False,
@@ -458,36 +461,83 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     - Requests: "tell me about...", "explain..."
     - Temporary states: "I'm hungry right now", "currently working on..."
     
-    TASK 2: SEMANTIC PROBE GENERATION (Query Transformation for Vector Search)
+    TASK 2: SEMANTIC PROBE GENERATION (Multi-Probe HyDE Transformation)
     ---
-    Look at 'RECENT HISTORY' and 'LATEST PROMPT'. You must convert the user's intent into a 'Semantic Search Probe' to be used as `standalone_query`. 
-    
-    ⚠️ THE ASYMMETRIC SEARCH RULE:
-    This probe MUST NOT be a question. It MUST NOT be a full sentence. 
-    It MUST be written as a short, declarative behavior segment (starting with an action verb) that represents the exact type of behavior we are looking for in the database.
-    
-    ⚠️ CONCRETE VOCABULARY RULE (CRITICAL for vector search accuracy):
-    - NEVER use abstract filler words in the probe: "specific", "certain", "particular", "various", "some"
-    - These words have ZERO semantic value in vector space and cause the search to miss real behaviors
-    - Instead, use CONCRETE domain nouns and verbs that plausibly describe stored behaviors
-    - Draw vocabulary from the TOPIC DOMAIN mentioned in the conversation (e.g., food → ingredients, allergens, diet; music → genre names, concentration, working; health → vitamins, supplements, water)
-    - The probe should sound like a REAL stored behavior, not a category label
-    
-    Examples of Semantic Probes (HyDE Transformation):
-    - User: "What ingredients must I absolutely keep out of the food?" → "avoids food ingredients and allergens in diet"
-    - User: "Recommend entertainment that I would actually enjoy watching" → "watches and enjoys shows movies streaming content in evening"
-    - User: "What does my daily health and wellness routine look like?" → "takes daily vitamins supplements and drinks water for wellness"
-    - User: "which is better for backend, Python or Node?" → "prefers Python or Node for backend development"
-    - User: "Can you summarize my coding habits?" → "follows coding habits and programming workflow patterns"
-    - User: "What music helps me concentrate?" → "listens to music while working for focus and concentration"
-    - User: "How do I usually shop for things?" → "compares prices and prefers online shopping for products"
-    
+    Look at 'RECENT HISTORY' and 'LATEST PROMPT'. You must convert the user's intent into a SET of 'Semantic Search Probes' to be used as `standalone_queries`.
+
+    ⚠️ MULTI-PROBE REQUIREMENT (CRITICAL — fixes abstract↔concrete asymmetry):
+    A single probe cannot cover broad/multi-faceted queries (e.g., "how do I deploy this?"
+    spans Docker, Kubernetes, cloud, CI/CD).  Emit 1 to 3 probes that together cover the
+    DIFFERENT FACETS of what the user is asking about.  Each probe should be a separate
+    short behavioral statement targeting one concrete sub-topic.
+
+    Rules for EACH probe:
+    - Must NOT be a question.  Must NOT be a full sentence.
+    - Must be a short declarative behavior segment (action verb + concrete noun).
+    - Must use CONCRETE domain vocabulary that plausibly describes stored behaviors.
+    - Must NOT use filler words: "specific", "certain", "particular", "various", "some".
+    - Each probe should target a DIFFERENT facet of the query (don't emit near-duplicates).
+
+    How many probes:
+    - Narrow query (1 facet)         → 1 probe
+    - Multi-faceted query (2 facets) → 2 probes
+    - Broad query (3+ facets)        → 3 probes (hard maximum)
+
+    Also emit `standalone_query` (singular) — set it equal to the FIRST probe in the list
+    for backwards compatibility with logging.
+
+    Examples of Multi-Probe Sets:
+    - User: "Which Python web framework should I use for a new API project?"
+        standalone_queries: [
+          "prefers Python for backend development",
+          "uses FastAPI for REST API"
+        ]
+    - User: "How should I configure the appearance settings of my IDE?"
+        standalone_queries: [
+          "prefers dark mode in IDE",
+          "uses high contrast themes for accessibility",
+          "dislikes bright white backgrounds"
+        ]
+    - User: "What quality assurance practices should I follow for this new feature?"
+        standalone_queries: [
+          "writes unit tests for code",
+          "practices test-driven development",
+          "performs code reviews before merging"
+        ]
+    - User: "I need to build a modern web frontend for a new project"
+        standalone_queries: [
+          "uses React for frontend applications",
+          "prefers TypeScript for JavaScript projects",
+          "uses Tailwind CSS for styling"
+        ]
+    - User: "How should I set up the deployment pipeline for this new microservice?"
+        standalone_queries: [
+          "uses Docker and Kubernetes for deployment",
+          "uses Terraform for infrastructure as code",
+          "prefers AWS for cloud deployments"
+        ]
+    - User: "What should I consider when planning my weekly meals?"
+        standalone_queries: [
+          "avoids meat and dairy in diet",
+          "prefers organic and locally sourced food"
+        ]
+    - User: "How do I make my technical knowledge more accessible to teammates?"
+        standalone_queries: [
+          "prefers written documentation over verbal explanations",
+          "adds comments to complex code sections",
+          "maintains personal knowledge base"
+        ]
+
     ❌ BAD probes (abstract filler words — will FAIL vector search):
     - "has specific food preferences" ← "specific" matches nothing
     - "selects TV entertainment" ← too compressed, no domain vocabulary
     - "uses specific music genre for focus" ← "specific genre" adds nothing
     - "has device and app preferences" ← no concrete terms like dark mode, cloud, settings
     - "shops electronics with specific method" ← "specific method" is empty
+
+    ❌ BAD multi-probe sets (probes are near-duplicates — wastes a probe slot):
+    - ["uses Python for backend", "prefers Python for server-side"]  ← same facet, different words
+    - ["writes unit tests", "writes tests for code"]                 ← same facet
     ---
     FOR EACH BEHAVIOR, YOU MUST PRODUCE A CANONICAL FORM WITH THESE FIELDS:
     
@@ -568,7 +618,11 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     OUTPUT FORMAT (STRICT JSON - use these EXACT field names):
     
     {
-      "standalone_query": "The short, declarative Semantic Search Probe (e.g., 'avoids specific foods')",
+      "standalone_query": "The first probe — kept as a string for backwards compatibility (e.g., 'prefers Python for backend')",
+      "standalone_queries": [
+        "prefers Python for backend development",
+        "uses FastAPI for REST API"
+      ],
       "required_intents": ["CONSTRAINT", "PREFERENCE"],
       "segments": [
         {
@@ -623,8 +677,10 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     ⚠️ CRITICAL RULES:
     - Extract behaviors ONLY from 'LATEST PROMPT' - NEVER from 'RECENT HISTORY'!
     - If LATEST PROMPT is a question or has no behaviors, return empty segments list []
-    - standalone_query is MANDATORY - it MUST be a behavioral probe (action verb + noun phrase), NOT a question.
-    - standalone_query MUST use concrete domain vocabulary — NEVER use "specific", "certain", "particular" as they fail vector search.
+    - standalone_queries is MANDATORY - 1 to 3 short behavioral probes (action verb + concrete noun), NOT questions.
+    - standalone_query (singular, kept for backwards compatibility) MUST equal standalone_queries[0].
+    - Each probe MUST use concrete domain vocabulary — NEVER use "specific", "certain", "particular" as they fail vector search.
+    - Probes within standalone_queries MUST target DIFFERENT facets of the query (no near-duplicates).
     - Target must be CONCISE (1-3 words) - the noun, not the whole phrase
     - Target must use CANONICAL/FULL form - NEVER abbreviations (JavaScript not JS)
     - Use field name "linguistic_strength" (NOT "strength")
@@ -651,17 +707,19 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     CORRECT Output:
     {
       "standalone_query": "prefers sweet food",
+      "standalone_queries": ["prefers sweet food", "enjoys oatmeal and fruits as breakfast"],
       "segments": []
     }
-    
+
     ⚠️ WHY segments is empty:
     - Latest prompt is a QUESTION, not a behavior statement
     - "I like healthy breakfast..." is in HISTORY and was ALREADY PROCESSED - DO NOT extract it again!
-    
+
     WRONG Output (DO NOT DO THIS):
     {
       "standalone_query": "Which is the sweetest food among oatmeal and fruits?",
-      "segments": [{"text": "I like healthy breakfast options...", "behaviors": [...]}]  ❌ WRONG! This is from history!
+      "standalone_queries": ["Which is the sweetest food..."],
+      "segments": [{"text": "I like healthy breakfast options...", "behaviors": [...]}]  ❌ WRONG! Question + history extraction!
     }
     """
 
@@ -712,12 +770,42 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
             }   
            
         result = json.loads(content)
-        
-        # Validate that standalone_query exists
-        standalone_query = result.get("standalone_query")
-        if not standalone_query or not standalone_query.strip():
-            logger.warning("LLM did not provide standalone_query, using original prompt")
-            standalone_query = prompt
+
+        from config.configurations import MAX_STANDALONE_QUERIES
+
+        # ----- standalone_queries (multi-probe) ---------------------------------
+        # Prefer the new list field; fall back to the legacy single-string field;
+        # final fallback is the raw prompt (avoids hard failure on retrieval).
+        raw_queries = result.get("standalone_queries")
+        standalone_queries: list[str] = []
+        if isinstance(raw_queries, list):
+            seen = set()
+            for q in raw_queries:
+                if not isinstance(q, str):
+                    continue
+                q_clean = q.strip()
+                if not q_clean:
+                    continue
+                # Dedupe case-insensitively to filter out near-misses
+                key = q_clean.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                standalone_queries.append(q_clean)
+
+        legacy_query = result.get("standalone_query")
+        if isinstance(legacy_query, str) and legacy_query.strip():
+            legacy_clean = legacy_query.strip()
+            if legacy_clean.lower() not in {q.lower() for q in standalone_queries}:
+                standalone_queries.insert(0, legacy_clean)
+
+        if not standalone_queries:
+            logger.warning("LLM did not provide any standalone probe, falling back to raw prompt")
+            standalone_queries = [prompt]
+
+        # Cap to MAX_STANDALONE_QUERIES
+        standalone_queries = standalone_queries[:MAX_STANDALONE_QUERIES]
+        standalone_query = standalone_queries[0]
 
         # Extract required_intents with safe default
         required_intents = result.get("required_intents", ["PREFERENCE", "CONSTRAINT"])
@@ -728,7 +816,8 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
             required_intents = ["PREFERENCE", "CONSTRAINT"]
 
         return {
-            "standalone_query": standalone_query.strip(),
+            "standalone_query": standalone_query,
+            "standalone_queries": standalone_queries,
             "required_intents": required_intents,
             "segments": result.get("segments", []),
             "profile_signals": result.get("profile_signals"),
@@ -745,6 +834,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
         extraction_time_ms = (time() - start_time) * 1000
         return {
             "standalone_query": None,
+            "standalone_queries": None,
             "segments": [],
             "profile_signals": None,
             "success": False,
@@ -760,6 +850,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
         error_type = type(e).__name__
         return {
             "standalone_query": None,
+            "standalone_queries": None,
             "segments": [],
             "profile_signals": None,
             "success": False,

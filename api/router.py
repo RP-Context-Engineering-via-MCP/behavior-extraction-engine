@@ -591,16 +591,38 @@ def extract_behaviors_with_history(
         # STEP 2: Search for related behaviors using 3D hybrid retrieval (FAST)
         behavior_texts = []  # flat list of behavior_text strings
         hybrid_response = None
-        if extraction_result.standalone_query:
+
+        # Resolve probe list (multi-probe HyDE).  Falls back to the singular
+        # field for backwards compatibility if the LLM only emitted one.
+        probes = extraction_result.standalone_queries or (
+            [extraction_result.standalone_query] if extraction_result.standalone_query else []
+        )
+
+        if probes:
             try:
                 from services.openAiClient import embed_text
 
-                query_embedding = embed_text(extraction_result.standalone_query)
+                # Embed each probe.  Skip failures so one bad probe doesn't
+                # take down the whole retrieval pass.
+                probe_embeddings: list[list[float]] = []
+                for probe in probes:
+                    try:
+                        probe_embeddings.append(embed_text(probe))
+                    except Exception as e:
+                        logger.warning(f"Failed to embed probe '{probe[:60]}...': {e}")
+
+                if not probe_embeddings:
+                    raise RuntimeError("No probes successfully embedded")
+
+                logger.info(
+                    f"Multi-probe retrieval: {len(probe_embeddings)} probe(s) for query "
+                    f"(first='{probes[0][:60]}...')"
+                )
 
                 hybrid_response = search_similar_behavior_3D(
                     user_id=request.user_id,
-                    query_embedding=query_embedding,
-                    query_text=extraction_result.standalone_query,
+                    query_embeddings=probe_embeddings,
+                    query_text=probes[0],
                     session_id=request.session_id,
                     required_intents=extraction_result.required_intents,
                 )
@@ -611,7 +633,7 @@ def extract_behaviors_with_history(
                     behavior_texts.append(b.behavior_text)
                     related_ids.append(b.behavior_id)
 
-                # Graph expansion — 1-hop co-occurrence walk
+                # Graph expansion — 1-hop co-occurrence walk, gated by query relevance
                 if related_ids:
                     try:
                         associated = get_graph_expanded_behaviors(
@@ -619,6 +641,7 @@ def extract_behaviors_with_history(
                             seed_behavior_ids=related_ids,
                             session_id=request.session_id,
                             limit=10,
+                            query_embeddings=probe_embeddings,
                         )
                         for a in associated:
                             if a["behavior_text"] not in behavior_texts:
@@ -628,7 +651,7 @@ def extract_behaviors_with_history(
 
                 logger.info(
                     f"Returning {len(behavior_texts)} behaviors "
-                    f"for query: '{extraction_result.standalone_query}'"
+                    f"for query: '{probes[0][:60]}...'"
                 )
             except Exception as e:
                 logger.error(f"Failed to search related behaviors: {str(e)}")

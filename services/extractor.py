@@ -30,7 +30,8 @@ from services.behaviorRepository import (
     supersede_behavior,
     update_behavior_state,
     update_behavior_access_time,
-    insert_co_occurrences_batch
+    insert_co_occurrences_batch,
+    get_behavior_ids_by_session
 )
 from services.profileSignalExtractor import ProfileSignalExtractor
 from datetime import datetime
@@ -255,7 +256,9 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
         >>> result.standalone_query
         "which is better for backend development: Python or JavaScript?"
     """
+    logger.info("sent for behavior extraction")
     raw_response = extract_behavior_with_history(prompt, recent_history)
+    logger.info("sent for behavior extraction")
     
     if not raw_response.get("success", False):
         return ExtractionResult(
@@ -298,21 +301,33 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
             )
             validated_segments.append(validated_segment)
         
-        # Extract standalone query from response — hard failure if missing
+        # Extract standalone queries (multi-probe) and the singular legacy field.
+        # The openAiClient layer normalises both fields, so trust its output.
+        standalone_queries = raw_response.get("standalone_queries")
         standalone_query = raw_response.get("standalone_query")
+
+        if not standalone_queries or not isinstance(standalone_queries, list):
+            # Fallback: derive list from singular field
+            if standalone_query and standalone_query.strip():
+                standalone_queries = [standalone_query.strip()]
+            else:
+                logger.error(
+                    "GPT failed to generate any standalone probe — cannot perform retrieval. "
+                    f"Raw response keys: {list(raw_response.keys())}"
+                )
+                return ExtractionResult(
+                    segments=[],
+                    success=False,
+                    error="Extraction failed: GPT did not return any standalone probe. Cannot perform behavior retrieval.",
+                    extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
+                    standalone_query=None,
+                    standalone_queries=None,
+                )
+
+        # Ensure singular field is populated (always = first probe)
         if not standalone_query or not standalone_query.strip():
-            logger.error(
-                "GPT failed to generate standalone_query — cannot perform retrieval. "
-                f"Raw response keys: {list(raw_response.keys())}"
-            )
-            return ExtractionResult(
-                segments=[],
-                success=False,
-                error="Extraction failed: GPT did not return a standalone query. Cannot perform behavior retrieval.",
-                extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
-                standalone_query=None,
-            )
-        
+            standalone_query = standalone_queries[0]
+
         # Extract required_intents for hybrid retrieval (3D search)
         required_intents = raw_response.get("required_intents")
         if not required_intents or not isinstance(required_intents, list):
@@ -340,13 +355,14 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
                 "did not contain enough information to generate a behavioral profile."
             )
         
-        # Return successful extraction result with standalone query and required intents
+        # Return successful extraction result with standalone queries and required intents
         return ExtractionResult(
             segments=validated_segments,
             success=True,
             error=None,
             extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
             standalone_query=standalone_query.strip(),
+            standalone_queries=standalone_queries,
             required_intents=required_intents,
             profile_signals=validated_profile_signals
         )
@@ -1165,6 +1181,32 @@ def _collect_all_relationships(
             f"distance={existing.distance:.3f}"
         )
         
+        # Semantic-distance duplicate upgrade: catches paraphrases where exact
+        # target strings differ (e.g. "dark mode" vs "dark theme", "VS Code"
+        # vs "Visual Studio Code").  Runs before classify_relationship so it
+        # takes priority when the embedding distance is very tight.
+        _PARAPHRASE_DUP_DISTANCE = 0.15
+        if (
+            existing.distance < _PARAPHRASE_DUP_DISTANCE
+            and existing.intent == canonical.intent
+            and existing.polarity == canonical.polarity
+        ):
+            _same_ctx, _ctx_rel = contexts_match(
+                existing.context or "general",
+                canonical.context
+            )
+            if _same_ctx:
+                logger.info(
+                    f"PARAPHRASE DUPLICATE: '{existing.target}' ~ '{canonical.target}' "
+                    f"(distance={existing.distance:.3f}) — upgrading to DUPLICATE"
+                )
+                relationships.append(BehaviorRelation(
+                    existing_behavior=existing,
+                    relation_type=RelationType.DUPLICATE,
+                    context_relation=_ctx_rel
+                ))
+                continue
+
         relation = classify_relationship(existing, canonical)
         if relation is not None:
             logger.info(
@@ -1172,8 +1214,6 @@ def _collect_all_relationships(
                 f"{existing.behavior_id}"
             )
             relationships.append(relation)
-            # TODO: remove below is the test is failing due to multiple relationships being detected for the same candidate
-            # relationships = [r for r in relationships if r.existing_behavior != existing]
         elif can_intents_conflict(existing.intent, canonical.intent):
             # SEMANTIC FALLBACK: canonical string rules found no relationship (targets differ —
             # synonyms, parent/child, or paraphrases like "coffee" vs "caffeine",
@@ -1728,6 +1768,26 @@ def store_behavior(
             )
         except Exception as e:
             logger.error(f"[GRAPH] Failed to create CO_PROMPT edges: {e}")
+
+    # Create CO_SESSION edges between new behaviors and pre-existing session behaviors
+    if prompt_behavior_ids and session_id:
+        try:
+            existing_session_ids = get_behavior_ids_by_session(
+                user_id=user_id,
+                session_id=session_id,
+                exclude_ids=prompt_behavior_ids,
+            )
+            if existing_session_ids:
+                for new_id in prompt_behavior_ids:
+                    co_session_ids = [new_id] + existing_session_ids
+                    insert_co_occurrences_batch(
+                        behavior_ids=co_session_ids,
+                        user_id=user_id,
+                        session_id=session_id,
+                        edge_type="CO_SESSION",
+                    )
+        except Exception as e:
+            logger.error(f"[GRAPH] Failed to create CO_SESSION edges: {e}")
 
     logger.info(f"store_behavior complete: {len(stored_behaviors)} behaviors stored")
     return stored_behaviors
