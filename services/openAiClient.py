@@ -131,16 +131,26 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
     5. confidence, clarity, linguistic_strength (all 0.0-1.0):
        - confidence: How certain you are this is a stable behavior (not a question or temporary state)
        - clarity: How clear and unambiguous the statement is
-       - linguistic_strength: Intensity of user's language
-         * Strong indicators → 0.8-1.0: "strongly", "always", "never", "absolutely", "definitely", "must", "cannot"
-         * Normal preference → 0.6-0.8: "prefer", "like", "usually", "generally"
-         * Mild → 0.4-0.6: "tend to", "somewhat", "kind of", "sometimes"
-         * Weak/uncertain → <0.4: "might", "maybe", "could", "possibly"
-         
-         ⚠️ CONSTRAINT intent should typically have high linguistic_strength (0.8+)
+       - linguistic_strength: How strongly the user expresses this behavior.
+         This is the DOMINANT signal for credibility — score it carefully.
+         * Maximum (0.85-1.00): "absolutely", "always", "never", "must", "cannot",
+                                "definitely", "without exception", "I refuse to"
+         * Strong   (0.65-0.85): "strongly prefer", "really love", "hate", "I will not"
+         * Normal   (0.45-0.65): "prefer", "like", "use", "do" (no modifier)
+         * Mild     (0.30-0.45): "tend to", "usually", "generally", "often"
+         * Weak     (0.15-0.30): "sometimes", "occasionally", "kind of", "sort of",
+                                 "somewhat", "when I remember"
+         * Very weak (0.00-0.20): "might", "maybe", "could", "possibly", "perhaps",
+                                  "would like to", "hope to", "someday",
+                                  "at some point", "if I have time"
+
+         ⚠️ Conditional capability statements such as "I can use X if required",
+            "I'm able to work with Y if needed", "I could do Z if it's required"
+            score below 0.20 — they describe fallback ability, not a preference.
+         ⚠️ CONSTRAINT intent should always have linguistic_strength ≥ 0.85.
     ---
     OUTPUT FORMAT (STRICT JSON - use these EXACT field names):
-    
+
     {
       "segments": [
         {
@@ -154,7 +164,7 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
               "polarity": "POSITIVE",
               "confidence": 0.92,
               "clarity": 0.88,
-              "linguistic_strength": 0.75
+              "linguistic_strength": 0.55
             }
           ]
         }
@@ -242,8 +252,8 @@ def extract_behavior(prompt: str) -> Dict[str, Any]:
     ⚠️ Note: Extract only the preferred choice (Angular)
     
     Input: "Maybe I should try using JavaScript for backend"
-    Output: {"intent": "PREFERENCE", "target": "JavaScript", "context": "backend", "polarity": "POSITIVE", "confidence": 0.35, "clarity": 0.4, "linguistic_strength": 0.3}
-    ⚠️ Note: Weak/uncertain statement - still extract but with low scores to reflect uncertainty
+    Output: {"intent": "PREFERENCE", "target": "JavaScript", "context": "backend", "polarity": "POSITIVE", "confidence": 0.40, "clarity": 0.45, "linguistic_strength": 0.10}
+    ⚠️ Note: Hedged tentative statement — linguistic_strength near minimum (very-weak band).
 
 ---
 TASK 2: PROFILE SIGNAL EXTRACTION (for Profile Service)
@@ -607,16 +617,26 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     5. confidence, clarity, linguistic_strength (all 0.0-1.0):
        - confidence: How certain you are this is a stable behavior (not a question or temporary state)
        - clarity: How clear and unambiguous the statement is
-       - linguistic_strength: Intensity of user's language
-         * Strong indicators → 0.8-1.0: "strongly", "always", "never", "absolutely", "definitely", "must", "cannot"
-         * Normal preference → 0.6-0.8: "prefer", "like", "usually", "generally"
-         * Mild → 0.4-0.6: "tend to", "somewhat", "kind of", "sometimes"
-         * Weak/uncertain → <0.4: "might", "maybe", "could", "possibly"
-         
-         ⚠️ CONSTRAINT intent should typically have high linguistic_strength (0.8+)
+       - linguistic_strength: How strongly the user expresses this behavior.
+         This is the DOMINANT signal for credibility — score it carefully.
+         * Maximum (0.85-1.00): "absolutely", "always", "never", "must", "cannot",
+                                "definitely", "without exception", "I refuse to"
+         * Strong   (0.65-0.85): "strongly prefer", "really love", "hate", "I will not"
+         * Normal   (0.45-0.65): "prefer", "like", "use", "do" (no modifier)
+         * Mild     (0.30-0.45): "tend to", "usually", "generally", "often"
+         * Weak     (0.15-0.30): "sometimes", "occasionally", "kind of", "sort of",
+                                 "somewhat", "when I remember"
+         * Very weak (0.00-0.20): "might", "maybe", "could", "possibly", "perhaps",
+                                  "would like to", "hope to", "someday",
+                                  "at some point", "if I have time"
+
+         ⚠️ Conditional capability statements such as "I can use X if required",
+            "I'm able to work with Y if needed", "I could do Z if it's required"
+            score below 0.20 — they describe fallback ability, not a preference.
+         ⚠️ CONSTRAINT intent should always have linguistic_strength ≥ 0.85.
     ---
     OUTPUT FORMAT (STRICT JSON - use these EXACT field names):
-    
+
     {
       "standalone_query": "The first probe — kept as a string for backwards compatibility (e.g., 'prefers Python for backend')",
       "standalone_queries": [
@@ -636,7 +656,7 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
               "polarity": "POSITIVE",
               "confidence": 0.92,
               "clarity": 0.88,
-              "linguistic_strength": 0.75
+              "linguistic_strength": 0.55
             }
           ]
         }

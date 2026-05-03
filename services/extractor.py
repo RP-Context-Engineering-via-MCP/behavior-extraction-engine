@@ -19,7 +19,8 @@ from models.behavior import (
     DetailedExtractionResult
 )
 from services.openAiClient import extract_behavior, embed_text, analyze_conflict, extract_behavior_with_history
-from utils.embedding_utils import get_canonical_embedding
+from utils.embedding_utils import get_canonical_embedding, get_text_embedding
+from utils.similarity_utils import cosine_distance
 from services.credibilityCalculator import calculate_initial_credibility, should_store_behavior, get_decay_rate
 from services.behaviorRepository import (
     insert_behavior, 
@@ -31,6 +32,7 @@ from services.behaviorRepository import (
     update_behavior_state,
     update_behavior_access_time,
     insert_co_occurrences_batch,
+    insert_directed_pairs_batch,
     get_behavior_ids_by_session
 )
 from services.profileSignalExtractor import ProfileSignalExtractor
@@ -40,7 +42,9 @@ from config.configurations import (
     DEFAULT_DECAY_RATE,
     SAMPLE_USERID,
     SEMANTIC_RELEVANCE_THRESHOLD,
-    DECAY_GRACE_PERIOD_SECONDS
+    DECAY_GRACE_PERIOD_SECONDS,
+    PARAPHRASE_DUPLICATE_DISTANCE,
+    PARAPHRASE_TARGET_DISTANCE
 )
 
 import logging
@@ -51,6 +55,73 @@ logger = logging.getLogger(__name__)
 
 # Profile Signal Extractor instance for validating GPT-4 profile_signals output
 _profile_signal_extractor = ProfileSignalExtractor()
+
+# ==============================================================================
+# TARGET NORMALIZATION (for duplicate detection)
+# ==============================================================================
+# Duplicate detection compares behavior targets with exact string equality,
+# which misses paraphrases like "Dark Mode" / "the dark mode" / "dark-mode".
+# This normalizer collapses common surface variations so equivalent targets
+# compare equal, without softening the polarity / context / intent gates that
+# the conflict pipeline relies on.
+# ==============================================================================
+
+def _normalize_target(target: Optional[str]) -> str:
+    """Lowercase, strip articles/punctuation/separators for duplicate matching."""
+    if not target:
+        return ""
+    t = target.lower().strip()
+    t = t.replace("-", " ").replace("_", " ")
+    for article in ("the ", "a ", "an "):
+        if t.startswith(article):
+            t = t[len(article):]
+    t = t.rstrip(".,!?;:")
+    return " ".join(t.split())
+
+
+def _targets_are_paraphrases(
+    existing_target: Optional[str],
+    new_target: Optional[str]
+) -> bool:
+    """
+    Confirm two targets are actual paraphrases before upgrading to DUPLICATE.
+
+    The canonical-sentence distance can be tight purely because intent + context
+    + polarity match — e.g. "fastapi" vs "asynchronous support" both render as
+    "user POSITIVE PREFERENCE <target> in web framework" and end up clustered.
+    This second gate embeds the targets in isolation and requires their cosine
+    distance to also be tight, which true paraphrases like "dark mode" /
+    "dark theme" pass and disjoint-but-related concepts fail.
+
+    Returns False on any embedding failure (conservative: better to miss a
+    paraphrase than to silently merge two distinct behaviors).
+    """
+    norm_existing = _normalize_target(existing_target)
+    norm_new = _normalize_target(new_target)
+    if not norm_existing or not norm_new:
+        return False
+    if norm_existing == norm_new:
+        return True
+
+    try:
+        emb_existing = get_text_embedding(norm_existing)
+        emb_new = get_text_embedding(norm_new)
+        target_dist = cosine_distance(emb_existing, emb_new)
+    except Exception as exc:
+        logger.warning(
+            f"Target paraphrase check failed for '{existing_target}' vs "
+            f"'{new_target}': {exc}. Skipping paraphrase upgrade."
+        )
+        return False
+
+    is_paraphrase = target_dist < PARAPHRASE_TARGET_DISTANCE
+    logger.info(
+        f"Target paraphrase check: '{norm_existing}' vs '{norm_new}' "
+        f"target_distance={target_dist:.3f} threshold={PARAPHRASE_TARGET_DISTANCE} "
+        f"→ {'paraphrase' if is_paraphrase else 'distinct concepts'}"
+    )
+    return is_paraphrase
+
 
 # ==============================================================================
 # INTENT CONFLICT RULES
@@ -1053,7 +1124,7 @@ def classify_relationship(
         canonical.context
     )
     
-    same_target = existing.target == canonical.target
+    same_target = _normalize_target(existing.target) == _normalize_target(canonical.target)
     same_polarity = existing.polarity == canonical.polarity
     
     # ==================================================================
@@ -1185,9 +1256,13 @@ def _collect_all_relationships(
         # target strings differ (e.g. "dark mode" vs "dark theme", "VS Code"
         # vs "Visual Studio Code").  Runs before classify_relationship so it
         # takes priority when the embedding distance is very tight.
-        _PARAPHRASE_DUP_DISTANCE = 0.15
+        #
+        # Two-signal gate: the canonical-sentence distance alone is not
+        # enough — it can be tight purely because intent/context/polarity
+        # match (see "fastapi" vs "asynchronous support" in "web framework").
+        # We additionally require the targets themselves to embed close.
         if (
-            existing.distance < _PARAPHRASE_DUP_DISTANCE
+            existing.distance < PARAPHRASE_DUPLICATE_DISTANCE
             and existing.intent == canonical.intent
             and existing.polarity == canonical.polarity
         ):
@@ -1195,7 +1270,7 @@ def _collect_all_relationships(
                 existing.context or "general",
                 canonical.context
             )
-            if _same_ctx:
+            if _same_ctx and _targets_are_paraphrases(existing.target, canonical.target):
                 logger.info(
                     f"PARAPHRASE DUPLICATE: '{existing.target}' ~ '{canonical.target}' "
                     f"(distance={existing.distance:.3f}) — upgrading to DUPLICATE"
@@ -1769,7 +1844,10 @@ def store_behavior(
         except Exception as e:
             logger.error(f"[GRAPH] Failed to create CO_PROMPT edges: {e}")
 
-    # Create CO_SESSION edges between new behaviors and pre-existing session behaviors
+    # Create CO_SESSION edges between new behaviors (anchors) and pre-existing
+    # session behaviors (partners).  Only anchor↔partner pairs are emitted —
+    # partner↔partner pairs are NOT created here, because those existing
+    # behaviors did not co-occur with each other in *this* prompt event.
     if prompt_behavior_ids and session_id:
         try:
             existing_session_ids = get_behavior_ids_by_session(
@@ -1778,14 +1856,13 @@ def store_behavior(
                 exclude_ids=prompt_behavior_ids,
             )
             if existing_session_ids:
-                for new_id in prompt_behavior_ids:
-                    co_session_ids = [new_id] + existing_session_ids
-                    insert_co_occurrences_batch(
-                        behavior_ids=co_session_ids,
-                        user_id=user_id,
-                        session_id=session_id,
-                        edge_type="CO_SESSION",
-                    )
+                insert_directed_pairs_batch(
+                    anchor_ids=prompt_behavior_ids,
+                    partner_ids=existing_session_ids,
+                    user_id=user_id,
+                    session_id=session_id,
+                    edge_type="CO_SESSION",
+                )
         except Exception as e:
             logger.error(f"[GRAPH] Failed to create CO_SESSION edges: {e}")
 

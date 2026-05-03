@@ -615,8 +615,7 @@ def extract_behaviors_with_history(
                     raise RuntimeError("No probes successfully embedded")
 
                 logger.info(
-                    f"Multi-probe retrieval: {len(probe_embeddings)} probe(s) for query "
-                    f"(first='{probes[0][:60]}...')"
+                    f"Multi-probe retrieval: {len(probes)} probe(s) for query: {probes}"
                 )
 
                 hybrid_response = search_similar_behavior_3D(

@@ -1162,9 +1162,13 @@ def search_similar_behavior_3D(
                             affinity_map[intent_type] = best
                     logger.debug(f"[LRA] Intent affinity map: {affinity_map}")
 
-                # Process rows: compute S_final, apply lazy decay, collect
+                # Process rows: compute S_final, apply lazy decay, collect.
+                # Lazy-decay pending updates are attached to each candidate
+                # dict (under "_pending_decay_update") and only harvested
+                # for SURVIVING candidates after Stage 3 — so we never
+                # persist decay for behaviors that are subsequently dropped
+                # by the floor / gap / cap.
                 scored_candidates = []
-                decay_updates = []
 
                 for row in rows:
                     behavior_id = row["behavior_id"]
@@ -1210,18 +1214,19 @@ def search_similar_behavior_3D(
                         current_time=current_time
                     )
 
+                    pending_decay_update = None
                     if decay_applied:
                         logger.debug(
                             f"[LRA] Lazy decay (in-memory) for {behavior_id}: "
                             f"{stored_credibility:.4f} → {new_credibility:.4f} "
                             f"({days_elapsed} days)"
                         )
-                        decay_updates.append((
+                        pending_decay_update = (
                             new_credibility,
                             current_time,
                             behavior_id,
-                            user_id
-                        ))
+                            user_id,
+                        )
 
                     scored_candidates.append({
                         "behavior_id": behavior_id,
@@ -1241,10 +1246,12 @@ def search_similar_behavior_3D(
                         "target": target,
                         "context": context if context else "general",
                         "polarity": polarity,
+                        "_pending_decay_update": pending_decay_update,
                     })
 
                 # Sort by S_final descending (re-ranking may reorder)
                 scored_candidates.sort(key=lambda c: c["s_final"], reverse=True)
+                logger.info(f"[LRA] {len(scored_candidates)} candidates after intent re-ranking")
 
                 # ==========================================================
                 # STAGE 3a — Absolute Semantic Floor (Hard Cutoff)
@@ -1347,10 +1354,16 @@ def search_similar_behavior_3D(
                     )
 
                 # ==========================================================
-                # Build final response objects
+                # Build final response objects.  Decay updates are
+                # harvested ONLY from surviving candidates — behaviors
+                # dropped by the floor / gap / cap should not have their
+                # decay persisted, since we never returned them and a
+                # subsequent search may re-evaluate them with fresher
+                # signals before that work is committed.
                 # ==========================================================
                 similarity_results = []
                 accessed_behavior_ids = []
+                decay_updates: List[tuple] = []
 
                 for i, c in enumerate(scored_candidates):
                     # distance = 1 - S_final  (lower = better, API consistency)
@@ -1369,6 +1382,9 @@ def search_similar_behavior_3D(
                         polarity=c["polarity"],
                     ))
                     accessed_behavior_ids.append(c["behavior_id"])
+                    pending = c.get("_pending_decay_update")
+                    if pending is not None:
+                        decay_updates.append(pending)
 
                     logger.info(
                         f"[LRA] MATCH #{i + 1}: "
@@ -1382,10 +1398,6 @@ def search_similar_behavior_3D(
                         f"credibility={c['credibility']:.4f} | "
                         f"text='{c['behavior_text'][:80]}...'"
                     )
-
-                # Trim decay_updates to only include returned behavior IDs
-                returned_ids = set(accessed_behavior_ids)
-                decay_updates = [d for d in decay_updates if d[2] in returned_ids]
 
                 logger.info(
                     f"[LRA] Search for user {user_id} in session {session_id}: "
@@ -2462,47 +2474,27 @@ def get_behavior_ids_by_session(
         return []
 
 
-def insert_co_occurrences_batch(
-    behavior_ids: List[str],
+def _upsert_co_occurrence_pairs(
+    pairs: List[Tuple[str, str]],
     user_id: str,
     edge_type: str,
-    session_id: str = "default",
+    session_id: str,
 ) -> int:
     """
-    Create pairwise co-occurrence edges for a list of behavior IDs.
+    Internal helper: UPSERT a list of canonical (a, b) pairs as edges.
 
-    Generates all unique (a, b) pairs (a < b lexicographically to avoid
-    duplicate reversed edges) and upserts them.  On conflict the edge
-    weight is incremented by 0.5 (diminishing reinforcement signal).
-
-    Args:
-        behavior_ids: List of behavior IDs that co-occurred.
-        user_id: The user who owns these behaviors.
-        edge_type: 'CO_PROMPT' or 'CO_SESSION'.
-        session_id: Session in which these behaviors were extracted.
-
-    Returns:
-        Number of edges written (inserted or updated).
+    Each pair is assumed to already be in canonical order (a < b lexicographically)
+    and free of self-loops.  On conflict, weight is bumped by +0.5 (diminishing
+    reinforcement signal) and created_at is refreshed.
     """
-    if len(behavior_ids) < 2:
+    if not pairs:
         return 0
 
     current_timestamp = int(time.time())
 
-    # Build all unique pairs (sorted to guarantee canonical order)
-    pairs = []
-    sorted_ids = sorted(set(behavior_ids))
-    for i in range(len(sorted_ids)):
-        for j in range(i + 1, len(sorted_ids)):
-            pairs.append((sorted_ids[i], sorted_ids[j]))
-
-    if not pairs:
-        return 0
-
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
-                # Use executemany with UPSERT — ON CONFLICT bumps weight
                 cur.executemany(
                     """
                     INSERT INTO behavior_co_occurrences
@@ -2521,13 +2513,103 @@ def insert_co_occurrences_batch(
                 conn.commit()
 
         logger.info(
-            f"[GRAPH] Upserted {len(pairs)} {edge_type} edge(s) for user {user_id} session {session_id}"
+            f"[GRAPH] Upserted {len(pairs)} {edge_type} edge(s) "
+            f"for user {user_id} session {session_id}"
         )
         return len(pairs)
 
     except Exception as e:
         logger.error(f"[GRAPH] Failed to insert co-occurrence edges: {str(e)}")
         return 0
+
+
+def insert_co_occurrences_batch(
+    behavior_ids: List[str],
+    user_id: str,
+    edge_type: str,
+    session_id: str = "default",
+) -> int:
+    """
+    Create pairwise co-occurrence edges for a list of behavior IDs.
+
+    Generates all unique (a, b) pairs (a < b lexicographically to avoid
+    duplicate reversed edges) and upserts them.  Use this for CO_PROMPT
+    edges where every behavior in the list genuinely co-occurred (e.g. all
+    behaviors extracted from the same prompt).
+
+    For "anchor + partners" semantics — i.e. when only a subset of the IDs
+    are anchors that co-occurred with a separate partner set, but the
+    partners did NOT co-occur with each other in this event — use
+    insert_directed_pairs_batch instead.  Calling this function with an
+    anchor + partners list would inflate edge weights between unrelated
+    partner pairs.
+
+    Args:
+        behavior_ids: List of behavior IDs that co-occurred.
+        user_id: The user who owns these behaviors.
+        edge_type: 'CO_PROMPT' or 'CO_SESSION'.
+        session_id: Session in which these behaviors were extracted.
+
+    Returns:
+        Number of edges written (inserted or updated).
+    """
+    if len(behavior_ids) < 2:
+        return 0
+
+    sorted_ids = sorted(set(behavior_ids))
+    pairs = [
+        (sorted_ids[i], sorted_ids[j])
+        for i in range(len(sorted_ids))
+        for j in range(i + 1, len(sorted_ids))
+    ]
+    return _upsert_co_occurrence_pairs(pairs, user_id, edge_type, session_id)
+
+
+def insert_directed_pairs_batch(
+    anchor_ids: List[str],
+    partner_ids: List[str],
+    user_id: str,
+    edge_type: str,
+    session_id: str = "default",
+) -> int:
+    """
+    Create co-occurrence edges between every (anchor, partner) pair only.
+
+    Unlike ``insert_co_occurrences_batch`` (which generates ALL pairwise
+    combinations of a single id list), this helper emits edges strictly
+    between the anchor set and the partner set.  Anchor↔anchor and
+    partner↔partner pairs are NOT created — those did not co-occur in
+    this event.
+
+    Use case: CO_SESSION edges from newly inserted / reinforced behaviors
+    (anchors) to pre-existing session behaviors (partners).  Earlier
+    versions of this code passed ``[new_id] + existing_session_ids`` to
+    ``insert_co_occurrences_batch`` once per new id, which inserted
+    spurious existing↔existing edges and bumped their weights by +0.5
+    on every prompt.  This helper avoids that quadratic noise.
+
+    Edges are stored in canonical order (min, max).  Self-loops and
+    duplicates are skipped.
+    """
+    if not anchor_ids or not partner_ids:
+        return 0
+
+    anchor_set = set(anchor_ids)
+    partner_set = set(partner_ids)
+
+    seen: set[Tuple[str, str]] = set()
+    pairs: List[Tuple[str, str]] = []
+    for a in anchor_set:
+        for p in partner_set:
+            if a == p:
+                continue  # self-loop
+            lo, hi = (a, p) if a < p else (p, a)
+            if (lo, hi) in seen:
+                continue
+            seen.add((lo, hi))
+            pairs.append((lo, hi))
+
+    return _upsert_co_occurrence_pairs(pairs, user_id, edge_type, session_id)
 
 
 def get_graph_expanded_behaviors(
@@ -2552,12 +2634,20 @@ def get_graph_expanded_behaviors(
 
     RELEVANCE GATE (when query_embeddings is provided):
     Each candidate neighbor's stored prose embedding is compared against
-    every probe; the BEST cosine distance must be ≤
-    GRAPH_EXPANSION_DISTANCE_THRESHOLD.  This prevents cross-domain
-    co-occurrence noise (e.g., a user mentions Python and cooking in the
-    same prompt → write-time edge → otherwise gets replayed at read time
-    on a Python-only query).  When query_embeddings is None or empty, the
-    gate is skipped (legacy behaviour).
+    every probe; the BEST cosine distance must be ≤ the edge-type-specific
+    threshold:
+        CO_PROMPT  → GRAPH_EXPANSION_DISTANCE_THRESHOLD          (strict)
+        CO_SESSION → GRAPH_EXPANSION_SESSION_DISTANCE_THRESHOLD  (loose)
+
+    The split exists because CO_PROMPT edges link ANY two behaviors that
+    appeared in the same prompt (high cross-domain noise risk), while
+    CO_SESSION edges already carry the user's implicit "these belong
+    together in this work session" signal — pragmatic association the
+    embeddings cannot see.  A tight CO_SESSION gate would defeat the
+    purpose of using session as an edge factor.
+
+    When query_embeddings is None or empty, the gate is skipped (legacy
+    behaviour).
 
     Lazy decay is applied in Python after fetch (same pattern as LRA),
     with a ``limit * 2`` pre-fetch from SQL to allow re-ranking post-decay
@@ -2580,28 +2670,41 @@ def get_graph_expanded_behaviors(
     if not seed_behavior_ids:
         return []
 
-    from config.configurations import GRAPH_EXPANSION_DISTANCE_THRESHOLD
+    from config.configurations import (
+        GRAPH_EXPANSION_DISTANCE_THRESHOLD,
+        GRAPH_EXPANSION_SESSION_DISTANCE_THRESHOLD,
+    )
 
     sql_limit = limit * 2  # pre-fetch extra candidates to allow decay re-ranking
 
     # Build the optional relevance-gate SQL fragment.  Computes the MIN
-    # cosine distance from the neighbor's prose embedding to ANY probe;
-    # rows whose min-distance exceeds the threshold are dropped.
+    # cosine distance from the neighbor's prose embedding to ANY probe.
+    #
+    # The gate threshold is edge-type-conditional:
+    #   - CO_PROMPT  → strict (GRAPH_EXPANSION_DISTANCE_THRESHOLD)
+    #   - CO_SESSION → loose  (GRAPH_EXPANSION_SESSION_DISTANCE_THRESHOLD)
+    # Encoded as a CASE in the WHERE clause so the gate runs before
+    # DISTINCT ON picks the surviving edge per neighbor.
     use_relevance_gate = bool(query_embeddings) and len(query_embeddings) > 0
     if use_relevance_gate:
-        # LEAST(b.embedding <=> %s::vector, b.embedding <=> %s::vector, ...)
         distance_terms = ", ".join(
             ["b.embedding <=> %s::vector"] * len(query_embeddings)
         )
         if len(query_embeddings) == 1:
-            min_dist_expr = distance_terms  # LEAST() of one is invalid; use the term directly
+            min_dist_expr = distance_terms  # LEAST() of one is invalid
         else:
             min_dist_expr = f"LEAST({distance_terms})"
         relevance_select = f", {min_dist_expr} AS min_query_distance"
-        relevance_where = f" AND {min_dist_expr} <= %s"
+        relevance_where = (
+            f" AND {min_dist_expr} <= "
+            f"CASE WHEN e.edge_type = 'CO_SESSION' THEN %s ELSE %s END"
+        )
         # Probe vectors appear twice: once in SELECT, once in WHERE
         relevance_params_select = list(query_embeddings)
-        relevance_params_where = list(query_embeddings) + [GRAPH_EXPANSION_DISTANCE_THRESHOLD]
+        relevance_params_where = list(query_embeddings) + [
+            GRAPH_EXPANSION_SESSION_DISTANCE_THRESHOLD,
+            GRAPH_EXPANSION_DISTANCE_THRESHOLD,
+        ]
     else:
         relevance_select = ""
         relevance_where = ""
@@ -2728,7 +2831,9 @@ def get_graph_expanded_behaviors(
             })
 
         gate_info = (
-            f", relevance_gate=ON (τ={GRAPH_EXPANSION_DISTANCE_THRESHOLD:.2f}, "
+            f", relevance_gate=ON ("
+            f"τ_prompt={GRAPH_EXPANSION_DISTANCE_THRESHOLD:.2f}, "
+            f"τ_session={GRAPH_EXPANSION_SESSION_DISTANCE_THRESHOLD:.2f}, "
             f"probes={len(query_embeddings) if query_embeddings else 0})"
             if use_relevance_gate else ", relevance_gate=OFF"
         )

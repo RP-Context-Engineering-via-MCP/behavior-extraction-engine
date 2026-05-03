@@ -38,18 +38,25 @@ INTENT_DECAY_RATES: dict[str, float] = {
 # ---------------------------------------------------------------------------
 
 # Weights used when calculating the initial credibility of an extracted behavior.
-#   confidence        – GPT's certainty in the extraction          (0.0-1.0)
-#   clarity           – how unambiguous the behavior statement is  (0.0-1.0)
-#   linguistic_strength – how strongly the user expressed it       (0.0-1.0)
+# Reduced to 2 factors (was 3) — confidence and clarity were near-duplicates of
+# the same "is this a clean, real behavior?" signal and double-counted, leaving
+# linguistic_strength under-weighted at 0.25 even though it is the only signal
+# that distinguishes hedged ("I might try Rust") from strong ("I always use
+# Python") statements.  They are now averaged into a single extraction_quality
+# term, freeing linguistic_strength to carry the dominant weight.
+#   extraction_quality (= avg of LLM confidence + clarity) – weight 0.25
+#   linguistic_strength (LLM's intensity score)            – weight 0.75
 CREDIBILITY_WEIGHTS: dict[str, float] = {
-    "confidence": 0.40,
-    "clarity": 0.35,
-    "linguistic_strength": 0.25,
+    "extraction_quality": 0.25,
+    "linguistic_strength": 0.75,
 }
 
 # Behaviors whose calculated credibility falls at or below this value are
 # filtered out before storage (too low quality to be useful).
-CREDIBILITY_PRUNE_THRESHOLD: float = 0.4
+# Lowered from 0.40 → 0.30 to accompany the formula change above: weak-but-real
+# behaviors ("I sometimes use Pomodoro") now legitimately settle around 0.36
+# and would otherwise be filtered out.
+CREDIBILITY_PRUNE_THRESHOLD: float = 0.30
 
 # ---------------------------------------------------------------------------
 # Reinforcement
@@ -99,6 +106,24 @@ CONFLICT_EXPIRY_SECONDS: int = CONFLICT_EXPIRY_DAYS * 24 * 60 * 60  # 2 592 000 
 # relevant during the store_behavior pipeline (duplicate / conflict gate).
 SEMANTIC_RELEVANCE_THRESHOLD: float = 0.6
 
+# Maximum cosine distance at which two behaviors with the same intent +
+# same polarity + same context are upgraded to DUPLICATE even if their
+# target strings differ.  Was hardcoded as 0.15 in extractor.py; raised to
+# 0.28 to catch paraphrases like "dark mode" / "dark theme" or short vs
+# verbose forms without admitting false duplicates (precision was 1.00 with
+# headroom to spare).
+PARAPHRASE_DUPLICATE_DISTANCE: float = 0.28
+
+# Secondary gate applied on top of PARAPHRASE_DUPLICATE_DISTANCE: the
+# *targets themselves* (not the full canonical sentence) must also be
+# semantically close before two behaviors can be merged as DUPLICATE.
+# Without this, the canonical-sentence distance can be tight purely because
+# intent + context + polarity match — letting through cases like
+# "fastapi" vs "asynchronous support" (same web-framework context,
+# disjoint concepts).  Tuned for short target phrases; loosen if true
+# paraphrases like "dark mode" / "dark theme" start being missed.
+PARAPHRASE_TARGET_DISTANCE: float = 0.30
+
 # Maximum cosine *distance* value used by the /v2/extract endpoint to
 # decide which retrieved behaviors are returned to the caller as "related".
 # (distance = 1 - hybrid_score, so lower is closer)
@@ -135,8 +160,10 @@ INTENT_RERANK_ALPHA: float = 0.35
 # into the LLM context window, reducing hallucination risk.
 # Lowered from 0.48 → 0.40 to reflect MiniLM-L6's diffuse geometry on
 # abstract↔concrete asymmetric query patterns (e.g., "QA practices" ↔
-# "always writes unit tests").
-SEMANTIC_FLOOR_THRESHOLD: float = 0.40
+# "always writes unit tests"), then 0.40 → 0.35 to recover near-misses
+# that the relevance-gap stage was already correctly ranking but the
+# floor was discarding before the gap stage could see them.
+SEMANTIC_FLOOR_THRESHOLD: float = 0.35
 
 # Soft-fallback floor — only activated when the primary floor (above)
 # drops ALL candidates to zero results.  Recovers near-miss behaviors
@@ -153,10 +180,12 @@ MAX_FALLBACK_RESULTS: int = 3
 # Relevance-gap cutoff ratio (Top-Score Relative Drop-off).
 # T_dynamic = S_max * (1 - RELEVANCE_GAP_DROP_RATIO)
 # Any behaviour below T_dynamic is cut.
-# Loosened from 0.15 → 0.30 for broad multi-domain queries — at 0.15 a
-# single tight top hit nukes the entire tail, which is too aggressive on
-# diffuse 384-dim cosine.
-RELEVANCE_GAP_DROP_RATIO: float = 0.30
+# Loosened from 0.15 → 0.30 → 0.45 progressively as we observed that
+# even 0.30 was over-pruning: with S_max ≈ 0.7 (typical good match)
+# T_dynamic was 0.49, which on diffuse 384-dim cosine left only the
+# top-1 candidate. 0.45 keeps the second/third tier visible while the
+# absolute SEMANTIC_FLOOR_THRESHOLD still guards against tail noise.
+RELEVANCE_GAP_DROP_RATIO: float = 0.45
 
 # Hard cap on the number of results returned after gap filtering.
 # Prevents over-retrieval on broad / vague queries.
@@ -183,14 +212,26 @@ MAX_STANDALONE_QUERIES: int = 3
 # ---------------------------------------------------------------------------
 # After 1-hop co-occurrence walk in get_graph_expanded_behaviors, every
 # neighbor is checked against the query embedding(s) and dropped if its
-# best cosine distance to any probe exceeds this threshold.
+# best cosine distance to any probe exceeds the edge-type-specific
+# threshold below.
 #
-# Without this gate, graph expansion replays write-time co-occurrence
+# Without any gate, graph expansion replays write-time co-occurrence
 # (e.g., "Python" and "cooking" mentioned in the same prompt) into
 # read-time noise — even when dense retrieval correctly excluded them.
 #
-# 0.55 keeps strong topical neighbors while filtering cross-domain noise.
+# CO_PROMPT edges are the riskiest source of cross-domain noise: any
+# two behaviors mentioned in one prompt are linked, regardless of how
+# unrelated they are.  Apply a tight gate here.
+#
+# CO_SESSION edges already carry an implicit pragmatic association —
+# the user kept these behaviors together inside one session boundary,
+# so even topically distant neighbors are usually relevant context.
+# Use a much looser gate so that, e.g., "I'm working on a Django
+# project, and I prefer dark mode" still surfaces the dark-mode
+# preference when the query is about Django, without needing semantic
+# proximity between the two concepts.
 GRAPH_EXPANSION_DISTANCE_THRESHOLD: float = 0.55
+GRAPH_EXPANSION_SESSION_DISTANCE_THRESHOLD: float = 0.85
 
 # ---------------------------------------------------------------------------
 # Intent taxonomy
