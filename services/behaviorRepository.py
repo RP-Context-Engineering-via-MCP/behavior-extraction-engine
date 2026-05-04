@@ -71,7 +71,8 @@ def insert_behavior(payload: dict):
                     credibility, decay_rate, reinforcement_count,
                     usefulness_score, behavior_state,
                     created_at, last_seen_at, last_accessed_at, last_decay_applied_at,
-                    embedding, canonical_embedding, search_vector
+                    embedding, canonical_embedding, search_vector,
+                    extraction_confidence, clarity_score, linguistic_strength
                 )
                 VALUES (
                     %(behavior_id)s, %(user_id)s, %(session_id)s, %(behavior_text)s,
@@ -80,7 +81,8 @@ def insert_behavior(payload: dict):
                     %(usefulness_score)s, %(behavior_state)s,
                     %(created_at)s, %(last_seen_at)s, %(last_accessed_at)s, %(last_decay_applied_at)s,
                     %(embedding)s, %(canonical_embedding)s,
-                    to_tsvector('english', %(search_text)s)
+                    to_tsvector('english', %(search_text)s),
+                    %(extraction_confidence)s, %(clarity_score)s, %(linguistic_strength)s
                 )
                 """,
                 payload,

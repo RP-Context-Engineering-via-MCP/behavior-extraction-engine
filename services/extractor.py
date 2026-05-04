@@ -535,6 +535,9 @@ def _create_stored_behavior(
     canonical_embedding_vector: List[float],
     canonical: CanonicalBehavior,
     session_id: str = "default",
+    extraction_confidence: Optional[float] = None,
+    clarity_score: Optional[float] = None,
+    linguistic_strength: Optional[float] = None,
 ) -> StoredBehavior:
     """Create a StoredBehavior object from extraction data with intent-based decay rate."""
     decay_rate = get_decay_rate(intent=canonical.intent)
@@ -556,6 +559,9 @@ def _create_stored_behavior(
         created_at=current_time,
         last_seen_at=current_time,
         last_decay_applied_at=decay_starts_at,
+        extraction_confidence=extraction_confidence,
+        clarity_score=clarity_score,
+        linguistic_strength=linguistic_strength,
     )
 
 
@@ -631,7 +637,10 @@ def _handle_llm_conflict_analysis(
     canonical: CanonicalBehavior,
     stored_behaviors: List[StoredBehavior],
     session_id: str = "default",
-    conflict_subtype: str = "POLARITY_CONFLICT"
+    conflict_subtype: str = "POLARITY_CONFLICT",
+    extraction_confidence: Optional[float] = None,
+    clarity_score: Optional[float] = None,
+    linguistic_strength: Optional[float] = None,
 ) -> tuple[bool, bool]:
     """
     Handle LLM conflict analysis for ambiguous credibility scenarios.
@@ -676,6 +685,9 @@ def _handle_llm_conflict_analysis(
             canonical_embedding_vector=canonical_embedding_vector,
             canonical=canonical,
             session_id=session_id,
+            extraction_confidence=extraction_confidence,
+            clarity_score=clarity_score,
+            linguistic_strength=linguistic_strength,
         )
         _flag_and_create_conflict(
             existing_behavior_id=existing.behavior_id,
@@ -703,6 +715,9 @@ def _handle_llm_conflict_analysis(
         canonical_embedding_vector=canonical_embedding_vector,
         canonical=canonical,
         session_id=session_id,
+        extraction_confidence=extraction_confidence,
+        clarity_score=clarity_score,
+        linguistic_strength=linguistic_strength,
     )
 
     if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
@@ -750,7 +765,10 @@ def _handle_polarity_conflict(
     canonical: CanonicalBehavior,
     stored_behaviors: List[StoredBehavior],
     session_id: str = "default",
-    conflict_subtype: str = "POLARITY_CONFLICT"
+    conflict_subtype: str = "POLARITY_CONFLICT",
+    extraction_confidence: Optional[float] = None,
+    clarity_score: Optional[float] = None,
+    linguistic_strength: Optional[float] = None,
 ) -> tuple[bool, bool]:
     """
     Handle polarity conflict (same target, different polarity).
@@ -790,6 +808,9 @@ def _handle_polarity_conflict(
             canonical_embedding_vector=canonical_embedding_vector,
             canonical=canonical,
             session_id=session_id,
+            extraction_confidence=extraction_confidence,
+            clarity_score=clarity_score,
+            linguistic_strength=linguistic_strength,
         )
 
         _supersede_existing_behavior(
@@ -824,6 +845,9 @@ def _handle_polarity_conflict(
             stored_behaviors=stored_behaviors,
             session_id=session_id,
             conflict_subtype=conflict_subtype,
+            extraction_confidence=extraction_confidence,
+            clarity_score=clarity_score,
+            linguistic_strength=linguistic_strength,
         )
 
     return (False, False)
@@ -838,7 +862,10 @@ def _handle_potential_conflict(
     canonical_embedding_vector: List[float],
     canonical: CanonicalBehavior,
     stored_behaviors: List[StoredBehavior],
-    session_id: str = "default"
+    session_id: str = "default",
+    extraction_confidence: Optional[float] = None,
+    clarity_score: Optional[float] = None,
+    linguistic_strength: Optional[float] = None,
 ) -> tuple[bool, bool]:
     """
     Handle potential conflict (different target, same context).
@@ -875,6 +902,9 @@ def _handle_potential_conflict(
             canonical_embedding_vector=canonical_embedding_vector,
             canonical=canonical,
             session_id=session_id,
+            extraction_confidence=extraction_confidence,
+            clarity_score=clarity_score,
+            linguistic_strength=linguistic_strength,
         )
         _supersede_existing_behavior(
             existing_behavior_id=existing.behavior_id,
@@ -925,6 +955,9 @@ def _handle_potential_conflict(
             canonical_embedding_vector=canonical_embedding_vector,
             canonical=canonical,
             session_id=session_id,
+            extraction_confidence=extraction_confidence,
+            clarity_score=clarity_score,
+            linguistic_strength=linguistic_strength,
         )
         _flag_and_create_conflict(
             existing_behavior_id=existing.behavior_id,
@@ -952,6 +985,9 @@ def _handle_potential_conflict(
         canonical_embedding_vector=canonical_embedding_vector,
         canonical=canonical,
         session_id=session_id,
+        extraction_confidence=extraction_confidence,
+        clarity_score=clarity_score,
+        linguistic_strength=linguistic_strength,
     )
 
     if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
@@ -1261,6 +1297,9 @@ def _process_relationships(
     canonical_embedding_vector: List[float],
     stored_behaviors: List[StoredBehavior],
     session_id: str = "default",
+    extraction_confidence: Optional[float] = None,
+    clarity_score: Optional[float] = None,
+    linguistic_strength: Optional[float] = None,
 ) -> bool:
     """
     Process all collected relationships and take appropriate actions.
@@ -1378,6 +1417,9 @@ def _process_relationships(
                 canonical=canonical,
                 stored_behaviors=stored_behaviors,
                 session_id=session_id,
+                extraction_confidence=extraction_confidence,
+                clarity_score=clarity_score,
+                linguistic_strength=linguistic_strength,
             )
             if not decision_taken:
                 all_conflicts_resolved = False
@@ -1433,6 +1475,9 @@ def _process_relationships(
                 stored_behaviors=stored_behaviors,
                 session_id=session_id,
                 conflict_subtype="CROSS_INTENT_CONFLICT",
+                extraction_confidence=extraction_confidence,
+                clarity_score=clarity_score,
+                linguistic_strength=linguistic_strength,
             )
             if not decision_taken:
                 all_cross_intent_resolved = False
@@ -1483,6 +1528,9 @@ def _process_relationships(
                 canonical=canonical,
                 stored_behaviors=stored_behaviors,
                 session_id=session_id,
+                extraction_confidence=extraction_confidence,
+                clarity_score=clarity_score,
+                linguistic_strength=linguistic_strength,
             )
             if not decision_taken:
                 all_potential_resolved = False
@@ -1597,6 +1645,9 @@ def store_behavior(
                 canonical_embedding_vector=canonical_embedding_vector,
                 stored_behaviors=stored_behaviors,
                 session_id=session_id,
+                extraction_confidence=behavior.confidence,
+                clarity_score=behavior.clarity,
+                linguistic_strength=behavior.linguistic_strength,
             )
 
             # 7. Fallback → insert new behavior
@@ -1617,6 +1668,9 @@ def store_behavior(
                 canonical_embedding_vector=canonical_embedding_vector,
                 canonical=canonical,
                 session_id=session_id,
+                extraction_confidence=behavior.confidence,
+                clarity_score=behavior.clarity,
+                linguistic_strength=behavior.linguistic_strength,
             )
 
             try:
