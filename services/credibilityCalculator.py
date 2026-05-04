@@ -25,30 +25,35 @@ def calculate_initial_credibility(
 ) -> float:
     """
     Calculate initial credibility score for a newly extracted behavior.
-    
-    The credibility is calculated using a weighted combination of:
-    1. Confidence score from GPT (how certain the model is)
-    2. Clarity score from GPT (how unambiguous the behavior is)
-    3. Linguistic strength from GPT (how strongly user expressed the behavior)
-    
+
+    Two-factor weighted combination:
+    1. extraction_quality — average of GPT confidence and clarity. These
+       two scores measure the same axis ("is this a clean, real, extractable
+       behavior?") and are intentionally collapsed so the formula does not
+       double-count them.
+    2. linguistic_strength — GPT's score for how strongly the user expressed
+       the behavior. This is the dominant signal because it is the only one
+       that distinguishes hedged statements ("I might try Rust") from strong
+       ones ("I always use Python").
+
     Args:
         confidence: GPT confidence score (0.0-1.0)
         clarity: GPT clarity score (0.0-1.0)
         linguistic_strength: GPT linguistic strength score (0.0-1.0)
         behavior_text: The extracted behavior description
-        
+
     Returns:
         float: Initial credibility score (0.0-1.0)
-        
+
     Example:
-        >>> calculate_initial_credibility(0.95, 1.0, 0.7, "prefers Python over JavaScript for backend")
+        >>> calculate_initial_credibility(0.95, 1.0, "prefers Python over JavaScript for backend", 0.7)
     """
-    
+
     # Validate inputs
     if not 0.0 <= confidence <= 1.0:
         logger.warning(f"Confidence {confidence} out of range [0,1], clamping")
         confidence = max(0.0, min(1.0, confidence))
-    
+
     if not 0.0 <= clarity <= 1.0:
         logger.warning(f"Clarity {clarity} out of range [0,1], clamping")
         clarity = max(0.0, min(1.0, clarity))
@@ -56,28 +61,30 @@ def calculate_initial_credibility(
     if not 0.0 <= linguistic_strength <= 1.0:
         logger.warning(f"Linguistic strength {linguistic_strength} out of range [0,1], clamping")
         linguistic_strength = max(0.0, min(1.0, linguistic_strength))
-    
+
     if not behavior_text or not behavior_text.strip():
         logger.error("Empty behavior text provided")
         return 0.0
-    
-    # Get weights from config
-    w_confidence = CREDIBILITY_WEIGHTS.get("confidence", 0.5)
-    w_clarity = CREDIBILITY_WEIGHTS.get("clarity", 0.5)
-    w_linguistic = CREDIBILITY_WEIGHTS.get("linguistic_strength", 0.0)
-    
-    # Calculate credibility from all factors
-    initial_credibility = (w_confidence * confidence) + (w_clarity * clarity) + (w_linguistic * linguistic_strength)
-    
+
+    # Get weights from config (2-factor formula)
+    w_extraction = CREDIBILITY_WEIGHTS.get("extraction_quality", 0.25)
+    w_linguistic = CREDIBILITY_WEIGHTS.get("linguistic_strength", 0.75)
+
+    # Combine confidence and clarity into a single extraction_quality signal —
+    # they describe the same "cleanly extractable behavior?" axis.
+    extraction_quality = (confidence + clarity) / 2.0
+
+    initial_credibility = (w_extraction * extraction_quality) + (w_linguistic * linguistic_strength)
+
     # Ensure result is in valid range [0.0, 1.0]
     initial_credibility = max(0.0, min(1.0, initial_credibility))
-    
+
     logger.debug(
         f"Calculated initial credibility: {initial_credibility:.3f} "
-        f"(conf={confidence:.2f}, clarity={clarity:.2f}, "
+        f"(extraction_quality={extraction_quality:.2f}, "
         f"ling_str={linguistic_strength:.2f})"
     )
-    
+
     return round(initial_credibility, 4)
 
 

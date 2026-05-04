@@ -3,125 +3,103 @@ from datetime import datetime
 from typing import List, Tuple, Optional
 from dataclasses import dataclass, field
 from models.behavior import (
-    PromptSegment, 
-    SegmentInsertResult, 
-    SimilarityClassification, 
-    SimilarityResult, 
+    SimilarityClassification,
+    SimilarityResult,
     ReinforcementResult,
     ConflictType,
     ResolutionStatus,
-    BehaviorState
+    BehaviorState,
+    RetrievedBehavior,
+    RetrievalRelationship,
 )
 from services.credibilityCalculator import calculate_reinforcement_boost, apply_lazy_decay
 from services.eventPublisher import get_event_publisher
 from config.configurations import DECAY_GRACE_PERIOD_SECONDS
 import time
 import uuid
+import math
 import logging
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class HybridSearchResponse:
+class HMBRResponse:
     """
-    Response from search_similar_behavior_3D.
-    
-    Contains both the search results (returned immediately to the client)
-    and pending DB updates (processed asynchronously after response is sent).
-    
+    Result of HMBR retrieval — synchronous results plus pending async updates.
+
     Attributes:
-        results: List of SimilarityResult objects sorted by hybrid_score
-        decay_updates: Tuples of (new_credibility, timestamp, behavior_id, user_id)
-                       for behaviors where lazy decay was applied in-memory
-        accessed_behavior_ids: All behavior_ids that were returned in results,
-                               used to update last_accessed_at timestamps
+        results:               Final fused/ranked RetrievedBehavior objects
+                               sorted by S_final descending.
+        decay_updates:         (new_credibility, timestamp, behavior_id, user_id)
+                               tuples for behaviors that had lazy-decay applied
+                               in-memory during retrieval.  Persisted async.
+        accessed_behavior_ids: All behavior_ids returned in `results`; used by
+                               persist_retrieval_updates_batch to bump
+                               last_accessed_at.
     """
-    results: List[SimilarityResult] = field(default_factory=list)
+    results: List[RetrievedBehavior] = field(default_factory=list)
     decay_updates: List[tuple] = field(default_factory=list)
     accessed_behavior_ids: List[str] = field(default_factory=list)
 
 def insert_behavior(payload: dict):
     """
     Insert a new behavior into the database.
-    
-    The payload should include behavior_state (defaults to 'ACTIVE' if not provided).
-    All new behaviors start in ACTIVE state unless explicitly specified otherwise.
-    
-    Args:
-        payload: Dictionary containing all behavior fields including:
-            - behavior_id, user_id, behavior_text, embedding
-            - credibility, extraction metrics, timestamps
-            - behavior_state (optional, defaults to 'ACTIVE')
+
+    The payload is the dict form of a StoredBehavior model (see models/behavior.py).
+    Defaults behavior_state to 'ACTIVE' and usefulness_score to 0.5 if not provided.
+
+    Side-effect: kicks off SEMANTIC_SIMILAR edge generation for the new behavior
+    so that HMBR's graph-expansion stage can find it without waiting on the cron.
+    Failures here are logged but do not block the insert.
     """
-    # Ensure behavior_state is set (default to ACTIVE for new behaviors)
-    if 'behavior_state' not in payload:
-        payload['behavior_state'] = BehaviorState.ACTIVE.value
-    
-    # Build enriched search text for tsvector (behavior_text + target + context)
-    # Passed as a single parameter to avoid PostgreSQL type inference conflicts
-    # (varchar column params vs text in to_tsvector)
+    payload.setdefault('behavior_state', BehaviorState.ACTIVE.value)
+    payload.setdefault('usefulness_score', 0.5)
+
+    # tsvector content for the lexical retrieval lane: behavior_text + target + context
     search_text = payload.get('behavior_text', '')
     target_val = payload.get('target') or ''
     context_val = payload.get('context') or ''
     payload['search_text'] = f"{search_text} {target_val} {context_val}".strip()
-    
+
     with get_db_pool_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO behaviors (
-                    behavior_id,
-                    user_id,
-                    behavior_text,
-                    embedding,
-                    credibility,
-                    extraction_confidence,
-                    clarity_score,
-                    linguistic_strength,
-                    decay_rate,
-                    reinforcement_count,
-                    created_at,
-                    last_seen_at,
-                    last_decay_applied_at,
-                    last_accessed_at,
-                    session_id,
-                    prompt_history_ids,
-                    behavior_state,
-                    intent,
-                    target,
-                    context,
-                    polarity,
-                    search_vector
+                    behavior_id, user_id, session_id, behavior_text,
+                    intent, target, context, polarity,
+                    credibility, decay_rate, reinforcement_count,
+                    usefulness_score, behavior_state,
+                    created_at, last_seen_at, last_accessed_at, last_decay_applied_at,
+                    embedding, canonical_embedding, search_vector
                 )
                 VALUES (
-                    %(behavior_id)s,
-                    %(user_id)s,
-                    %(behavior_text)s,
-                    %(embedding)s,
-                    %(credibility)s,
-                    %(extraction_confidence)s,
-                    %(clarity_score)s,
-                    %(linguistic_strength)s,
-                    %(decay_rate)s,
-                    %(reinforcement_count)s,
-                    %(created_at)s,
-                    %(last_seen_at)s,
-                    %(last_decay_applied_at)s,
-                    %(last_accessed_at)s,
-                    %(session_id)s,
-                    %(prompt_history_ids)s,
-                    %(behavior_state)s,
-                    %(intent)s,
-                    %(target)s,
-                    %(context)s,
-                    %(polarity)s,
+                    %(behavior_id)s, %(user_id)s, %(session_id)s, %(behavior_text)s,
+                    %(intent)s, %(target)s, %(context)s, %(polarity)s,
+                    %(credibility)s, %(decay_rate)s, %(reinforcement_count)s,
+                    %(usefulness_score)s, %(behavior_state)s,
+                    %(created_at)s, %(last_seen_at)s, %(last_accessed_at)s, %(last_decay_applied_at)s,
+                    %(embedding)s, %(canonical_embedding)s,
                     to_tsvector('english', %(search_text)s)
                 )
-                """
-            , payload
+                """,
+                payload,
             )
         conn.commit()
-    
+
+    # Compute SEMANTIC_SIMILAR edges so the new behavior is reachable in PPR
+    # graph walks even when it never co-occurred with any other behavior.
+    try:
+        if payload.get('canonical_embedding') is not None:
+            compute_semantic_similar_edges_for_behavior(
+                behavior_id=payload['behavior_id'],
+                user_id=payload['user_id'],
+                session_id=payload['session_id'],
+                canonical_embedding=payload['canonical_embedding'],
+            )
+    except Exception as e:
+        logger.warning(f"Failed to compute SEMANTIC_SIMILAR edges for new behavior: {e}")
+
     # Publish behavior.created event for drift detection
     try:
         publisher = get_event_publisher()
@@ -136,107 +114,37 @@ def insert_behavior(payload: dict):
             reinforcement_count=payload.get('reinforcement_count', 1),
             state=payload.get('behavior_state', 'ACTIVE'),
             created_at=payload.get('created_at', int(time.time())),
-            last_seen_at=payload.get('last_seen_at', int(time.time()))
+            last_seen_at=payload.get('last_seen_at', int(time.time())),
         )
     except Exception as e:
         logger.warning(f"Failed to publish behavior.created event: {e}")
-
-def insert_prompt_segment(segment_text: str, user_id: str) -> SegmentInsertResult:
-    """
-    Insert a prompt segment into prompt_segments table
-    
-    Args:
-        segment_text: The segment text to store
-        user_id: User identifier
-        
-    Returns:
-        SegmentInsertResult with success, segment_id, and error fields
-    """
-    try:
-        # Create PromptSegment model instance (generates ID and timestamp)
-        segment = PromptSegment(
-            user_id=user_id,
-            segment_text=segment_text
-        )
-        
-        with get_db_pool_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO prompt_segments (
-                        user_id,
-                        segment_text,
-                        created_at
-                    )
-                    VALUES (%s, %s, %s)
-                    RETURNING segment_id;
-                    """,
-                    (segment.user_id, segment.segment_text, segment.created_at)
-                )
-                result = cur.fetchone()
-                conn.commit()
-                
-                returned_id = result[0] if result else None
-                # Convert UUID to string for Pydantic validation
-                segment_id_str = str(returned_id) if returned_id else None
-                logger.info(f"Inserted prompt segment: {segment_id_str} for user: {user_id}")
-                
-                return SegmentInsertResult(
-                    success=True,
-                    segment_id=segment_id_str,
-                    error=None
-                )
-                
-    except Exception as e:
-        logger.error(f"Failed to insert prompt segment: {str(e)}")
-        return SegmentInsertResult(
-            success=False,
-            segment_id=None,
-            error=str(e)
-        )
-
 
 def _reinforce_behavior_on_cursor(
     cur,
     behavior_id: str,
     user_id: str,
-    segment_id: Optional[str] = None,
     current_timestamp: Optional[int] = None,
 ) -> ReinforcementResult:
     """
-    Internal helper — execute all reinforcement SQL on an **existing** cursor.
+    Reinforce a behavior on an *existing* open cursor (caller commits).
 
-    Does NOT commit; the caller is responsible for committing (or rolling back).
-    This allows the reinforcement to participate in the caller's transaction.
-
-    Args:
-        cur: An open psycopg cursor (must be inside an active connection).
-        behavior_id: ID of the behavior to reinforce.
-        user_id: User identifier (for the WHERE clause).
-        segment_id: Optional segment ID to append to prompt_history_ids.
-        current_timestamp: Unix timestamp to use; defaults to now.
-
-    Returns:
-        ReinforcementResult with success status and updated values.
+    Increments reinforcement_count, applies a diminishing-returns credibility
+    boost, refreshes last_seen_at / last_accessed_at / last_decay_applied_at,
+    and bumps usefulness_score upward — reinforcement is implicit positive
+    feedback that any prior retrieval result was useful.
     """
     if current_timestamp is None:
         current_timestamp = int(time.time())
 
-    # Step 1: Fetch current behavior data
     cur.execute(
         """
-        SELECT 
-            credibility,
-            reinforcement_count,
-            prompt_history_ids
+        SELECT credibility, reinforcement_count
         FROM behaviors
         WHERE behavior_id = %s AND user_id = %s;
         """,
-        (behavior_id, user_id)
+        (behavior_id, user_id),
     )
-
     result = cur.fetchone()
-
     if not result:
         logger.error(f"Behavior {behavior_id} not found for user {user_id}")
         return ReinforcementResult(
@@ -245,38 +153,23 @@ def _reinforce_behavior_on_cursor(
             new_credibility=0.0,
             new_reinforcement_count=0,
             credibility_boost=0.0,
-            segment_id_added=None,
-            error=f"Behavior not found: {behavior_id}"
+            error=f"Behavior not found: {behavior_id}",
         )
 
-    current_credibility, current_count, prompt_history_ids = result
-
-    # Step 2: Calculate credibility boost with diminishing returns
-    boost = calculate_reinforcement_boost(
-        float(current_credibility),
-        int(current_count)
-    )
+    current_credibility, current_count = result
+    boost = calculate_reinforcement_boost(float(current_credibility), int(current_count))
     new_credibility = min(1.0, float(current_credibility) + boost)
     new_count = int(current_count) + 1
 
-    # Step 3: Prepare updated prompt_history_ids
-    updated_history_ids = list(prompt_history_ids) if prompt_history_ids else []
-    if segment_id and segment_id not in updated_history_ids:
-        updated_history_ids.append(segment_id)
-
-    # Step 4: Update behavior in database
-    # Reset last_decay_applied_at to current time when reinforced.
-    # Set last_accessed_at to mark this behavior as actively used.
     cur.execute(
         """
         UPDATE behaviors
-        SET 
-            credibility = %s,
+        SET credibility = %s,
             reinforcement_count = %s,
             last_seen_at = %s,
             last_decay_applied_at = %s,
             last_accessed_at = %s,
-            prompt_history_ids = %s
+            usefulness_score = LEAST(1.0, usefulness_score + 0.05)
         WHERE behavior_id = %s AND user_id = %s;
         """,
         (
@@ -285,10 +178,9 @@ def _reinforce_behavior_on_cursor(
             current_timestamp,
             current_timestamp,
             current_timestamp,
-            updated_history_ids,
             behavior_id,
-            user_id
-        )
+            user_id,
+        ),
     )
 
     logger.info(
@@ -303,38 +195,23 @@ def _reinforce_behavior_on_cursor(
         new_credibility=new_credibility,
         new_reinforcement_count=new_count,
         credibility_boost=boost,
-        segment_id_added=segment_id if segment_id else None,
-        error=None
+        error=None,
     )
 
 
 def reinforce_behavior(
     behavior_id: str,
     user_id: str,
-    segment_id: Optional[str] = None
 ) -> ReinforcementResult:
     """
     Reinforce an existing behavior by incrementing reinforcement count,
-    boosting credibility, updating timestamp, and optionally adding segment reference.
+    boosting credibility, updating timestamps, and bumping usefulness_score.
 
-    This is called when a duplicate or highly similar behavior is detected,
-    instead of inserting a new behavior.
-
-    Args:
-        behavior_id: ID of the behavior to reinforce
-        user_id: User identifier (for validation)
-        segment_id: Optional segment ID to add to prompt_history_ids
+    Called when a duplicate behavior is detected (instead of inserting a new one)
+    or when retrieval feedback indicates the behavior is being actively reused.
 
     Returns:
         ReinforcementResult with success status and updated values
-
-    Process:
-        1. Fetch current behavior data
-        2. Calculate credibility boost (diminishing returns)
-        3. Increment reinforcement_count
-        4. Update last_seen_at timestamp
-        5. Add segment_id to prompt_history_ids (if provided)
-        6. Commit all changes
     """
     try:
         current_timestamp = int(time.time())
@@ -342,17 +219,15 @@ def reinforce_behavior(
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
                 reinforce_result = _reinforce_behavior_on_cursor(
-                    cur, behavior_id, user_id, segment_id, current_timestamp
+                    cur, behavior_id, user_id, current_timestamp
                 )
                 conn.commit()
 
         # After reinforcement is committed, check if this behavior is
         # involved in any PENDING conflict that can now be auto-resolved.
-        # Runs in its own transaction — failures are logged, never raised.
         if reinforce_result.success:
             _check_and_auto_resolve_conflicts(behavior_id, user_id)
 
-            # Publish behavior.reinforced event for drift detection
             try:
                 publisher = get_event_publisher()
                 publisher.publish_behavior_reinforced(
@@ -360,11 +235,11 @@ def reinforce_behavior(
                     behavior_id=behavior_id,
                     reinforcement_count=reinforce_result.new_reinforcement_count,
                     credibility=reinforce_result.new_credibility,
-                    last_seen_at=current_timestamp
+                    last_seen_at=current_timestamp,
                 )
             except Exception as e:
                 logger.warning(f"Failed to publish behavior.reinforced event: {e}")
-                
+
         return reinforce_result
 
     except Exception as e:
@@ -375,8 +250,7 @@ def reinforce_behavior(
             new_credibility=0.0,
             new_reinforcement_count=0,
             credibility_boost=0.0,
-            segment_id_added=None,
-            error=str(e)
+            error=str(e),
         )
 
 
@@ -431,10 +305,14 @@ def _check_and_auto_resolve_conflicts(
                         c.behavior_id_1,
                         c.behavior_id_2,
                         c.created_at,
-                        b1.credibility        AS cred_1,
-                        b1.reinforcement_count AS rc_1,
-                        b2.credibility        AS cred_2,
-                        b2.reinforcement_count AS rc_2
+                        b1.credibility              AS cred_1,
+                        b1.reinforcement_count       AS rc_1,
+                        b1.decay_rate               AS decay_rate_1,
+                        b1.last_decay_applied_at    AS last_decay_1,
+                        b2.credibility              AS cred_2,
+                        b2.reinforcement_count       AS rc_2,
+                        b2.decay_rate               AS decay_rate_2,
+                        b2.last_decay_applied_at    AS last_decay_2
                     FROM behavior_conflicts c
                     JOIN behaviors b1
                       ON b1.behavior_id = c.behavior_id_1 AND b1.user_id = c.user_id
@@ -462,9 +340,26 @@ def _check_and_auto_resolve_conflicts(
                         conflict_id,
                         bid_1, bid_2,
                         created_at,
-                        cred_1, rc_1,
-                        cred_2, rc_2,
+                        stored_cred_1, rc_1, decay_rate_1, last_decay_1,
+                        stored_cred_2, rc_2, decay_rate_2, last_decay_2,
                     ) = row
+
+                    # Apply lazy decay to stored credibilities before comparing.
+                    # Without this, a behavior that hasn't been accessed in months
+                    # retains its stored (inflated) credibility and can incorrectly
+                    # win auto-resolution over a fresher, genuinely stronger behavior.
+                    cred_1, _, _ = apply_lazy_decay(
+                        stored_credibility=float(stored_cred_1),
+                        decay_rate=float(decay_rate_1),
+                        last_decay_applied_at=last_decay_1,
+                        current_time=current_timestamp,
+                    )
+                    cred_2, _, _ = apply_lazy_decay(
+                        stored_credibility=float(stored_cred_2),
+                        decay_rate=float(decay_rate_2),
+                        last_decay_applied_at=last_decay_2,
+                        current_time=current_timestamp,
+                    )
 
                     conflict_age = current_timestamp - created_at
                     reinforcement_gap = abs(int(rc_1) - int(rc_2))
@@ -713,67 +608,52 @@ def get_user_behaviors(user_id: str, session_id: Optional[str] = None, include_s
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
-                # Build query with optional session_id filter
                 query = """
-                    SELECT 
-                        behavior_id,
-                        user_id,
-                        behavior_text,
-                        credibility,
-                        clarity_score,
-                        extraction_confidence,
-                        linguistic_strength,
-                        reinforcement_count,
-                        last_seen_at,
-                        created_at,
-                        behavior_state,
-                        intent,
-                        target,
-                        context,
-                        polarity,
-                        session_id
+                    SELECT
+                        behavior_id, user_id, session_id, behavior_text,
+                        intent, target, context, polarity,
+                        credibility, reinforcement_count, usefulness_score,
+                        last_seen_at, created_at, behavior_state
                     FROM behaviors
                     WHERE user_id = %s
-                    AND behavior_state = ANY(%s)
+                      AND behavior_state = ANY(%s)
                 """
                 params = [user_id, include_states]
-                
-                # Add session_id filter if provided
+
                 if session_id is not None:
                     query += " AND session_id = %s"
                     params.append(session_id)
-                
+
                 query += " ORDER BY created_at DESC;"
-                
+
                 cur.execute(query, params)
-                
                 results = cur.fetchall()
-                
-                behaviors = []
-                for row in results:
-                    behaviors.append({
+
+                behaviors = [
+                    {
                         'behavior_id': row[0],
                         'user_id': row[1],
-                        'behavior_text': row[2],
-                        'credibility': float(row[3]),
-                        'clarity_score': float(row[4]) if row[4] else None,
-                        'extraction_confidence': float(row[5]) if row[5] else None,
-                        'linguistic_strength': float(row[6]) if row[6] else None,
-                        'reinforcement_count': int(row[7]),
-                        'last_seen_at': int(row[8]),
-                        'created_at': int(row[9]),
-                        'behavior_state': row[10],
-                        'intent': row[11],
-                        'target': row[12],
-                        'context': row[13],
-                        'polarity': row[14],
-                        'session_id': row[15]
-                    })
-                
-                session_info = f" in session {session_id}" if session_id else " (all sessions)"
-                logger.debug(f"Found {len(behaviors)} behaviors for user {user_id}{session_info}")
+                        'session_id': row[2],
+                        'behavior_text': row[3],
+                        'intent': row[4],
+                        'target': row[5],
+                        'context': row[6],
+                        'polarity': row[7],
+                        'credibility': float(row[8]) if row[8] is not None else 0.0,
+                        'reinforcement_count': int(row[9]) if row[9] is not None else 0,
+                        'usefulness_score': float(row[10]) if row[10] is not None else 0.5,
+                        'last_seen_at': int(row[11]) if row[11] is not None else 0,
+                        'created_at': int(row[12]) if row[12] is not None else 0,
+                        'behavior_state': row[13],
+                    }
+                    for row in results
+                ]
+                logger.debug(
+                    f"Found {len(behaviors)} behaviors for user {user_id} "
+                    f"(session={session_id or 'ALL'})"
+                )
                 return behaviors
-                
+
     except Exception as e:
         logger.error(f"Failed to get user behaviors: {str(e)}")
         return []
@@ -811,10 +691,10 @@ def search_similar_behaviors(
                 # SESSION ISOLATION: Only search within the same session_id
                 cur.execute(
                     """
-                    SELECT 
-                        behavior_id, 
+                    SELECT
+                        behavior_id,
                         behavior_text,
-                        embedding <=> %s::vector AS distance,
+                        canonical_embedding <=> %s::vector AS distance,
                         credibility,
                         last_seen_at,
                         reinforcement_count,
@@ -828,6 +708,7 @@ def search_similar_behaviors(
                     WHERE user_id = %s
                     AND session_id = %s
                     AND behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED')
+                    AND canonical_embedding IS NOT NULL
                     ORDER BY distance
                     LIMIT %s;
                     """,
@@ -903,455 +784,6 @@ def search_similar_behaviors(
         return []
 
 
-def search_similar_behavior_3D(
-    user_id: str,
-    query_embedding: List[float],
-    query_text: str,
-    session_id: str = "default",
-    required_intents: Optional[List[str]] = None,
-    limit: int = None
-) -> HybridSearchResponse:
-    """
-    Layered Retrieval Architecture (LRA) — 3-stage behavior search.
-
-    Replaces the previous single-pass additive hybrid (TGHR) with a
-    retrieve-and-rerank pipeline that avoids BM25 score incompatibility
-    and lexical sparsity issues on micro-behaviors (<7 words).
-
-    Pipeline stages:
-      Stage 1 — Coarse Semantic Retrieval (Recall Layer):
-          Pure cosine-distance query via pgvector.  Fetches the top K
-          candidates purely by semantic meaning, maximising recall.
-
-      Stage 2 — Multiplicative Intent Re-ranking (Precision Layer):
-          Neuro-symbolic fusion: each candidate's base semantic score is
-          modulated by a multiplicative intent-affinity scalar.
-              S_base  = 1 - D_cosine
-              M       = 1 + (α · A)          (α = INTENT_RERANK_ALPHA)
-              S_final = S_base · M
-          This ensures intent alignment *amplifies* strong semantic
-          matches but cannot rescue irrelevant behaviors.
-
-      Stage 3 — Dynamic Thresholding & Relevance Gap Cutoff:
-          a) Absolute Semantic Floor — discard any S_final < τ_min.
-          b) Relevance Gap — T_dynamic = S_max · (1 - ρ).  Any result
-             below T_dynamic is cut, preventing "tail noise" from
-             diluting the LLM's attention.
-          c) Soft cap — hard limit on returned results.
-
-    This method is READ-ONLY at query time.  It collects pending updates
-    (lazy decay + last_accessed_at) which the caller should persist
-    asynchronously via persist_retrieval_updates_batch().
-
-    Args:
-        user_id: User identifier
-        query_embedding: Dense vector embedding of the standalone query
-        query_text: Plain text of the standalone query (kept for logging)
-        session_id: Session identifier for isolation (defaults to "default")
-        required_intents: Optional list of intent types predicted by the LLM
-                          (e.g., ["CONSTRAINT", "PREFERENCE"]).  If None or
-                          empty, no intent re-ranking is applied.
-        limit: Maximum candidates fetched from DB (defaults to HYBRID_SEARCH_LIMIT)
-
-    Returns:
-        HybridSearchResponse containing:
-          - results: List of SimilarityResult objects (sorted by S_final desc)
-          - decay_updates: Pending credibility updates for async persistence
-          - accessed_behavior_ids: IDs of all returned behaviors for
-            last_accessed_at update
-    """
-    from config.configurations import (
-        HYBRID_SEARCH_LIMIT,
-        INTENT_RERANK_ALPHA,
-        SEMANTIC_FLOOR_THRESHOLD,
-        SEMANTIC_FLOOR_FALLBACK,
-        MAX_FALLBACK_RESULTS,
-        RELEVANCE_GAP_DROP_RATIO,
-        MAX_RETRIEVAL_RESULTS,
-        ALL_INTENT_TYPES,
-        INTENT_AFFINITY
-    )
-
-    if limit is None:
-        limit = HYBRID_SEARCH_LIMIT
-
-    try:
-        with get_db_pool_connection() as conn:
-            with conn.cursor() as cur:
-                # ==========================================================
-                # STAGE 1 — Coarse Semantic Retrieval (Recall Layer)
-                # Pure dense vector search via pgvector cosine distance.
-                # No BM25, no intent scoring in SQL — just semantics.
-                # ==========================================================
-                base_conditions = """
-                    user_id = %s
-                    AND session_id = %s
-                    AND behavior_state IN ('ACTIVE', 'NEW', 'FLAGGED')
-                """
-
-                query = f"""
-                    SELECT
-                        behavior_id,
-                        behavior_text,
-                        embedding <=> %s::vector AS cosine_distance,
-                        credibility,
-                        last_seen_at,
-                        reinforcement_count,
-                        intent,
-                        target,
-                        context,
-                        polarity,
-                        decay_rate,
-                        last_decay_applied_at
-                    FROM behaviors
-                    WHERE {base_conditions}
-                    ORDER BY cosine_distance ASC
-                    LIMIT %s;
-                """
-
-                params = [
-                    query_embedding,   # embedding <=> %s::vector
-                    user_id,           # WHERE user_id = %s
-                    session_id,        # AND session_id = %s
-                    limit,             # LIMIT %s
-                ]
-
-                cur.execute(query, params)
-                rows = cur.fetchall()
-                current_time = int(time.time())
-
-                # ==========================================================
-                # STAGE 2 — Multiplicative Intent Re-ranking (Precision Layer)
-                #
-                # Build per-intent affinity map, then compute:
-                #   S_base  = 1 - D_cosine         (bounded 0..1)
-                #   M       = 1 + (α · A)          (bounded 1..1+α)
-                #   S_final = S_base · M
-                #
-                # This is a neuro-symbolic operation: neural (embedding
-                # distance) modulated by symbolic (intent taxonomy).
-                # Multiplication guarantees that intent alone cannot rescue
-                # a semantically poor match.
-                # ==========================================================
-
-                # Pre-compute affinity map: intent_type → best affinity
-                use_intent_rerank = required_intents and len(required_intents) > 0
-                affinity_map: dict[str, float] = {}
-                if use_intent_rerank:
-                    for intent_type in ALL_INTENT_TYPES:
-                        if intent_type in required_intents:
-                            affinity_map[intent_type] = 1.0
-                        else:
-                            best = 0.0
-                            for req in required_intents:
-                                key = frozenset({intent_type, req})
-                                best = max(best, INTENT_AFFINITY.get(key, 0.0))
-                            affinity_map[intent_type] = best
-                    logger.debug(f"[LRA] Intent affinity map: {affinity_map}")
-
-                # Process rows: compute S_final, apply lazy decay, collect
-                scored_candidates = []
-                decay_updates = []
-
-                for row in rows:
-                    (
-                        behavior_id, behavior_text, cosine_distance,
-                        stored_credibility, last_seen_at, reinforcement_count,
-                        intent, target, context, polarity,
-                        decay_rate, last_decay_applied_at,
-                    ) = row
-
-                    # S_base: convert cosine distance → similarity (bounded 0..1)
-                    s_base = max(0.0, 1.0 - float(cosine_distance))
-
-                    # Multiplicative intent scalar
-                    if use_intent_rerank:
-                        affinity = affinity_map.get(intent, 0.0)
-                        multiplier = 1.0 + (INTENT_RERANK_ALPHA * affinity)
-                    else:
-                        affinity = 0.0
-                        multiplier = 1.0
-
-                    s_final = s_base * multiplier
-
-                    # Apply lazy decay in-memory (read-only, no DB update)
-                    new_credibility, decay_applied, days_elapsed = apply_lazy_decay(
-                        stored_credibility=float(stored_credibility),
-                        decay_rate=float(decay_rate),
-                        last_decay_applied_at=last_decay_applied_at,
-                        current_time=current_time
-                    )
-
-                    if decay_applied:
-                        logger.debug(
-                            f"[LRA] Lazy decay (in-memory) for {behavior_id}: "
-                            f"{stored_credibility:.4f} → {new_credibility:.4f} "
-                            f"({days_elapsed} days)"
-                        )
-                        decay_updates.append((
-                            new_credibility,
-                            current_time,
-                            behavior_id,
-                            user_id
-                        ))
-
-                    scored_candidates.append({
-                        "behavior_id": behavior_id,
-                        "behavior_text": behavior_text,
-                        "cosine_distance": float(cosine_distance),
-                        "s_base": s_base,
-                        "affinity": affinity,
-                        "multiplier": multiplier,
-                        "s_final": s_final,
-                        "credibility": new_credibility,
-                        "last_seen_at": int(last_seen_at),
-                        "reinforcement_count": int(reinforcement_count),
-                        "intent": intent,
-                        "target": target,
-                        "context": context if context else "general",
-                        "polarity": polarity,
-                    })
-
-                # Sort by S_final descending (re-ranking may reorder)
-                scored_candidates.sort(key=lambda c: c["s_final"], reverse=True)
-
-                # ==========================================================
-                # STAGE 3a — Absolute Semantic Floor (Hard Cutoff)
-                # Discard any candidate with S_final < τ_min.
-                # Prevents injecting weakly-related behaviors that could
-                # cause hallucination or knowledge fragmentation in the LLM.
-                # ==========================================================
-                # Save sorted candidates before floor for potential fallback
-                candidates_before_floor = list(scored_candidates)
-
-                before_floor = len(scored_candidates)
-                scored_candidates = [
-                    c for c in scored_candidates
-                    if c["s_final"] >= SEMANTIC_FLOOR_THRESHOLD
-                ]
-                dropped_by_floor = before_floor - len(scored_candidates)
-                if dropped_by_floor > 0:
-                    logger.info(
-                        f"[LRA] Semantic floor: dropped {dropped_by_floor} candidates "
-                        f"below τ_min={SEMANTIC_FLOOR_THRESHOLD:.2f}"
-                    )
-
-                # ==========================================================
-                # STAGE 3a-FALLBACK — Soft floor for zero-result recovery
-                # If the primary floor drops ALL candidates, try a relaxed
-                # threshold (τ_fallback).  Only fires when the strict floor
-                # returns nothing — cannot affect queries that already pass.
-                # Capped at MAX_FALLBACK_RESULTS to limit noise.
-                # ==========================================================
-                if not scored_candidates and candidates_before_floor:
-                    scored_candidates = [
-                        c for c in candidates_before_floor
-                        if c["s_final"] >= SEMANTIC_FLOOR_FALLBACK
-                    ][:MAX_FALLBACK_RESULTS]
-                    if scored_candidates:
-                        logger.info(
-                            f"[LRA] Soft fallback: recovered {len(scored_candidates)} "
-                            f"candidate(s) above τ_fallback={SEMANTIC_FLOOR_FALLBACK:.2f} "
-                            f"(primary floor returned 0)"
-                        )
-
-                # ==========================================================
-                # STAGE 3b — Relevance Gap (Dynamic Context Truncation)
-                # T_dynamic = S_ref · (1 - ρ)
-                # Detects the "semantic cliff" between relevant results and
-                # tail noise.  Prevents weak matches from diluting the
-                # LLM's attention mechanism.
-                #
-                # Exact-match guard: when the top candidate is a near-exact
-                # match (S_base ≥ 0.95, i.e. distance ≈ 0), the gap between
-                # it and every other candidate is artificially large.  In
-                # that case, compute T_dynamic from the second-best candidate
-                # so the gap cutoff evaluates the real cluster of results.
-                # ==========================================================
-                if scored_candidates:
-                    # Check if top candidate is a near-exact match (S_base ≥ 0.95)
-                    top_s_base = scored_candidates[0].get("s_base", 0.0)
-                    if top_s_base >= 0.95 and len(scored_candidates) >= 2:
-                        # Use second-best for gap reference — always keep the exact match
-                        s_ref = scored_candidates[1]["s_final"]
-                        t_dynamic = s_ref * (1.0 - RELEVANCE_GAP_DROP_RATIO)
-                        gap_filtered = [scored_candidates[0]]  # exact match always kept
-                        for c in scored_candidates[1:]:
-                            if c["s_final"] < t_dynamic:
-                                break
-                            gap_filtered.append(c)
-                    else:
-                        s_ref = scored_candidates[0]["s_final"]
-                        # Cap at 1.0 — intent boost can push S_final > 1.0
-                        s_ref = min(s_ref, 1.0)
-                        t_dynamic = s_ref * (1.0 - RELEVANCE_GAP_DROP_RATIO)
-                        gap_filtered = []
-                        for c in scored_candidates:
-                            if c["s_final"] < t_dynamic:
-                                break
-                            gap_filtered.append(c)
-
-                    dropped_by_gap = len(scored_candidates) - len(gap_filtered)
-                    if dropped_by_gap > 0:
-                        logger.info(
-                            f"[LRA] Relevance gap cutoff: kept {len(gap_filtered)}, "
-                            f"dropped {dropped_by_gap} "
-                            f"(S_ref={s_ref:.4f}, T_dynamic={t_dynamic:.4f}, "
-                            f"ρ={RELEVANCE_GAP_DROP_RATIO}, "
-                            f"exact_match_guard={top_s_base >= 0.95})"
-                        )
-                    scored_candidates = gap_filtered
-
-                # ==========================================================
-                # STAGE 3c — Soft Cap
-                # Hard limit on returned results to prevent over-retrieval
-                # for broad/vague queries.
-                # ==========================================================
-                if len(scored_candidates) > MAX_RETRIEVAL_RESULTS:
-                    dropped_by_cap = len(scored_candidates) - MAX_RETRIEVAL_RESULTS
-                    scored_candidates = scored_candidates[:MAX_RETRIEVAL_RESULTS]
-                    logger.info(
-                        f"[LRA] Soft cap applied: kept top {MAX_RETRIEVAL_RESULTS}, "
-                        f"dropped {dropped_by_cap} excess results"
-                    )
-
-                # ==========================================================
-                # Build final response objects
-                # ==========================================================
-                similarity_results = []
-                accessed_behavior_ids = []
-
-                for i, c in enumerate(scored_candidates):
-                    # distance = 1 - S_final  (lower = better, API consistency)
-                    effective_distance = max(0.0, 1.0 - c["s_final"])
-
-                    similarity_results.append(SimilarityResult(
-                        behavior_id=c["behavior_id"],
-                        behavior_text=c["behavior_text"],
-                        distance=effective_distance,
-                        credibility=c["credibility"],
-                        last_seen_at=c["last_seen_at"],
-                        reinforcement_count=c["reinforcement_count"],
-                        intent=c["intent"],
-                        target=c["target"],
-                        context=c["context"],
-                        polarity=c["polarity"],
-                    ))
-                    accessed_behavior_ids.append(c["behavior_id"])
-
-                    logger.info(
-                        f"[LRA] MATCH #{i + 1}: "
-                        f"id={c['behavior_id']} | intent={c['intent']} | "
-                        f"S_base={c['s_base']:.4f} | "
-                        f"affinity={c['affinity']:.2f} | "
-                        f"M={c['multiplier']:.4f} | "
-                        f"S_final={c['s_final']:.4f} | "
-                        f"credibility={c['credibility']:.4f} | "
-                        f"text='{c['behavior_text'][:80]}...'"
-                    )
-
-                # Trim decay_updates to only include returned behavior IDs
-                returned_ids = set(accessed_behavior_ids)
-                decay_updates = [d for d in decay_updates if d[2] in returned_ids]
-
-                logger.info(
-                    f"[LRA] Search for user {user_id} in session {session_id}: "
-                    f"{len(similarity_results)} results "
-                    f"(α={INTENT_RERANK_ALPHA}, "
-                    f"τ_min={SEMANTIC_FLOOR_THRESHOLD}, "
-                    f"ρ={RELEVANCE_GAP_DROP_RATIO}, "
-                    f"intents={required_intents or 'NONE'}, "
-                    f"decay_pending={len(decay_updates)}, "
-                    f"query='{query_text[:60]}...')"
-                )
-                return HybridSearchResponse(
-                    results=similarity_results,
-                    decay_updates=decay_updates,
-                    accessed_behavior_ids=accessed_behavior_ids
-                )
-
-    except Exception as e:
-        logger.error(f"[LRA] Failed to search similar behaviors: {str(e)}")
-        return HybridSearchResponse()
-
-
-def persist_retrieval_updates_batch(
-    decay_updates: List[tuple],
-    accessed_behavior_ids: List[str],
-    user_id: str
-) -> None:
-    """
-    Persist pending updates from a hybrid search in a single batch transaction.
-    
-    Called asynchronously (via BackgroundTasks) after the v2/extract response
-    has already been sent to the client. Performs two operations:
-    
-    1. Credibility decay persistence — for behaviors where lazy decay was applied
-       in-memory during retrieval, persist the new credibility + last_decay_applied_at.
-    2. Access timestamp update — for ALL behaviors returned in the search results,
-       update last_accessed_at to mark they were used for prompt enrichment.
-    
-    Both operations run in a single transaction for efficiency.
-    
-    Args:
-        decay_updates: List of (new_credibility, timestamp, behavior_id, user_id)
-                       tuples from HybridSearchResponse.decay_updates
-        accessed_behavior_ids: List of behavior_id strings from
-                               HybridSearchResponse.accessed_behavior_ids
-        user_id: User identifier (for logging and WHERE clause)
-    """
-    if not decay_updates and not accessed_behavior_ids:
-        logger.debug("[3D-ASYNC] No pending updates to persist, skipping")
-        return
-
-    try:
-        current_time = int(time.time())
-        
-        with get_db_pool_connection() as conn:
-            with conn.cursor() as cur:
-                # ---------------------------------------------------------
-                # 1. Batch update: credibility decay persistence
-                # ---------------------------------------------------------
-                if decay_updates:
-                    cur.executemany(
-                        """
-                        UPDATE behaviors
-                        SET credibility = %s,
-                            last_decay_applied_at = %s
-                        WHERE behavior_id = %s AND user_id = %s
-                        """,
-                        decay_updates
-                    )
-                    logger.info(
-                        f"[3D-ASYNC] Persisted lazy decay for "
-                        f"{len(decay_updates)} behaviors (user: {user_id})"
-                    )
-
-                # ---------------------------------------------------------
-                # 2. Batch update: last_accessed_at for all returned behaviors
-                # ---------------------------------------------------------
-                if accessed_behavior_ids:
-                    cur.execute(
-                        """
-                        UPDATE behaviors
-                        SET last_accessed_at = %s
-                        WHERE user_id = %s
-                        AND behavior_id = ANY(%s)
-                        """,
-                        (current_time, user_id, accessed_behavior_ids)
-                    )
-                    logger.info(
-                        f"[3D-ASYNC] Updated last_accessed_at for "
-                        f"{len(accessed_behavior_ids)} behaviors (user: {user_id})"
-                    )
-
-                conn.commit()
-
-    except Exception as e:
-        logger.error(
-            f"[3D-ASYNC] Failed to persist retrieval updates for user {user_id}: {str(e)}"
-        )
-        
 
 def insert_conflict(
     user_id: str,
@@ -1736,116 +1168,82 @@ def get_behaviors_by_user(user_id: str, session_id: Optional[str] = None) -> Lis
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
-                # Build query with optional session_id filter
                 query = """
-                    SELECT 
-                        behavior_id,
-                        user_id,
-                        behavior_text,
-                        credibility,
-                        reinforcement_count,
-                        decay_rate,
-                        created_at,
-                        last_seen_at,
-                        prompt_history_ids,
-                        clarity_score,
-                        extraction_confidence,
-                        linguistic_strength,
-                        session_id,
-                        behavior_state,
-                        intent,
-                        target,
-                        context,
-                        polarity,
-                        last_decay_applied_at,
-                        last_accessed_at
+                    SELECT
+                        behavior_id, user_id, session_id, behavior_text,
+                        intent, target, context, polarity,
+                        credibility, reinforcement_count, usefulness_score,
+                        decay_rate, last_decay_applied_at,
+                        created_at, last_seen_at, last_accessed_at,
+                        behavior_state
                     FROM behaviors
                     WHERE user_id = %s
                 """
                 params = [user_id]
-                
-                # Add session_id filter if provided
                 if session_id is not None:
                     query += " AND session_id = %s"
                     params.append(session_id)
-                
                 query += " ORDER BY last_seen_at DESC"
-                
+
                 cur.execute(query, params)
-                
+
                 current_time = int(time.time())
                 behaviors = []
                 behaviors_to_update = []
-                
+
                 for row in cur.fetchall():
-                    behavior_id = row[0]
-                    stored_credibility = row[3]
-                    decay_rate = row[5]
-                    last_decay_applied_at = row[18]
-                    last_accessed_at = row[19]
-                    
-                    # Apply lazy decay to credibility
-                    new_credibility, decay_applied, days_elapsed = apply_lazy_decay(
+                    (
+                        behavior_id, _user_id, b_session_id, behavior_text,
+                        intent, target, context, polarity,
+                        stored_credibility, reinforcement_count, usefulness_score,
+                        decay_rate, last_decay_applied_at,
+                        created_at, last_seen_at, last_accessed_at,
+                        behavior_state,
+                    ) = row
+
+                    new_credibility, decay_applied, _days = apply_lazy_decay(
                         stored_credibility=float(stored_credibility),
                         decay_rate=float(decay_rate),
                         last_decay_applied_at=last_decay_applied_at,
-                        current_time=current_time
+                        current_time=current_time,
                     )
-                    
-                    # Track behaviors that need credibility update in DB
                     if decay_applied:
-                        behaviors_to_update.append((
-                            new_credibility,
-                            current_time,
-                            behavior_id,
-                            user_id
-                        ))
-                        logger.debug(
-                            f"Lazy decay applied to {behavior_id}: "
-                            f"{stored_credibility:.4f} → {new_credibility:.4f} "
-                            f"({days_elapsed} days)"
+                        behaviors_to_update.append(
+                            (new_credibility, current_time, behavior_id, user_id)
                         )
-                    
+
                     behaviors.append({
                         "behavior_id": behavior_id,
-                        "user_id": row[1],
-                        "behavior_text": row[2],
-                        "credibility": new_credibility,  # Use decayed credibility
-                        "reinforcement_count": row[4],
-                        "decay_rate": decay_rate,
-                        "created_at": row[6],
-                        "last_seen_at": row[7],
-                        "prompt_history_ids": row[8],
-                        "clarity_score": row[9],
-                        "extraction_confidence": row[10],
-                        "linguistic_strength": row[11],
-                        "session_id": row[12],
-                        "behavior_state": row[13],
-                        "intent": row[14],
-                        "target": row[15],
-                        "context": row[16],
-                        "polarity": row[17],
-                        "last_accessed_at": last_accessed_at
+                        "user_id": _user_id,
+                        "session_id": b_session_id,
+                        "behavior_text": behavior_text,
+                        "intent": intent,
+                        "target": target,
+                        "context": context,
+                        "polarity": polarity,
+                        "credibility": new_credibility,
+                        "reinforcement_count": reinforcement_count,
+                        "usefulness_score": float(usefulness_score) if usefulness_score is not None else 0.5,
+                        "decay_rate": float(decay_rate) if decay_rate is not None else 0.0,
+                        "created_at": created_at,
+                        "last_seen_at": last_seen_at,
+                        "last_accessed_at": last_accessed_at,
+                        "behavior_state": behavior_state,
                     })
-                
-                # Batch update behaviors with decayed credibility
+
                 if behaviors_to_update:
                     cur.executemany(
                         """
                         UPDATE behaviors
-                        SET credibility = %s,
-                            last_decay_applied_at = %s
+                        SET credibility = %s, last_decay_applied_at = %s
                         WHERE behavior_id = %s AND user_id = %s
                         """,
-                        behaviors_to_update
+                        behaviors_to_update,
                     )
                     conn.commit()
-                    logger.info(
-                        f"Updated {len(behaviors_to_update)} behaviors with lazy decay"
-                    )
-                
+
                 return behaviors
-                
+
     except Exception as e:
         logger.error(f"Failed to get behaviors for user {user_id}: {str(e)}")
         raise Exception(f"Database error retrieving behaviors: {str(e)}")
@@ -2211,151 +1609,760 @@ def get_behaviors_by_ids(user_id: str, behavior_ids: List[str]) -> List[dict]:
     """
     if not behavior_ids:
         return []
-    
+
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
-                # Build parameterized query for multiple behavior IDs
                 placeholders = ','.join(['%s'] * len(behavior_ids))
-                
                 cur.execute(
                     f"""
-                    SELECT 
-                        behavior_id,
-                        user_id,
-                        session_id,
-                        behavior_text,
-                        credibility,
-                        reinforcement_count,
-                        decay_rate,
-                        created_at,
-                        last_seen_at,
-                        prompt_history_ids,
-                        clarity_score,
-                        extraction_confidence,
-                        linguistic_strength,
-                        behavior_state,
-                        superseded_by_id,
-                        related_behaviors,
-                        last_decay_applied_at,
-                        context_notes,
-                        last_accessed_at,
-                        intent,
-                        target,
-                        context,
-                        polarity
+                    SELECT
+                        behavior_id, user_id, session_id, behavior_text,
+                        intent, target, context, polarity,
+                        credibility, reinforcement_count, usefulness_score,
+                        decay_rate, last_decay_applied_at,
+                        created_at, last_seen_at, last_accessed_at,
+                        behavior_state, superseded_by_id
                     FROM behaviors
-                    WHERE user_id = %s 
-                    AND behavior_id IN ({placeholders})
+                    WHERE user_id = %s AND behavior_id IN ({placeholders})
                     ORDER BY last_seen_at DESC
                     """,
-                    [user_id] + behavior_ids
+                    [user_id] + behavior_ids,
                 )
-                
                 rows = cur.fetchall()
-        
+
         behaviors = []
         for row in rows:
-            behavior = {
+            behaviors.append({
                 "behavior_id": row[0],
                 "user_id": row[1],
                 "session_id": row[2],
                 "behavior_text": row[3],
-                "credibility": float(row[4]) if row[4] is not None else 0.0,
-                "reinforcement_count": row[5] or 0,
-                "decay_rate": float(row[6]) if row[6] is not None else 0.0,
-                "created_at": row[7],
-                "last_seen_at": row[8],
-                "prompt_history_ids": row[9] or [],
-                "clarity_score": float(row[10]) if row[10] is not None else 0.0,
-                "extraction_confidence": float(row[11]) if row[11] is not None else 0.0,
-                "linguistic_strength": float(row[12]) if row[12] is not None else 0.0,
-                "behavior_state": row[13],
-                "superseded_by_id": row[14],
-                "related_behaviors": row[15] or [],
-                "last_decay_applied_at": row[16],
-                "context_notes": row[17],
-                "last_accessed_at": row[18],
-                # Canonical fields
                 "canonical": {
-                    "intent": row[19],
-                    "target": row[20],
-                    "context": row[21],
-                    "polarity": row[22]
-                }
-            }
-            behaviors.append(behavior)
-        
-        logger.info(f"Retrieved {len(behaviors)} behaviors for user={user_id} with IDs={behavior_ids}")
+                    "intent": row[4],
+                    "target": row[5],
+                    "context": row[6],
+                    "polarity": row[7],
+                },
+                "credibility": float(row[8]) if row[8] is not None else 0.0,
+                "reinforcement_count": row[9] or 0,
+                "usefulness_score": float(row[10]) if row[10] is not None else 0.5,
+                "decay_rate": float(row[11]) if row[11] is not None else 0.0,
+                "last_decay_applied_at": row[12],
+                "created_at": row[13],
+                "last_seen_at": row[14],
+                "last_accessed_at": row[15],
+                "behavior_state": row[16],
+                "superseded_by_id": row[17],
+            })
+
+        logger.info(f"Retrieved {len(behaviors)} behaviors for user={user_id}")
         return behaviors
-        
+
     except Exception as e:
         logger.error(f"Failed to retrieve behaviors by IDs for user={user_id}: {str(e)}")
         raise
 
 
 # ===========================================================================
-# Co-Occurrence Graph — edge creation, expansion, inheritance, cleanup
+# HMBR — Hybrid Multi-Signal Behavior Retrieval
 # ===========================================================================
 
-def insert_co_occurrences_batch(
-    behavior_ids: List[str],
+def compute_semantic_similar_edges_for_behavior(
+    behavior_id: str,
     user_id: str,
-    edge_type: str,
+    session_id: str,
+    canonical_embedding: List[float],
 ) -> int:
     """
-    Create pairwise co-occurrence edges for a list of behavior IDs.
-
-    Generates all unique (a, b) pairs (a < b lexicographically to avoid
-    duplicate reversed edges) and upserts them.  On conflict the edge
-    weight is incremented by 0.5 (diminishing reinforcement signal).
-
-    Args:
-        behavior_ids: List of behavior IDs that co-occurred.
-        user_id: The user who owns these behaviors.
-        edge_type: 'CO_PROMPT' or 'CO_SESSION'.
-
-    Returns:
-        Number of edges written (inserted or updated).
+    Find top-N existing behaviors closest to this one by canonical_embedding
+    and create SEMANTIC_SIMILAR edges.  Called right after insert_behavior so
+    the new node is reachable in PPR walks immediately.
     """
-    if len(behavior_ids) < 2:
+    from config.configurations import (
+        HMBR_SEMANTIC_SIMILAR_TOP_N,
+        HMBR_SEMANTIC_SIMILAR_MAX_DISTANCE,
+    )
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT behavior_id
+                    FROM behaviors
+                    WHERE user_id = %s
+                      AND behavior_id != %s
+                      AND behavior_state IN ('ACTIVE', 'NEW')
+                      AND canonical_embedding IS NOT NULL
+                      AND (canonical_embedding <=> %s::vector) <= %s
+                    ORDER BY canonical_embedding <=> %s::vector
+                    LIMIT %s
+                    """,
+                    (
+                        user_id,
+                        behavior_id,
+                        canonical_embedding,
+                        HMBR_SEMANTIC_SIMILAR_MAX_DISTANCE,
+                        canonical_embedding,
+                        HMBR_SEMANTIC_SIMILAR_TOP_N,
+                    ),
+                )
+                neighbors = [row[0] for row in cur.fetchall()]
+
+        if not neighbors:
+            return 0
+
+        pairs = [
+            (min(behavior_id, n), max(behavior_id, n))
+            for n in neighbors
+        ]
+        created = _upsert_co_occurrence_pairs(pairs, user_id, "SEMANTIC_SIMILAR", session_id)
+        logger.info(
+            f"[GRAPH] SEMANTIC_SIMILAR: {created} edge(s) created for behavior={behavior_id}"
+        )
+        return created
+    except Exception as e:
+        logger.warning(f"[GRAPH] compute_semantic_similar_edges_for_behavior failed: {e}")
         return 0
 
-    current_timestamp = int(time.time())
 
-    # Build all unique pairs (sorted to guarantee canonical order)
-    pairs = []
-    sorted_ids = sorted(set(behavior_ids))
-    for i in range(len(sorted_ids)):
-        for j in range(i + 1, len(sorted_ids)):
-            pairs.append((sorted_ids[i], sorted_ids[j]))
+def retrieve_behaviors(
+    probes: list,
+    query_type: str,
+    required_intents: Optional[List[str]],
+    user_id: str,
+    session_id: str,
+) -> "HMBRResponse":
+    """
+    Hybrid Multi-Signal Behavior Retrieval (HMBR).
 
-    if not pairs:
-        return 0
+    Pillar 1 — multi-signal candidate pool:
+      Runs prose-cosine, canonical-cosine, and BM25 queries for each probe,
+      merges results, and computes per-signal scores for each candidate.
+
+    Pillar 2 — Personalised PageRank graph expansion:
+      Loads the user's co-occurrence subgraph, seeds mass proportional to each
+      candidate's Pillar-1 scores, and runs PPR to surface graph neighbors.
+
+    Pillar 3 — adaptive fusion + elbow selection:
+      Combines all signals with query_type-specific weights, applies a
+      same-session boost, cuts at the score elbow, enforces a floor, and caps
+      results at HMBR_MAX_RESULTS.
+    """
+    from config.configurations import (
+        HMBR_PER_LANE_TOP_K,
+        HMBR_LEXICAL_MIN_RANK,
+        HMBR_RECENCY_TAU_DAYS,
+        HMBR_SESSION_BOOST,
+        HMBR_MAX_RESULTS,
+        HMBR_MIN_FINAL_SCORE,
+        HMBR_PPR_ALPHA,
+        HMBR_PPR_ITERATIONS,
+        HMBR_EDGE_WEIGHT_CO_PROMPT,
+        HMBR_EDGE_WEIGHT_SEMANTIC_SIMILAR,
+        HMBR_EDGE_WEIGHT_CO_SESSION,
+        HMBR_GRAPH_MAX_NODES,
+        HMBR_FUSION_WEIGHTS,
+        INTENT_AFFINITY,
+        DECAY_GRACE_PERIOD_SECONDS,
+    )
+    from services.openAiClient import embed_batch
+
+    fusion_weights = HMBR_FUSION_WEIGHTS.get(query_type, HMBR_FUSION_WEIGHTS["BROAD"])
+    current_ts = int(time.time())
+
+    # -----------------------------------------------------------------------
+    # Pre-compute ALL embeddings in ONE batch call before touching the DB.
+    #
+    # Previously each probe called embed_text() twice (prose + canonical),
+    # meaning 3 probes × 2 = 6 sequential model.encode() calls at ~2–3s each
+    # = 12–18s just on embeddings.  embed_batch() does a single forward pass
+    # over all texts — one call regardless of how many probes there are.
+    # -----------------------------------------------------------------------
+    _texts_to_embed: list[str] = []
+    _embed_plan: list[tuple[int, str]] = []  # (probe_index, 'prose'|'canonical')
+
+    for i, probe in enumerate(probes):
+        probe_text = probe.text if hasattr(probe, "text") else str(probe)
+        _texts_to_embed.append(probe_text)
+        _embed_plan.append((i, "prose"))
+        if hasattr(probe, "canonical") and probe.canonical is not None:
+            canon = probe.canonical
+            _texts_to_embed.append(
+                f"{canon.polarity} {canon.intent} {canon.target} {canon.context}"
+            )
+            _embed_plan.append((i, "canonical"))
+
+    # Single model.encode() — the core performance fix
+    _probe_embs: dict[int, dict[str, list]] = {}
+    try:
+        _all_embs = embed_batch(_texts_to_embed)
+        for idx, (probe_idx, lane) in enumerate(_embed_plan):
+            _probe_embs.setdefault(probe_idx, {})[lane] = _all_embs[idx]
+    except Exception as e:
+        logger.error(f"[HMBR] Batch embedding failed: {e}")
+        return HMBRResponse()
+
+    # -----------------------------------------------------------------------
+    # Pillar 1 — build candidate pool
+    #
+    # Performance: instead of 1 execute() per probe per lane (up to 9 round-trips
+    # for 3 probes), we build one UNION ALL per lane and send 3 round-trips total.
+    # Each subquery uses (ORDER BY ... LIMIT k) inside parentheses so PostgreSQL
+    # applies the top-K cut before combining results.
+    # -----------------------------------------------------------------------
+    candidates: dict[str, dict] = {}
+
+    def _merge(bid: str, row_data: dict) -> None:
+        if bid not in candidates:
+            candidates[bid] = row_data.copy()
+        else:
+            existing = candidates[bid]
+            for sig in ("s_semantic", "s_canonical", "s_lexical"):
+                if row_data.get(sig, 0.0) > existing.get(sig, 0.0):
+                    existing[sig] = row_data[sig]
+
+    # Column layout shared by all three lanes (signal value is always col 16)
+    _BASE_COLS = """
+        behavior_id, behavior_text, intent, target, context,
+        polarity, credibility, reinforcement_count, usefulness_score,
+        decay_rate, last_decay_applied_at, created_at, last_seen_at,
+        last_accessed_at, behavior_state, session_id
+    """
+
+    def _unpack(row, signal_name: str, signal_val: float) -> dict:
+        sigs = {"s_semantic": 0.0, "s_canonical": 0.0, "s_lexical": 0.0}
+        sigs[signal_name] = signal_val
+        return {
+            "behavior_text": row[1], "intent": row[2],
+            "target": row[3], "context": row[4], "polarity": row[5],
+            "credibility": float(row[6]) if row[6] else 0.0,
+            "reinforcement_count": row[7] or 1,
+            "usefulness_score": float(row[8]) if row[8] else 0.5,
+            "decay_rate": float(row[9]) if row[9] else 0.015,
+            "last_decay_applied_at": row[10],
+            "created_at": row[11] or 0, "last_seen_at": row[12] or 0,
+            "last_accessed_at": row[13], "behavior_state": row[14],
+            "session_id": row[15],
+            **sigs,
+        }
+
+    # Collect embeddings keyed by probe index
+    prose_embs  = [(i, d["prose"])     for i, d in _probe_embs.items() if "prose"     in d]
+    canon_embs  = [(i, d["canonical"]) for i, d in _probe_embs.items() if "canonical" in d]
+    probe_texts = [
+        (i, probe.text if hasattr(probe, "text") else str(probe))
+        for i, probe in enumerate(probes)
+    ]
 
     try:
         with get_db_pool_connection() as conn:
             with conn.cursor() as cur:
-                # Use executemany with UPSERT — ON CONFLICT bumps weight
+
+                # --- Prose cosine lane: one UNION ALL for all probes (1 round-trip) ---
+                if prose_embs:
+                    try:
+                        subs, params = [], []
+                        for _, emb in prose_embs:
+                            subs.append(f"""
+                                (SELECT {_BASE_COLS},
+                                        (embedding <=> %s::vector) AS sig
+                                 FROM behaviors
+                                 WHERE user_id = %s
+                                   AND behavior_state IN ('ACTIVE', 'NEW')
+                                   AND embedding IS NOT NULL
+                                 ORDER BY sig LIMIT %s)
+                            """)
+                            params.extend([emb, user_id, HMBR_PER_LANE_TOP_K])
+                        cur.execute(" UNION ALL ".join(subs), params)
+                        for row in cur.fetchall():
+                            dist = float(row[16]) if row[16] is not None else 1.0
+                            _merge(row[0], _unpack(row, "s_semantic", max(0.0, 1.0 - dist)))
+                    except Exception as e:
+                        logger.warning(f"[HMBR] prose UNION ALL failed: {e}")
+
+                # --- Canonical cosine lane: one UNION ALL (1 round-trip) ---
+                if canon_embs:
+                    try:
+                        subs, params = [], []
+                        for _, emb in canon_embs:
+                            subs.append(f"""
+                                (SELECT {_BASE_COLS},
+                                        (canonical_embedding <=> %s::vector) AS sig
+                                 FROM behaviors
+                                 WHERE user_id = %s
+                                   AND behavior_state IN ('ACTIVE', 'NEW')
+                                   AND canonical_embedding IS NOT NULL
+                                 ORDER BY sig LIMIT %s)
+                            """)
+                            params.extend([emb, user_id, HMBR_PER_LANE_TOP_K])
+                        cur.execute(" UNION ALL ".join(subs), params)
+                        for row in cur.fetchall():
+                            dist = float(row[16]) if row[16] is not None else 1.0
+                            _merge(row[0], _unpack(row, "s_canonical", max(0.0, 1.0 - dist)))
+                    except Exception as e:
+                        logger.warning(f"[HMBR] canonical UNION ALL failed: {e}")
+
+                # --- Lexical BM25 lane: one UNION ALL (1 round-trip) ---
+                if probe_texts:
+                    try:
+                        subs, params = [], []
+                        for _, pt in probe_texts:
+                            subs.append(f"""
+                                (SELECT {_BASE_COLS},
+                                        ts_rank(search_vector, plainto_tsquery('english', %s)) AS sig
+                                 FROM behaviors
+                                 WHERE user_id = %s
+                                   AND behavior_state IN ('ACTIVE', 'NEW')
+                                   AND search_vector @@ plainto_tsquery('english', %s)
+                                 ORDER BY sig DESC LIMIT %s)
+                            """)
+                            params.extend([pt, user_id, pt, HMBR_PER_LANE_TOP_K])
+                        cur.execute(" UNION ALL ".join(subs), params)
+                        for row in cur.fetchall():
+                            rank = float(row[16]) if row[16] is not None else 0.0
+                            if rank >= HMBR_LEXICAL_MIN_RANK:
+                                _merge(row[0], _unpack(row, "s_lexical", min(1.0, rank)))
+                    except Exception as e:
+                        logger.warning(f"[HMBR] lexical UNION ALL failed: {e}")
+
+    except Exception as e:
+        logger.error(f"[HMBR] Pillar 1 DB error: {e}")
+        return HMBRResponse()
+
+    if not candidates:
+        logger.info(f"[HMBR] No candidates found for user={user_id}")
+        return HMBRResponse()
+
+    # -----------------------------------------------------------------------
+    # Per-candidate signal computation (recency, credibility, usefulness,
+    # intent affinity, lazy decay)
+    # -----------------------------------------------------------------------
+    decay_updates: list[tuple] = []
+    tau_seconds = HMBR_RECENCY_TAU_DAYS * 86400.0
+
+    for bid, c in candidates.items():
+        # Lazy decay
+        credibility = c["credibility"]
+        last_decay = c.get("last_decay_applied_at")
+        age_since_grace = current_ts - (c["created_at"] + DECAY_GRACE_PERIOD_SECONDS)
+        if age_since_grace > 0 and last_decay is not None:
+            try:
+                new_cred, applied, _ = apply_lazy_decay(
+                    credibility, c["decay_rate"], last_decay, current_ts
+                )
+                if applied:
+                    credibility = new_cred
+                    decay_updates.append((new_cred, current_ts, bid, user_id))
+            except Exception:
+                pass
+        c["credibility"] = credibility
+
+        # Recency: exp(-Δt / τ), Δt = seconds since last_seen_at
+        last_seen = c.get("last_seen_at") or c.get("created_at") or current_ts
+        delta_t = max(0.0, float(current_ts - last_seen))
+        c["s_recency"] = math.exp(-delta_t / tau_seconds)
+
+        c["s_credibility"] = float(credibility)
+        c["s_usefulness"] = float(c.get("usefulness_score", 0.5))
+
+        # Intent affinity multiplier on semantic signals
+        b_intent = c.get("intent")
+        if required_intents and b_intent:
+            best_affinity = max(
+                (
+                    1.0 if b_intent == ri else
+                    INTENT_AFFINITY.get(frozenset({b_intent, ri}), 0.0)
+                    for ri in required_intents
+                ),
+                default=0.3,
+            )
+            affinity_mult = 0.5 + 0.5 * best_affinity  # 0.5 … 1.0
+            c["s_semantic"] = c.get("s_semantic", 0.0) * affinity_mult
+            c["s_canonical"] = c.get("s_canonical", 0.0) * affinity_mult
+
+    # -----------------------------------------------------------------------
+    # Pillar 2 — Personalised PageRank
+    # -----------------------------------------------------------------------
+    candidate_ids = set(candidates.keys())
+    ppr_scores: dict[str, float] = {bid: 0.0 for bid in candidate_ids}
+
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                # Load subgraph edges among (or adjacent to) candidates
+                edge_weight_map = {
+                    "CO_PROMPT": HMBR_EDGE_WEIGHT_CO_PROMPT,
+                    "SEMANTIC_SIMILAR": HMBR_EDGE_WEIGHT_SEMANTIC_SIMILAR,
+                    "CO_SESSION": HMBR_EDGE_WEIGHT_CO_SESSION,
+                }
+                cur.execute(
+                    """
+                    SELECT behavior_id_1, behavior_id_2, edge_type, weight
+                    FROM behavior_co_occurrences
+                    WHERE user_id = %s
+                      AND (behavior_id_1 = ANY(%s) OR behavior_id_2 = ANY(%s))
+                    LIMIT %s
+                    """,
+                    (user_id, list(candidate_ids), list(candidate_ids),
+                     HMBR_GRAPH_MAX_NODES * 2),
+                )
+                edges_raw = cur.fetchall()
+
+        # Build adjacency: node → [(neighbor, weight)]
+        adjacency: dict[str, list[tuple[str, float]]] = {}
+        all_nodes: set[str] = set(candidate_ids)
+        for b1, b2, etype, w in edges_raw:
+            base_w = edge_weight_map.get(etype, 0.1) * float(w)
+            adjacency.setdefault(b1, []).append((b2, base_w))
+            adjacency.setdefault(b2, []).append((b1, base_w))
+            all_nodes.add(b1)
+            all_nodes.add(b2)
+
+        # Cap graph size
+        if len(all_nodes) > HMBR_GRAPH_MAX_NODES:
+            # keep all candidates; trim extra nodes by connection to seeds
+            extra = all_nodes - candidate_ids
+            conn_count = {n: 0 for n in extra}
+            for n in extra:
+                for nbr, _ in adjacency.get(n, []):
+                    if nbr in candidate_ids:
+                        conn_count[n] += 1
+            keep_extra = sorted(extra, key=lambda n: -conn_count[n])[
+                : HMBR_GRAPH_MAX_NODES - len(candidate_ids)
+            ]
+            all_nodes = candidate_ids | set(keep_extra)
+
+        node_list = list(all_nodes)
+        idx = {n: i for i, n in enumerate(node_list)}
+        N = len(node_list)
+
+        # Build row-normalised transition matrix as sparse dict
+        # T[i] = {j: w} where sum(T[i].values()) = 1
+        out_weights: dict[int, float] = {}
+        trans: dict[int, dict[int, float]] = {}
+        for node in node_list:
+            i = idx[node]
+            nbrs = adjacency.get(node, [])
+            nbrs_in_graph = [(idx[nb], w) for nb, w in nbrs if nb in idx]
+            if not nbrs_in_graph:
+                continue
+            total = sum(w for _, w in nbrs_in_graph)
+            trans[i] = {j: w / total for j, w in nbrs_in_graph}
+            out_weights[i] = total
+
+        # Seed distribution — proportional to pre-fusion seed score
+        seed_dist: dict[int, float] = {}
+        for bid in candidate_ids:
+            c = candidates[bid]
+            s_seed = (
+                c.get("s_semantic", 0.0) * 0.4
+                + c.get("s_canonical", 0.0) * 0.3
+                + c.get("s_lexical", 0.0) * 0.15
+                + c.get("s_credibility", 0.0) * 0.15
+            )
+            seed_dist[idx[bid]] = max(0.0, s_seed)
+
+        seed_total = sum(seed_dist.values())
+        if seed_total > 0:
+            for i in seed_dist:
+                seed_dist[i] /= seed_total
+
+        # PPR power iterations: r = α·seed + (1-α)·Tᵀ·r
+        r: dict[int, float] = dict(seed_dist)
+        alpha = HMBR_PPR_ALPHA
+        for _ in range(HMBR_PPR_ITERATIONS):
+            new_r: dict[int, float] = {i: alpha * seed_dist.get(i, 0.0) for i in range(N)}
+            for i, nbrs in trans.items():
+                ri = r.get(i, 0.0)
+                for j, w in nbrs.items():
+                    new_r[j] = new_r.get(j, 0.0) + (1.0 - alpha) * ri * w
+            r = new_r
+
+        for bid in candidate_ids:
+            ppr_scores[bid] = r.get(idx[bid], 0.0)
+
+        # Also surface graph neighbors not already in candidates
+        for node in node_list:
+            if node not in candidate_ids:
+                ppr_scores[node] = r.get(idx[node], 0.0)
+
+    except Exception as e:
+        logger.warning(f"[HMBR] PPR failed (using zero scores): {e}")
+
+    # Normalise PPR scores to [0, 1]
+    max_ppr = max(ppr_scores.values()) if ppr_scores else 0.0
+    if max_ppr > 0:
+        ppr_scores = {k: v / max_ppr for k, v in ppr_scores.items()}
+
+    # Fetch metadata for any graph-only nodes (not already in candidates)
+    graph_only_ids = [n for n in ppr_scores if n not in candidates and ppr_scores[n] > 0]
+    if graph_only_ids:
+        try:
+            with get_db_pool_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT behavior_id, behavior_text, intent, target, context,
+                               polarity, credibility, reinforcement_count, usefulness_score,
+                               decay_rate, last_decay_applied_at, created_at, last_seen_at,
+                               last_accessed_at, behavior_state, session_id
+                        FROM behaviors
+                        WHERE user_id = %s
+                          AND behavior_id = ANY(%s)
+                          AND behavior_state IN ('ACTIVE', 'NEW')
+                        """,
+                        (user_id, graph_only_ids),
+                    )
+                    for row in cur.fetchall():
+                        bid = row[0]
+                        last_seen = row[12] or row[11] or current_ts
+                        delta_t = max(0.0, float(current_ts - last_seen))
+                        s_recency = math.exp(-delta_t / tau_seconds)
+                        candidates[bid] = {
+                            "behavior_text": row[1], "intent": row[2],
+                            "target": row[3], "context": row[4], "polarity": row[5],
+                            "credibility": float(row[6]) if row[6] else 0.0,
+                            "reinforcement_count": row[7] or 1,
+                            "usefulness_score": float(row[8]) if row[8] else 0.5,
+                            "decay_rate": float(row[9]) if row[9] else 0.015,
+                            "last_decay_applied_at": row[10],
+                            "created_at": row[11] or 0,
+                            "last_seen_at": row[12] or 0,
+                            "last_accessed_at": row[13],
+                            "behavior_state": row[14],
+                            "session_id": row[15],
+                            "s_semantic": 0.0,
+                            "s_canonical": 0.0,
+                            "s_lexical": 0.0,
+                            "s_recency": s_recency,
+                            "s_credibility": float(row[6]) if row[6] else 0.0,
+                            "s_usefulness": float(row[8]) if row[8] else 0.5,
+                        }
+        except Exception as e:
+            logger.warning(f"[HMBR] Failed to fetch graph-only nodes: {e}")
+
+    # -----------------------------------------------------------------------
+    # Pillar 3 — adaptive fusion + elbow selection
+    # -----------------------------------------------------------------------
+    w = fusion_weights  # shorthand
+    fused: list[tuple[str, float, dict]] = []
+
+    for bid, c in candidates.items():
+        s_ppr = ppr_scores.get(bid, 0.0)
+        s_final = (
+            w["sem"]    * c.get("s_semantic", 0.0)
+            + w["canon"]  * c.get("s_canonical", 0.0)
+            + w["lex"]    * c.get("s_lexical", 0.0)
+            + w["rec"]    * c.get("s_recency", 0.0)
+            + w["cred"]   * c.get("s_credibility", 0.0)
+            + w["useful"] * c.get("s_usefulness", 0.0)
+            + w["ppr"]    * s_ppr
+        )
+
+        # Same-session boost
+        if c.get("session_id") == session_id:
+            s_final = min(1.0, s_final + HMBR_SESSION_BOOST)
+
+        c["s_ppr"] = s_ppr
+        c["s_final"] = s_final
+        fused.append((bid, s_final, c))
+
+    # Sort descending by s_final
+    fused.sort(key=lambda x: -x[1])
+
+    # Elbow detection — find the biggest score gap in top-20 candidates
+    top = fused[:max(HMBR_MAX_RESULTS * 2, 20)]
+    cut_idx = len(top)
+    if len(top) > 2:
+        gaps = [(top[i][1] - top[i + 1][1], i + 1) for i in range(len(top) - 1)]
+        max_gap, gap_pos = max(gaps, key=lambda g: g[0])
+        # Only cut at the gap if it's meaningfully large (> 0.05)
+        if max_gap > 0.05:
+            cut_idx = gap_pos
+
+    # Apply cuts: elbow, floor, cap
+    results_raw = [
+        (bid, s, c) for bid, s, c in fused[:cut_idx]
+        if s >= HMBR_MIN_FINAL_SCORE
+    ][:HMBR_MAX_RESULTS]
+
+    # Polarity tagging — compare behavior polarity vs. primary probe polarity
+    primary_polarity = None
+    if probes:
+        first = probes[0]
+        if hasattr(first, "canonical") and first.canonical:
+            primary_polarity = first.canonical.polarity
+
+    retrieved: list[RetrievedBehavior] = []
+    accessed_ids: list[str] = []
+    for bid, s_final, c in results_raw:
+        b_polarity = c.get("polarity")
+        if primary_polarity and b_polarity:
+            if b_polarity == primary_polarity:
+                rel = RetrievalRelationship.AGREES
+            else:
+                rel = RetrievalRelationship.DISAGREES
+        else:
+            rel = RetrievalRelationship.NEUTRAL
+
+        source = "seed" if bid in candidate_ids else "graph"
+        retrieved.append(RetrievedBehavior(
+            behavior_id=bid,
+            behavior_text=c["behavior_text"],
+            intent=c.get("intent"),
+            target=c.get("target"),
+            context=c.get("context"),
+            polarity=b_polarity,
+            credibility=c["credibility"],
+            s_final=round(s_final, 4),
+            s_semantic=round(c.get("s_semantic", 0.0), 4),
+            s_canonical=round(c.get("s_canonical", 0.0), 4),
+            s_lexical=round(c.get("s_lexical", 0.0), 4),
+            s_recency=round(c.get("s_recency", 0.0), 4),
+            s_credibility=round(c.get("s_credibility", 0.0), 4),
+            s_usefulness=round(c.get("s_usefulness", 0.0), 4),
+            s_ppr=round(c.get("s_ppr", 0.0), 4),
+            relationship=rel,
+            source=source,
+        ))
+        accessed_ids.append(bid)
+
+    logger.info(
+        f"[HMBR] user={user_id} query_type={query_type} "
+        f"candidates={len(candidates)} returned={len(retrieved)}"
+    )
+    return HMBRResponse(
+        results=retrieved,
+        decay_updates=decay_updates,
+        accessed_behavior_ids=accessed_ids,
+    )
+
+
+def persist_retrieval_updates_batch(
+    decay_updates: list,
+    accessed_behavior_ids: list,
+    user_id: str,
+) -> None:
+    """
+    Persist lazy-decay credibility updates and last_accessed_at timestamps
+    for behaviors that were returned by HMBR retrieval.
+
+    Called as a background task so it never blocks the HTTP response.
+    """
+    if not decay_updates and not accessed_behavior_ids:
+        return
+
+    current_ts = int(time.time())
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                # Apply credibility updates from lazy decay
+                for new_cred, decay_ts, bid, uid in decay_updates:
+                    cur.execute(
+                        """
+                        UPDATE behaviors
+                        SET credibility = %s,
+                            last_decay_applied_at = %s
+                        WHERE behavior_id = %s AND user_id = %s
+                        """,
+                        (new_cred, decay_ts, bid, uid),
+                    )
+
+                # Bump last_accessed_at for all returned behaviors
+                if accessed_behavior_ids:
+                    cur.execute(
+                        """
+                        UPDATE behaviors
+                        SET last_accessed_at = %s
+                        WHERE behavior_id = ANY(%s) AND user_id = %s
+                        """,
+                        (current_ts, accessed_behavior_ids, user_id),
+                    )
+            conn.commit()
+        logger.debug(
+            f"[HMBR] persist_retrieval_updates_batch: "
+            f"{len(decay_updates)} decay updates, "
+            f"{len(accessed_behavior_ids)} access timestamps for user={user_id}"
+        )
+    except Exception as e:
+        logger.error(f"[HMBR] persist_retrieval_updates_batch failed: {e}")
+
+
+# ===========================================================================
+# Co-Occurrence Graph — edge creation, expansion, inheritance, cleanup
+# ===========================================================================
+
+def get_behavior_ids_by_session(
+    user_id: str,
+    session_id: str,
+    exclude_ids: List[str] = None,
+) -> List[str]:
+    """
+    Return behavior IDs for a given user+session, excluding the provided IDs.
+    Used to identify pre-existing session behaviors when creating CO_SESSION edges.
+    """
+    exclude_ids = exclude_ids or []
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT behavior_id FROM behaviors
+                    WHERE user_id = %s
+                      AND session_id = %s
+                      AND behavior_state IN ('ACTIVE', 'NEW')
+                      AND behavior_id != ALL(%s)
+                    """,
+                    (user_id, session_id, exclude_ids),
+                )
+                return [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"[GRAPH] get_behavior_ids_by_session failed: {e}")
+        return []
+
+
+def _upsert_co_occurrence_pairs(
+    pairs: List[Tuple[str, str]],
+    user_id: str,
+    edge_type: str,
+    session_id: str,
+) -> int:
+    """
+    Internal helper: UPSERT a list of canonical (a, b) pairs as edges.
+
+    Each pair is assumed to already be in canonical order (a < b lexicographically)
+    and free of self-loops.  On conflict, weight is bumped by +0.5 (diminishing
+    reinforcement signal) and created_at is refreshed.
+    """
+    if not pairs:
+        return 0
+
+    current_timestamp = int(time.time())
+
+    try:
+        with get_db_pool_connection() as conn:
+            with conn.cursor() as cur:
                 cur.executemany(
                     """
                     INSERT INTO behavior_co_occurrences
-                        (behavior_id_1, behavior_id_2, user_id, edge_type, weight, created_at)
-                    VALUES (%s, %s, %s, %s, 1.0, %s)
+                        (behavior_id_1, behavior_id_2, user_id, session_id, edge_type, weight, created_at)
+                    VALUES (%s, %s, %s, %s, %s, 1.0, %s)
                     ON CONFLICT (behavior_id_1, behavior_id_2, edge_type)
                     DO UPDATE SET
                         weight     = behavior_co_occurrences.weight + 0.5,
                         created_at = EXCLUDED.created_at
                     """,
                     [
-                        (a, b, user_id, edge_type, current_timestamp)
+                        (a, b, user_id, session_id, edge_type, current_timestamp)
                         for a, b in pairs
                     ],
                 )
                 conn.commit()
 
         logger.info(
-            f"[GRAPH] Upserted {len(pairs)} {edge_type} edge(s) for user {user_id}"
+            f"[GRAPH] Upserted {len(pairs)} {edge_type} edge(s) "
+            f"for user {user_id} session {session_id}"
         )
         return len(pairs)
 
@@ -2364,110 +2371,94 @@ def insert_co_occurrences_batch(
         return 0
 
 
-def get_graph_expanded_behaviors(
+def insert_co_occurrences_batch(
+    behavior_ids: List[str],
     user_id: str,
-    seed_behavior_ids: List[str],
-    limit: int = 10,
-) -> List[dict]:
+    edge_type: str,
+    session_id: str = "default",
+) -> int:
     """
-    1-hop graph expansion from seed behaviors.
+    Create pairwise co-occurrence edges for a list of behavior IDs.
 
-    Given a set of behavior IDs returned by embedding search, walk
-    the co-occurrence graph one hop to find associated behaviors.
-    Results are ranked by ``edge_weight * behavior_credibility`` so
-    that strongly-associated, high-credibility behaviors bubble up.
+    Generates all unique (a, b) pairs (a < b lexicographically to avoid
+    duplicate reversed edges) and upserts them.  Use this for CO_PROMPT
+    edges where every behavior in the list genuinely co-occurred (e.g. all
+    behaviors extracted from the same prompt).
 
-    Only returns behaviors in ACTIVE / NEW state — SUPERSEDED, ARCHIVED,
-    and FLAGGED behaviors are excluded.  Already-retrieved seed IDs are
-    also excluded to avoid duplicates.
+    For "anchor + partners" semantics — i.e. when only a subset of the IDs
+    are anchors that co-occurred with a separate partner set, but the
+    partners did NOT co-occur with each other in this event — use
+    insert_directed_pairs_batch instead.  Calling this function with an
+    anchor + partners list would inflate edge weights between unrelated
+    partner pairs.
 
     Args:
-        user_id: User identifier.
-        seed_behavior_ids: Behavior IDs from the embedding search.
-        limit: Maximum neighbors to return (default 10).
+        behavior_ids: List of behavior IDs that co-occurred.
+        user_id: The user who owns these behaviors.
+        edge_type: 'CO_PROMPT' or 'CO_SESSION'.
+        session_id: Session in which these behaviors were extracted.
 
     Returns:
-        List of dicts, each containing behavior details + edge metadata.
-        Empty list if no graph neighbors exist.
+        Number of edges written (inserted or updated).
     """
-    if not seed_behavior_ids:
-        return []
+    if len(behavior_ids) < 2:
+        return 0
 
-    try:
-        with get_db_pool_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT DISTINCT ON (neighbor_id)
-                        neighbor_id,
-                        b.behavior_text,
-                        b.credibility,
-                        b.intent,
-                        b.target,
-                        b.context,
-                        b.polarity,
-                        e.edge_type,
-                        e.weight,
-                        (e.weight * b.credibility) AS rank_score
-                    FROM (
-                        -- Forward edges: seed is behavior_id_1
-                        SELECT behavior_id_2 AS neighbor_id, edge_type, weight
-                        FROM behavior_co_occurrences
-                        WHERE user_id = %s
-                          AND behavior_id_1 = ANY(%s)
+    sorted_ids = sorted(set(behavior_ids))
+    pairs = [
+        (sorted_ids[i], sorted_ids[j])
+        for i in range(len(sorted_ids))
+        for j in range(i + 1, len(sorted_ids))
+    ]
+    return _upsert_co_occurrence_pairs(pairs, user_id, edge_type, session_id)
 
-                        UNION ALL
 
-                        -- Reverse edges: seed is behavior_id_2
-                        SELECT behavior_id_1 AS neighbor_id, edge_type, weight
-                        FROM behavior_co_occurrences
-                        WHERE user_id = %s
-                          AND behavior_id_2 = ANY(%s)
-                    ) e
-                    JOIN behaviors b
-                      ON b.behavior_id = e.neighbor_id
-                     AND b.user_id = %s
-                    WHERE b.behavior_state IN ('ACTIVE', 'NEW')
-                      AND e.neighbor_id != ALL(%s)
-                    ORDER BY neighbor_id, rank_score DESC
-                    """,
-                    (
-                        user_id, seed_behavior_ids,
-                        user_id, seed_behavior_ids,
-                        user_id, seed_behavior_ids,
-                    ),
-                )
+def insert_directed_pairs_batch(
+    anchor_ids: List[str],
+    partner_ids: List[str],
+    user_id: str,
+    edge_type: str,
+    session_id: str = "default",
+) -> int:
+    """
+    Create co-occurrence edges between every (anchor, partner) pair only.
 
-                rows = cur.fetchall()
+    Unlike ``insert_co_occurrences_batch`` (which generates ALL pairwise
+    combinations of a single id list), this helper emits edges strictly
+    between the anchor set and the partner set.  Anchor↔anchor and
+    partner↔partner pairs are NOT created — those did not co-occur in
+    this event.
 
-        # Re-sort by rank_score descending and apply limit
-        rows.sort(key=lambda r: r[9], reverse=True)
-        rows = rows[:limit]
+    Use case: CO_SESSION edges from newly inserted / reinforced behaviors
+    (anchors) to pre-existing session behaviors (partners).  Earlier
+    versions of this code passed ``[new_id] + existing_session_ids`` to
+    ``insert_co_occurrences_batch`` once per new id, which inserted
+    spurious existing↔existing edges and bumped their weights by +0.5
+    on every prompt.  This helper avoids that quadratic noise.
 
-        results = []
-        for row in rows:
-            results.append({
-                "behavior_id": row[0],
-                "behavior_text": row[1],
-                "credibility": float(row[2]),
-                "intent": row[3],
-                "target": row[4],
-                "context": row[5],
-                "polarity": row[6],
-                "edge_type": row[7],
-                "edge_weight": float(row[8]),
-                "source": "graph",
-            })
+    Edges are stored in canonical order (min, max).  Self-loops and
+    duplicates are skipped.
+    """
+    if not anchor_ids or not partner_ids:
+        return 0
 
-        logger.info(
-            f"[GRAPH] Expanded {len(seed_behavior_ids)} seed(s) → "
-            f"{len(results)} associated behavior(s) for user {user_id}"
-        )
-        return results
+    anchor_set = set(anchor_ids)
+    partner_set = set(partner_ids)
 
-    except Exception as e:
-        logger.error(f"[GRAPH] Failed to expand graph: {str(e)}")
-        return []
+    seen: set[Tuple[str, str]] = set()
+    pairs: List[Tuple[str, str]] = []
+    for a in anchor_set:
+        for p in partner_set:
+            if a == p:
+                continue  # self-loop
+            lo, hi = (a, p) if a < p else (p, a)
+            if (lo, hi) in seen:
+                continue
+            seen.add((lo, hi))
+            pairs.append((lo, hi))
+
+    return _upsert_co_occurrence_pairs(pairs, user_id, edge_type, session_id)
+
 
 
 def _inherit_edges_on_cursor(

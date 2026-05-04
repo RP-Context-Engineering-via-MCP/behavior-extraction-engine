@@ -39,17 +39,6 @@ class ApiResponse(BaseModel, Generic[DataT]):
 # ---------------------------------------------------------------------------
 
 
-class BehaviorSimilarityRequest(BaseModel):
-    """Request model for the /similarity (POC) endpoint."""
-
-    behavior1: str = Field(..., description="First behavior description")
-    behavior2: str = Field(..., description="Second behavior description")
-    metric: Literal["cosine", "euclidean", "manhattan"] = Field(
-        default="cosine",
-        description="Distance metric to use for comparison",
-    )
-
-
 class ConflictResolutionRequest(BaseModel):
     """Request model for the /resolve-conflict endpoint."""
 
