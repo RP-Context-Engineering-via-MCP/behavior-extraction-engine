@@ -158,6 +158,11 @@ class StoredBehavior(BaseModel):
     last_decay_applied_at: Optional[int] = Field(default=None)
     last_accessed_at: Optional[int] = Field(default=None)
 
+    # Extraction quality signals (stored for team analytics)
+    extraction_confidence: Optional[float] = Field(None, ge=0.0, le=1.0, description="LLM's confidence in the extraction (0..1)")
+    clarity_score: Optional[float] = Field(None, ge=0.0, le=1.0, description="LLM's clarity/cleanness rating (0..1)")
+    linguistic_strength: Optional[float] = Field(None, ge=0.0, le=1.0, description="Hedging intensity — 1.0 = definitive, 0.0 = very hedged")
+
     # Search lanes
     embedding: Optional[List[float]] = Field(None, description="Prose-text embedding (384-dim)")
     canonical_embedding: Optional[List[float]] = Field(None, description="Canonical structural embedding (384-dim)")
