@@ -23,9 +23,8 @@ from utils.embedding_utils import get_canonical_embedding, get_text_embedding
 from utils.similarity_utils import cosine_distance
 from services.credibilityCalculator import calculate_initial_credibility, should_store_behavior, get_decay_rate
 from services.behaviorRepository import (
-    insert_behavior, 
-    insert_prompt_segment, 
-    search_similar_behaviors, 
+    insert_behavior,
+    search_similar_behaviors,
     reinforce_behavior,
     insert_conflict,
     supersede_behavior,
@@ -33,7 +32,7 @@ from services.behaviorRepository import (
     update_behavior_access_time,
     insert_co_occurrences_batch,
     insert_directed_pairs_batch,
-    get_behavior_ids_by_session
+    get_behavior_ids_by_session,
 )
 from services.profileSignalExtractor import ProfileSignalExtractor
 from datetime import datetime
@@ -291,41 +290,14 @@ def run_behavior_extraction(prompt: str) -> ExtractionResult:
 
 def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]) -> ExtractionResult:
     """
-    Extract behaviors from a user prompt with conversation history and enrich prompt for similarity search.
-    
-    This method performs TWO key tasks:
-    1. Extracts behaviors from the prompt
-    2. Enriches the prompt to a standalone query by resolving references using conversation history
-    
-    The standalone query is useful for similarity search when the prompt contains references
-    like "it", "that", "the above options" which depend on conversation context.
-    
-    Args:
-        prompt: User's natural language prompt (may contain contextual references)
-        recent_history: List of recent conversation messages [{"role": "user"/"assistant", "text": "..."}]
-        
-    Returns:
-        ExtractionResult object with:
-            - segments: Extracted behavior segments
-            - standalone_query: Enriched standalone version of prompt for similarity search
-            - success: Boolean indicating success
-            - error: Error message if failed
-            - extraction_time: Time taken in milliseconds
-        
-    Workflow:
-        1. Call GPT-4 via openAiClient.extract_behavior_with_history()
-        2. Validate response structure
-        3. Convert to Pydantic models for type safety
-        4. Return ExtractionResult with standalone_query
-        
-    Example:
-        >>> history = [
-        ...     {"role": "user", "text": "I like Python and JavaScript"},
-        ...     {"role": "assistant", "text": "Both are great choices!"}
-        ... ]
-        >>> result = run_behavior_extraction_with_history("which one is better for backend?", history)
-        >>> result.standalone_query
-        "which is better for backend development: Python or JavaScript?"
+    Extract behaviors + retrieval probes from a user prompt with conversation history.
+
+    Single LLM call produces:
+      - long-term behaviors extracted from the LATEST PROMPT only
+      - 1..3 probes (text + canonical structural form) used for HMBR retrieval
+      - query_type tag used by HMBR Pillar 3 to choose fusion weights
+      - required_intents hint
+      - profile_signals for Profile Service integration
     """
     logger.info("sent for behavior extraction")
     raw_response = extract_behavior_with_history(prompt, recent_history)
@@ -337,127 +309,105 @@ def run_behavior_extraction_with_history(prompt: str, recent_history: List[dict]
             success=False,
             error=raw_response.get("error", "Unknown extraction error"),
             extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
-            standalone_query=None
         )
-    
+
     try:
+        from models.behavior import ProbeSet, ProbeCanonical
+
         validated_segments = []
-        
         for segment_data in raw_response.get("segments", []):
             segment_text = segment_data["text"]
-
-            # Convert each behavior dict to ExtractedBehavior model
             validated_behaviors = []
-            
             for behavior_data in segment_data.get("behaviors", []):
-                # Pydantic will validate ranges and types automatically
                 validated_behavior = ExtractedBehavior(
                     description=behavior_data["description"],
                     confidence=behavior_data["confidence"],
                     clarity=behavior_data["clarity"],
                     linguistic_strength=behavior_data["linguistic_strength"],
                     extracted_at=datetime.now().isoformat(),
-                    # Canonical fields for structured reasoning
                     intent=behavior_data.get("intent"),
                     target=behavior_data.get("target"),
                     context=behavior_data.get("context", "general"),
-                    polarity=behavior_data.get("polarity")
+                    polarity=behavior_data.get("polarity"),
                 )
                 validated_behaviors.append(validated_behavior)
-            
-            # Create validated segment with validated behaviors only
-            validated_segment = BehaviorSegment(
-                text=segment_text,
-                behaviors=validated_behaviors
+            validated_segments.append(BehaviorSegment(text=segment_text, behaviors=validated_behaviors))
+
+        # ---------- probes (text + canonical) ---------------------------------
+        raw_probes = raw_response.get("probes") or []
+        probes: List[ProbeSet] = []
+        for p in raw_probes:
+            if not isinstance(p, dict):
+                continue
+            text = p.get("text")
+            canonical = p.get("canonical") or {}
+            if not isinstance(text, str) or not text.strip():
+                continue
+            try:
+                probes.append(ProbeSet(
+                    text=text.strip(),
+                    canonical=ProbeCanonical(
+                        intent=canonical.get("intent", "PREFERENCE"),
+                        target=(canonical.get("target") or text.strip())[:200],
+                        context=canonical.get("context", "general") or "general",
+                        polarity=canonical.get("polarity", "POSITIVE"),
+                    ),
+                ))
+            except Exception as e:
+                logger.warning(f"Skipping malformed probe {p}: {e}")
+
+        if not probes:
+            logger.error("GPT did not return usable probes — retrieval cannot proceed")
+            return ExtractionResult(
+                segments=[],
+                success=False,
+                error="Extraction failed: no usable probes returned",
+                extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
             )
-            validated_segments.append(validated_segment)
-        
-        # Extract standalone queries (multi-probe) and the singular legacy field.
-        # The openAiClient layer normalises both fields, so trust its output.
-        standalone_queries = raw_response.get("standalone_queries")
-        standalone_query = raw_response.get("standalone_query")
 
-        if not standalone_queries or not isinstance(standalone_queries, list):
-            # Fallback: derive list from singular field
-            if standalone_query and standalone_query.strip():
-                standalone_queries = [standalone_query.strip()]
-            else:
-                logger.error(
-                    "GPT failed to generate any standalone probe — cannot perform retrieval. "
-                    f"Raw response keys: {list(raw_response.keys())}"
-                )
-                return ExtractionResult(
-                    segments=[],
-                    success=False,
-                    error="Extraction failed: GPT did not return any standalone probe. Cannot perform behavior retrieval.",
-                    extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
-                    standalone_query=None,
-                    standalone_queries=None,
-                )
+        # ---------- query_type ------------------------------------------------
+        query_type = raw_response.get("query_type", "BROAD")
+        if query_type not in {"NARROW", "BROAD", "EXPLORATORY", "TASK", "RECALL"}:
+            query_type = "BROAD"
 
-        # Ensure singular field is populated (always = first probe)
-        if not standalone_query or not standalone_query.strip():
-            standalone_query = standalone_queries[0]
-
-        # Extract required_intents for hybrid retrieval (3D search)
+        # ---------- required_intents ------------------------------------------
         required_intents = raw_response.get("required_intents")
         if not required_intents or not isinstance(required_intents, list):
-            logger.warning("No required_intents in response, using default [PREFERENCE, CONSTRAINT]")
             required_intents = ["PREFERENCE", "CONSTRAINT"]
-        
-        # Validate and extract profile_signals for Profile Service integration
+
+        # ---------- profile_signals -------------------------------------------
         validated_profile_signals = None
         raw_profile_signals = raw_response.get("profile_signals")
         if raw_profile_signals:
             try:
                 validated_profile_signals = _profile_signal_extractor.parse_and_validate(raw_profile_signals)
-                logger.info(
-                    f"Validated profile_signals: behavior_level={validated_profile_signals.get('behavior_level')}, "
-                    f"intents={list(validated_profile_signals.get('intents', {}).keys())}, "
-                    f"interests={list(validated_profile_signals.get('interests', {}).keys())}"
-                )
             except ValueError as e:
-                logger.error(f"Profile signals validation failed: {e}. Raw data: {raw_profile_signals}")
-                # Continue without profile_signals - not critical for extraction
-        else:
-            logger.warning(
-                "No profile_signals in GPT response. Profile Service integration will not be triggered. "
-                "This may be because the GPT prompt did not generate profile_signals, or the user's prompt "
-                "did not contain enough information to generate a behavioral profile."
-            )
-        
-        # Return successful extraction result with standalone queries and required intents
+                logger.error(f"Profile signals validation failed: {e}")
+
         return ExtractionResult(
             segments=validated_segments,
             success=True,
             error=None,
             extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
-            standalone_query=standalone_query.strip(),
-            standalone_queries=standalone_queries,
+            probes=probes,
+            query_type=query_type,
             required_intents=required_intents,
-            profile_signals=validated_profile_signals
+            profile_signals=validated_profile_signals,
         )
-    
+
     except KeyError as e:
-        # Missing required field in response
         logger.error(f"Invalid response structure: missing field {str(e)}")
         return ExtractionResult(
-            segments=[],
-            success=False,
+            segments=[], success=False,
             error=f"Invalid response structure: missing field {str(e)}",
             extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
-            standalone_query=None
         )
-    
     except Exception as e:
-        # Pydantic validation error or other unexpected error
         logger.error(f"Failed to validate extraction result: {e}")
         return ExtractionResult(
-            segments=[],
-            success=False,
+            segments=[], success=False,
             error=f"Failed to validate extraction result: {str(e)}",
             extraction_time=raw_response.get("metadata", {}).get("extraction_time_ms", 0.0),
-            standalone_query=None
         )
 
 
@@ -581,48 +531,31 @@ def _create_stored_behavior(
     user_id: str,
     behavior_description: str,
     initial_credibility: float,
-    clarity: float,
-    confidence: float,
-    linguistic_strength: float,
     embedding_vector: List[float],
     canonical_embedding_vector: List[float],
-    segment_id: str,
     canonical: CanonicalBehavior,
-    session_id: str = "default"
+    session_id: str = "default",
 ) -> StoredBehavior:
     """Create a StoredBehavior object from extraction data with intent-based decay rate."""
-    # Get intent-specific decay rate based on behavioral intent
     decay_rate = get_decay_rate(intent=canonical.intent)
-    
-    # Calculate timestamps
     current_time = int(time.time())
-    # Set decay to start after grace period (7 days)
     decay_starts_at = current_time + DECAY_GRACE_PERIOD_SECONDS
-    
-    logger.debug(
-        f"Creating behavior with intent '{canonical.intent}', decay_rate {decay_rate}, "
-        f"grace period ends at {datetime.fromtimestamp(decay_starts_at).isoformat()}"
-    )
-    
+
     return StoredBehavior(
         user_id=user_id,
+        session_id=session_id,
         behavior_text=behavior_description,
+        intent=canonical.intent,
+        target=canonical.target,
+        context=canonical.context,
+        polarity=canonical.polarity,
         credibility=initial_credibility,
-        clarity_score=clarity,
-        extraction_confidence=confidence,
-        linguistic_strength=linguistic_strength,
         decay_rate=decay_rate,
         embedding=embedding_vector,
         canonical_embedding=canonical_embedding_vector,
         created_at=current_time,
         last_seen_at=current_time,
         last_decay_applied_at=decay_starts_at,
-        prompt_history_ids=[segment_id],
-        session_id=session_id,
-        intent=canonical.intent,
-        target=canonical.target,
-        context=canonical.context,
-        polarity=canonical.polarity
     )
 
 
@@ -693,12 +626,8 @@ def _handle_llm_conflict_analysis(
     behavior_description: str,
     user_id: str,
     initial_credibility: float,
-    clarity: float,
-    confidence: float,
-    linguistic_strength: float,
     embedding_vector: List[float],
     canonical_embedding_vector: List[float],
-    segment_id: str,
     canonical: CanonicalBehavior,
     stored_behaviors: List[StoredBehavior],
     session_id: str = "default",
@@ -743,14 +672,10 @@ def _handle_llm_conflict_analysis(
             user_id=user_id,
             behavior_description=behavior_description,
             initial_credibility=initial_credibility,
-            clarity=clarity,
-            confidence=confidence,
-            linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
             canonical_embedding_vector=canonical_embedding_vector,
-            segment_id=segment_id,
             canonical=canonical,
-            session_id=session_id
+            session_id=session_id,
         )
         _flag_and_create_conflict(
             existing_behavior_id=existing.behavior_id,
@@ -774,14 +699,10 @@ def _handle_llm_conflict_analysis(
         user_id=user_id,
         behavior_description=behavior_description,
         initial_credibility=initial_credibility,
-        clarity=clarity,
-        confidence=confidence,
-        linguistic_strength=linguistic_strength,
         embedding_vector=embedding_vector,
         canonical_embedding_vector=canonical_embedding_vector,
-        segment_id=segment_id,
         canonical=canonical,
-        session_id=session_id
+        session_id=session_id,
     )
 
     if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
@@ -824,12 +745,8 @@ def _handle_polarity_conflict(
     user_id: str,
     behavior_description: str,
     initial_credibility: float,
-    clarity: float,
-    confidence: float,
-    linguistic_strength: float,
     embedding_vector: List[float],
     canonical_embedding_vector: List[float],
-    segment_id: str,
     canonical: CanonicalBehavior,
     stored_behaviors: List[StoredBehavior],
     session_id: str = "default",
@@ -869,14 +786,10 @@ def _handle_polarity_conflict(
             user_id=user_id,
             behavior_description=behavior_description,
             initial_credibility=initial_credibility,
-            clarity=clarity,
-            confidence=confidence,
-            linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
             canonical_embedding_vector=canonical_embedding_vector,
-            segment_id=segment_id,
             canonical=canonical,
-            session_id=session_id
+            session_id=session_id,
         )
 
         _supersede_existing_behavior(
@@ -884,7 +797,7 @@ def _handle_polarity_conflict(
             user_id=user_id,
             stored=stored
         )
-        
+
         stored_behaviors.append(stored)
         return (True, True)
 
@@ -894,7 +807,6 @@ def _handle_polarity_conflict(
             f"AUTO-RESOLVE: Ignoring new behavior "
             f"(credibility: {initial_credibility:.2f} < {existing.credibility:.2f})"
         )
-        # Update last_accessed_at - existing behavior was confirmed in conflict resolution
         update_behavior_access_time(existing.behavior_id, user_id)
         return (True, True)
 
@@ -906,16 +818,12 @@ def _handle_polarity_conflict(
             behavior_description=behavior_description,
             user_id=user_id,
             initial_credibility=initial_credibility,
-            clarity=clarity,
-            confidence=confidence,
-            linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
             canonical_embedding_vector=canonical_embedding_vector,
-            segment_id=segment_id,
             canonical=canonical,
             stored_behaviors=stored_behaviors,
             session_id=session_id,
-            conflict_subtype=conflict_subtype
+            conflict_subtype=conflict_subtype,
         )
 
     return (False, False)
@@ -926,12 +834,8 @@ def _handle_potential_conflict(
     user_id: str,
     behavior_description: str,
     initial_credibility: float,
-    clarity: float,
-    confidence: float,
-    linguistic_strength: float,
     embedding_vector: List[float],
     canonical_embedding_vector: List[float],
-    segment_id: str,
     canonical: CanonicalBehavior,
     stored_behaviors: List[StoredBehavior],
     session_id: str = "default"
@@ -967,19 +871,15 @@ def _handle_potential_conflict(
             user_id=user_id,
             behavior_description=behavior_description,
             initial_credibility=initial_credibility,
-            clarity=clarity,
-            confidence=confidence,
-            linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
             canonical_embedding_vector=canonical_embedding_vector,
-            segment_id=segment_id,
             canonical=canonical,
-            session_id=session_id
+            session_id=session_id,
         )
         _supersede_existing_behavior(
             existing_behavior_id=existing.behavior_id,
             user_id=user_id,
-            stored=stored
+            stored=stored,
         )
         stored_behaviors.append(stored)
         return (True, True)
@@ -1021,14 +921,10 @@ def _handle_potential_conflict(
             user_id=user_id,
             behavior_description=behavior_description,
             initial_credibility=initial_credibility,
-            clarity=clarity,
-            confidence=confidence,
-            linguistic_strength=linguistic_strength,
             embedding_vector=embedding_vector,
             canonical_embedding_vector=canonical_embedding_vector,
-            segment_id=segment_id,
             canonical=canonical,
-            session_id=session_id
+            session_id=session_id,
         )
         _flag_and_create_conflict(
             existing_behavior_id=existing.behavior_id,
@@ -1052,14 +948,10 @@ def _handle_potential_conflict(
         user_id=user_id,
         behavior_description=behavior_description,
         initial_credibility=initial_credibility,
-        clarity=clarity,
-        confidence=confidence,
-        linguistic_strength=linguistic_strength,
         embedding_vector=embedding_vector,
         canonical_embedding_vector=canonical_embedding_vector,
-        segment_id=segment_id,
         canonical=canonical,
-        session_id=session_id
+        session_id=session_id,
     )
 
     if conflict_analysis.conflict_type == ConflictAnalysisType.CONTEXT_DEPENDENT:
@@ -1365,39 +1257,24 @@ def _process_relationships(
     user_id: str,
     behavior_description: str,
     initial_credibility: float,
-    clarity: float,
-    confidence: float,
-    linguistic_strength: float,
     embedding_vector: List[float],
     canonical_embedding_vector: List[float],
-    segment_id: str,
     stored_behaviors: List[StoredBehavior],
-    session_id: str = "default"
+    session_id: str = "default",
 ) -> bool:
     """
     Process all collected relationships and take appropriate actions.
-    
+
     Priority handling:
     1. DUPLICATE → Reinforce and return (definitive action)
     2. POLARITY_CONFLICT → Handle conflict (may supersede, ignore, or flag)
     3. CROSS_INTENT_CONFLICT → Handle cross-intent conflict
     4. POTENTIAL_CONFLICT → Collect all, then handle
     5. RELATED/COMPATIBLE → No action needed
-    
-    Args:
-        relationships: List of detected relationships
-        canonical: New behavior's canonical form
-        user_id: User ID
-        behavior_description: Description of new behavior
-        initial_credibility: Calculated credibility of new behavior
-        clarity, confidence, linguistic_strength: Behavior scores
-        embedding_vector: Embedding of new behavior
-        segment_id: Segment ID
-        stored_behaviors: List to append stored behaviors to
-        
+
     Returns:
-        True if a definitive action was taken (don't insert new behavior)
-        False if new behavior should be inserted
+        True if a definitive action was taken (don't insert new behavior),
+        False if new behavior should be inserted.
     """
     if not relationships:
         return False
@@ -1435,11 +1312,7 @@ def _process_relationships(
                 reverse=True
             )
             winner = duplicates_sorted[0].existing_behavior
-            reinforce_behavior(
-                behavior_id=winner.behavior_id,
-                user_id=user_id,
-                segment_id=segment_id
-            )
+            reinforce_behavior(behavior_id=winner.behavior_id, user_id=user_id)
             logger.info(
                 f"DUPLICATE ANOMALY: Reinforced winner {winner.behavior_id} "
                 f"(credibility={winner.credibility:.3f})"
@@ -1453,19 +1326,14 @@ def _process_relationships(
                 supersede_behavior(
                     old_behavior_id=loser.behavior_id,
                     new_behavior_id=winner.behavior_id,
-                    user_id=user_id
+                    user_id=user_id,
                 )
         else:
-            # Normal single-duplicate path → reinforce
             existing = duplicates[0].existing_behavior
             logger.info(
                 f"DUPLICATE ({duplicates[0].context_relation}) → reinforcing {existing.behavior_id}"
             )
-            reinforce_behavior(
-                behavior_id=existing.behavior_id,
-                user_id=user_id,
-                segment_id=segment_id
-            )
+            reinforce_behavior(behavior_id=existing.behavior_id, user_id=user_id)
         return True
 
     # ==================================================================
@@ -1505,15 +1373,11 @@ def _process_relationships(
                 user_id=user_id,
                 behavior_description=behavior_description,
                 initial_credibility=initial_credibility,
-                clarity=clarity,
-                confidence=confidence,
-                linguistic_strength=linguistic_strength,
                 embedding_vector=embedding_vector,
                 canonical_embedding_vector=canonical_embedding_vector,
-                segment_id=segment_id,
                 canonical=canonical,
                 stored_behaviors=stored_behaviors,
-                session_id=session_id
+                session_id=session_id,
             )
             if not decision_taken:
                 all_conflicts_resolved = False
@@ -1563,16 +1427,12 @@ def _process_relationships(
                 user_id=user_id,
                 behavior_description=behavior_description,
                 initial_credibility=initial_credibility,
-                clarity=clarity,
-                confidence=confidence,
-                linguistic_strength=linguistic_strength,
                 embedding_vector=embedding_vector,
                 canonical_embedding_vector=canonical_embedding_vector,
-                segment_id=segment_id,
                 canonical=canonical,
                 stored_behaviors=stored_behaviors,
                 session_id=session_id,
-                conflict_subtype="CROSS_INTENT_CONFLICT"
+                conflict_subtype="CROSS_INTENT_CONFLICT",
             )
             if not decision_taken:
                 all_cross_intent_resolved = False
@@ -1618,15 +1478,11 @@ def _process_relationships(
                 user_id=user_id,
                 behavior_description=behavior_description,
                 initial_credibility=initial_credibility,
-                clarity=clarity,
-                confidence=confidence,
-                linguistic_strength=linguistic_strength,
                 embedding_vector=embedding_vector,
                 canonical_embedding_vector=canonical_embedding_vector,
-                segment_id=segment_id,
                 canonical=canonical,
                 stored_behaviors=stored_behaviors,
-                session_id=session_id
+                session_id=session_id,
             )
             if not decision_taken:
                 all_potential_resolved = False
@@ -1661,21 +1517,16 @@ def store_behavior(
     prompt_behavior_ids: List[str] = []   # All behavior IDs touched in this prompt (for graph edges)
 
     for segment in extraction_result.segments:
-        segment_id: Optional[str] = None
-
         for behavior in segment.behaviors:
             logger.info(f"--- Processing behavior: '{behavior.description}' ---")
 
-            # ==============================================================
-            # 1️⃣ Credibility calculation & pruning
-            # ==============================================================
+            # 1. Credibility calculation & pruning
             initial_credibility = calculate_initial_credibility(
                 confidence=behavior.confidence,
                 clarity=behavior.clarity,
                 linguistic_strength=behavior.linguistic_strength,
-                behavior_text=behavior.description
+                behavior_text=behavior.description,
             )
-
             if not should_store_behavior(initial_credibility):
                 logger.info(
                     f"PRUNE: '{behavior.description}' "
@@ -1683,120 +1534,73 @@ def store_behavior(
                 )
                 continue
 
-            # ==============================================================
-            # 2️⃣ Ensure prompt segment exists
-            # ==============================================================
-            if segment_id is None:
-                segment_result = insert_prompt_segment(
-                    segment_text=segment.text,
-                    user_id=user_id
-                )
-                if not segment_result.success:
-                    logger.error(
-                        f"Failed to insert prompt segment: {segment_result.error}"
-                    )
-                    continue
-                # Capture the segment_id from the result
-                segment_id = segment_result.segment_id
-                logger.info(f"Prompt segment created: {segment_id}")
-
-            # ==============================================================
-            # 3️⃣ Canonical behavior creation
-            # ==============================================================
+            # 2. Canonical behavior creation
             canonical = create_canonical_behavior(behavior)
             if canonical is None:
                 logger.warning(
-                    f"SKIP: Missing canonical fields for "
-                    f"'{behavior.description}'"
+                    f"SKIP: Missing canonical fields for '{behavior.description}'"
                 )
                 continue
 
             logger.info(
-                f"CANONICAL: intent={canonical.intent}, "
-                f"target={canonical.target}, "
-                f"context={canonical.context}, "
-                f"polarity={canonical.polarity}"
+                f"CANONICAL: intent={canonical.intent}, target={canonical.target}, "
+                f"context={canonical.context}, polarity={canonical.polarity}"
             )
 
-            # ==============================================================
-            # 4️⃣ Generate DUAL embeddings
-            #    a) Canonical embedding → duplicate/conflict detection
-            #    b) Prose embedding     → LLM context retrieval
-            # ==============================================================
+            # 3. Generate dual embeddings
             try:
                 canonical_embedding_vector = get_canonical_embedding(canonical)
             except Exception as e:
-                logger.error(
-                    f"Canonical embedding failed for '{behavior.description}': {e}"
-                )
+                logger.error(f"Canonical embedding failed for '{behavior.description}': {e}")
                 continue
 
             try:
                 embedding_vector = embed_text(behavior.description)
             except Exception as e:
-                logger.error(
-                    f"Embedding failed for '{behavior.description}': {e}"
-                )
+                logger.error(f"Embedding failed for '{behavior.description}': {e}")
                 continue
 
-            # ==============================================================
-            # 5️⃣ Retrieve candidate behaviors (using canonical embedding)
-            # ==============================================================
+            # 4. Retrieve candidate behaviors for duplicate / conflict detection
             try:
                 candidates = search_similar_behaviors(
                     user_id=user_id,
                     query_embedding=canonical_embedding_vector,
                     session_id=session_id,
-                    limit=10
+                    limit=10,
                 )
                 logger.info(
-                    f"Retrieved {len(candidates)} candidate(s) for "
-                    f"'{behavior.description} : {candidates}'"
+                    f"Retrieved {len(candidates)} candidate(s) for '{behavior.description}'"
                 )
             except Exception as e:
                 logger.error(f"Failed to search similar behaviors: {e}")
                 candidates = []
 
-            # ==============================================================
-            # 6️⃣ MULTI-RELATIONSHIP DETECTION
-            # Collect ALL relationships before taking action
-            # ==============================================================
+            # 5. Detect all relationships (DUPLICATE / POLARITY_CONFLICT / etc.)
             relationships = _collect_all_relationships(
                 candidates=candidates,
                 canonical=canonical,
-                semantic_threshold=SEMANTIC_RELEVANCE_THRESHOLD
+                semantic_threshold=SEMANTIC_RELEVANCE_THRESHOLD,
             )
-            
             logger.info(
                 f"Found {len(relationships)} relationship(s) for '{behavior.description}': "
                 f"{[r.relation_type.value for r in relationships]}"
             )
 
-            # ==============================================================
-            # 7️⃣ PROCESS ALL RELATIONSHIPS
-            # Priority: DUPLICATE > POLARITY_CONFLICT > CROSS_INTENT > POTENTIAL
-            # ==============================================================
+            # 6. Process all relationships (DUPLICATE > POLARITY > CROSS_INTENT > POTENTIAL)
             decision_taken = _process_relationships(
                 relationships=relationships,
                 canonical=canonical,
                 user_id=user_id,
                 behavior_description=behavior.description,
                 initial_credibility=initial_credibility,
-                clarity=behavior.clarity,
-                confidence=behavior.confidence,
-                linguistic_strength=behavior.linguistic_strength,
                 embedding_vector=embedding_vector,
                 canonical_embedding_vector=canonical_embedding_vector,
-                segment_id=segment_id,
                 stored_behaviors=stored_behaviors,
-                session_id=session_id
+                session_id=session_id,
             )
 
-            # ==============================================================
-            # 8️⃣ FALLBACK → INSERT NEW BEHAVIOR
-            # ==============================================================
+            # 7. Fallback → insert new behavior
             if decision_taken:
-                # Track reinforced duplicate IDs for graph edges
                 for rel in relationships:
                     if rel.relation_type == RelationType.DUPLICATE:
                         prompt_behavior_ids.append(rel.existing_behavior.behavior_id)
@@ -1809,14 +1613,10 @@ def store_behavior(
                 user_id=user_id,
                 behavior_description=behavior.description,
                 initial_credibility=initial_credibility,
-                clarity=behavior.clarity,
-                confidence=behavior.confidence,
-                linguistic_strength=behavior.linguistic_strength,
                 embedding_vector=embedding_vector,
                 canonical_embedding_vector=canonical_embedding_vector,
-                segment_id=segment_id,
                 canonical=canonical,
-                session_id=session_id
+                session_id=session_id,
             )
 
             try:

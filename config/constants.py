@@ -132,106 +132,102 @@ PARAPHRASE_TARGET_DISTANCE: float = 0.30
 RELATED_BEHAVIORS_DISTANCE_THRESHOLD: float = 0.73
 
 # ---------------------------------------------------------------------------
-# Layered Retrieval Architecture (LRA) — replaces the old additive TGHR
+# Hybrid Multi-Signal Behavior Retrieval (HMBR) — replaces the old LRA
 # ---------------------------------------------------------------------------
 # Pipeline:
-#   Stage 1: Pure dense (cosine) retrieval from DB → top K candidates
-#   Stage 2: In-memory multiplicative intent re-ranking
-#            S_base = 1 - D_cosine
-#            M = 1 + (INTENT_RERANK_ALPHA * affinity)
-#            S_final = S_base * M
-#   Stage 3: Absolute semantic floor + relevance-gap dynamic cutoff
+#   Pillar 1: Multi-signal candidate generation
+#             - prose-embedding cosine over `embedding`
+#             - canonical-embedding cosine over `canonical_embedding`
+#             - lexical BM25 over `search_vector`
+#             union → ~80-150 candidate pool, each scored on every signal
+#   Pillar 2: Personalised PageRank graph expansion
+#             - seeds: candidates from Pillar 1, mass ∝ S_seed
+#             - edges: CO_PROMPT (high), SEMANTIC_SIMILAR (medium),
+#                      CO_SESSION (low)
+#             - 4 power-iterations with α=0.15 restart probability
+#   Pillar 3: Adaptive fusion + elbow selection
+#             - S_final = Σ w_i · S_i  (weights chosen by query_type)
+#             - cut by knee detection on sorted scores; soft cap fallback
 # ---------------------------------------------------------------------------
 
-# Maximum candidates fetched from DB before in-memory re-ranking.
-# 40 provides enough headroom for users with ~50-100 stored behaviors.
-HYBRID_SEARCH_LIMIT: int = 40
+# Per-probe per-lane top-K fetched from DB before fusion.
+# 20 gives up to 20×3lanes×3probes=180 candidate slots (many overlap) — ample
+# for fusion while saving ~33% DB scan time vs the original 30.
+HMBR_PER_LANE_TOP_K: int = 20
 
-# Intent re-ranking alpha — multiplicative weight for intent affinity.
-# S_final = S_base * (1 + INTENT_RERANK_ALPHA * affinity)
-# At alpha=0.35, a perfect intent match lifts the score by 35%.
-# A zero-affinity intent leaves the score unchanged.
-# Raised from 0.25 → 0.35 to better recover on-intent near-misses
-# under all-MiniLM-L6's diffuse cosine geometry.
-INTENT_RERANK_ALPHA: float = 0.35
+# Lexical-lane minimum BM25-style match score (ts_rank); below this we
+# treat the row as "not a lexical hit" and assign S_lexical = 0.
+HMBR_LEXICAL_MIN_RANK: float = 0.01
 
-# Absolute semantic floor — any behavior with S_final below this is
-# mathematically discarded.  Prevents injecting weakly-related behaviors
-# into the LLM context window, reducing hallucination risk.
-# Lowered from 0.48 → 0.40 to reflect MiniLM-L6's diffuse geometry on
-# abstract↔concrete asymmetric query patterns (e.g., "QA practices" ↔
-# "always writes unit tests"), then 0.40 → 0.35 to recover near-misses
-# that the relevance-gap stage was already correctly ranking but the
-# floor was discarding before the gap stage could see them.
-SEMANTIC_FLOOR_THRESHOLD: float = 0.35
+# Recency time constant (days).  S_recency = exp(-Δt / τ).
+HMBR_RECENCY_TAU_DAYS: float = 14.0
 
-# Soft-fallback floor — only activated when the primary floor (above)
-# drops ALL candidates to zero results.  Recovers near-miss behaviors
-# that the strict floor filters out.  Because this only fires when the
-# primary search returns nothing, it CANNOT affect already-passing queries.
-# Must be < SEMANTIC_FLOOR_THRESHOLD to actually rescue anything (the
-# previous 0.48 == 0.48 made this branch a no-op).
-SEMANTIC_FLOOR_FALLBACK: float = 0.32
+# Same-session boost: behaviors in the *current* session get this much
+# added to S_final after fusion, before elbow detection.
+HMBR_SESSION_BOOST: float = 0.15
 
-# Maximum results returned in fallback mode.  Capped low to prevent
-# noise from diluting the LLM context when the match quality is marginal.
-MAX_FALLBACK_RESULTS: int = 3
+# Hard cap on returned results after elbow detection.
+HMBR_MAX_RESULTS: int = 12
 
-# Relevance-gap cutoff ratio (Top-Score Relative Drop-off).
-# T_dynamic = S_max * (1 - RELEVANCE_GAP_DROP_RATIO)
-# Any behaviour below T_dynamic is cut.
-# Loosened from 0.15 → 0.30 → 0.45 progressively as we observed that
-# even 0.30 was over-pruning: with S_max ≈ 0.7 (typical good match)
-# T_dynamic was 0.49, which on diffuse 384-dim cosine left only the
-# top-1 candidate. 0.45 keeps the second/third tier visible while the
-# absolute SEMANTIC_FLOOR_THRESHOLD still guards against tail noise.
-RELEVANCE_GAP_DROP_RATIO: float = 0.45
+# Soft floor: a candidate must have S_final ≥ this to be returned even
+# if elbow detection includes it.  Prevents a thin tail from leaking in
+# when the score distribution is flat.
+HMBR_MIN_FINAL_SCORE: float = 0.20
 
-# Hard cap on the number of results returned after gap filtering.
-# Prevents over-retrieval on broad / vague queries.
-MAX_RETRIEVAL_RESULTS: int = 10
+# ----- Personalised PageRank --------------------------------------------
+# Restart probability (a.k.a. teleport rate) — fraction of mass returned
+# to the seed distribution at each iteration.  α=0.15 is the standard
+# choice; lower values let mass diffuse further into the graph.
+HMBR_PPR_ALPHA: float = 0.15
+HMBR_PPR_ITERATIONS: int = 4
 
-# ---------------------------------------------------------------------------
-# Multi-probe HyDE retrieval
-# ---------------------------------------------------------------------------
-# The LLM emits 1..MAX_STANDALONE_QUERIES short canonical probes per user
-# prompt.  Each probe is embedded and used to query pgvector independently.
-# Per-candidate scoring uses the BEST (minimum) cosine distance across
-# probes, with a 10%-per-extra-probe agreement multiplier when a candidate
-# appears in multiple probes' top-K.
-#
-# Multiple probes attack the abstract↔concrete vocabulary asymmetry
-# inherent to conversational-prompt → canonical-stored-behavior retrieval
-# (e.g., "modern web frontend" ↔ "uses React for frontend").  Keeping the
-# scoring on the existing s_base scale means τ_min/ρ thresholds carry over
-# without recalibration.
+# Edge-type weights for the transition matrix.  CO_PROMPT propagates
+# the most because direct co-occurrence is the strongest signal;
+# SEMANTIC_SIMILAR is medium; CO_SESSION is loose.
+HMBR_EDGE_WEIGHT_CO_PROMPT: float = 1.0
+HMBR_EDGE_WEIGHT_SEMANTIC_SIMILAR: float = 0.7
+HMBR_EDGE_WEIGHT_CO_SESSION: float = 0.4
+
+# Maximum graph nodes loaded for PPR.  Above this we sample down by
+# proximity to seeds — keeps the PPR matrix size bounded for users with
+# very large behavior libraries.
+HMBR_GRAPH_MAX_NODES: int = 400
+
+# ----- SEMANTIC_SIMILAR edge generation ---------------------------------
+# When a behavior is inserted, find its top-N closest existing behaviors
+# by canonical_embedding and create SEMANTIC_SIMILAR edges to them when
+# their cosine distance is below the threshold.
+HMBR_SEMANTIC_SIMILAR_TOP_N: int = 5
+HMBR_SEMANTIC_SIMILAR_MAX_DISTANCE: float = 0.25  # i.e. similarity ≥ 0.75
+
+# ----- Fusion weights per query_type ------------------------------------
+# Each row sums to 1.0.  Lanes:  sem | canon | lex | rec | cred | useful | ppr
+HMBR_FUSION_WEIGHTS: dict[str, dict[str, float]] = {
+    "NARROW": {
+        "sem":   0.35, "canon": 0.20, "lex":   0.25,
+        "rec":   0.05, "cred":  0.05, "useful": 0.05, "ppr": 0.05,
+    },
+    "BROAD": {
+        "sem":   0.22, "canon": 0.20, "lex":   0.10,
+        "rec":   0.08, "cred":  0.10, "useful": 0.05, "ppr": 0.25,
+    },
+    "EXPLORATORY": {
+        "sem":   0.10, "canon": 0.10, "lex":   0.05,
+        "rec":   0.25, "cred":  0.15, "useful": 0.10, "ppr": 0.25,
+    },
+    "TASK": {
+        "sem":   0.20, "canon": 0.25, "lex":   0.10,
+        "rec":   0.05, "cred":  0.05, "useful": 0.05, "ppr": 0.30,
+    },
+    "RECALL": {
+        "sem":   0.15, "canon": 0.10, "lex":   0.30,
+        "rec":   0.25, "cred":  0.05, "useful": 0.05, "ppr": 0.10,
+    },
+}
+
+# ----- Multi-probe HyDE -------------------------------------------------
+# The LLM emits 1..MAX_STANDALONE_QUERIES retrieval probes per prompt.
 MAX_STANDALONE_QUERIES: int = 3
-
-# ---------------------------------------------------------------------------
-# Graph expansion relevance gate
-# ---------------------------------------------------------------------------
-# After 1-hop co-occurrence walk in get_graph_expanded_behaviors, every
-# neighbor is checked against the query embedding(s) and dropped if its
-# best cosine distance to any probe exceeds the edge-type-specific
-# threshold below.
-#
-# Without any gate, graph expansion replays write-time co-occurrence
-# (e.g., "Python" and "cooking" mentioned in the same prompt) into
-# read-time noise — even when dense retrieval correctly excluded them.
-#
-# CO_PROMPT edges are the riskiest source of cross-domain noise: any
-# two behaviors mentioned in one prompt are linked, regardless of how
-# unrelated they are.  Apply a tight gate here.
-#
-# CO_SESSION edges already carry an implicit pragmatic association —
-# the user kept these behaviors together inside one session boundary,
-# so even topically distant neighbors are usually relevant context.
-# Use a much looser gate so that, e.g., "I'm working on a Django
-# project, and I prefer dark mode" still surfaces the dark-mode
-# preference when the query is about Django, without needing semantic
-# proximity between the two concepts.
-GRAPH_EXPANSION_DISTANCE_THRESHOLD: float = 0.55
-GRAPH_EXPANSION_SESSION_DISTANCE_THRESHOLD: float = 0.85
 
 # ---------------------------------------------------------------------------
 # Intent taxonomy

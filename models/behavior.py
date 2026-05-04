@@ -54,15 +54,39 @@ class ExtractedBehavior(BaseModel):
     
 
 
+class ProbeCanonical(BaseModel):
+    """
+    Canonical structural fields the LLM emits per probe at extraction time.
+
+    These let HMBR retrieval embed a structured form of the probe
+    (e.g., "POSITIVE PREFERENCE Python in backend") and search the
+    canonical_embedding column with like-for-like geometry.
+    """
+    intent: Literal["PREFERENCE", "CONSTRAINT", "HABIT", "SKILL", "COMMUNICATION"] = Field(
+        ..., description="Inferred intent of the probe — used for canonical embedding & intent affinity"
+    )
+    target: str = Field(..., description="Concise canonical noun the probe is about")
+    context: str = Field(default="general", description="Scope where the probe applies")
+    polarity: Literal["POSITIVE", "NEGATIVE"] = Field(
+        ..., description="Whether the probe is asking about positive or negative preference"
+    )
+
+
+class ProbeSet(BaseModel):
+    """One probe + its canonical structural form, both produced by the LLM in one call."""
+    text: str = Field(..., description="Conversational probe (e.g., 'uses GitHub Actions for CI/CD')")
+    canonical: ProbeCanonical = Field(..., description="Structured form for canonical-embedding lane")
+
+
 class ExtractionResult(BaseModel):
     segments: List[BehaviorSegment] = Field(
-        default_factory=list, 
+        default_factory=list,
         description="Segment prompt with extracted behaviors"
     )
     success: bool = Field(
         ...,
-        description = "Indicates if extraction was successful"
-    )  
+        description="Indicates if extraction was successful"
+    )
     error: Optional[str] = Field(
         None,
         description="Error message if extraction failed"
@@ -72,128 +96,80 @@ class ExtractionResult(BaseModel):
         ge=0.0,
         description="Time taken for extraction in milliseconds"
     )
-    standalone_query: Optional[str] = Field(
-        None,
-        description="First semantic search probe — kept as a string for backwards compatibility / logging"
-    )
-    standalone_queries: Optional[List[str]] = Field(
-        default=None,
-        description="1..3 short canonical search probes (multi-probe HyDE) used for retrieval. The retrieval pipeline embeds each and merges results via Reciprocal Rank Fusion."
+    probes: List[ProbeSet] = Field(
+        default_factory=list,
+        description=(
+            "1..3 retrieval probes, each with a conversational text form and a canonical "
+            "structural form.  Replaces the older standalone_query/standalone_queries pair."
+        )
     )
     required_intents: Optional[List[str]] = Field(
         default=None,
-        description="LLM-predicted intent types relevant to the query for metadata pre-filtering (e.g., ['CONSTRAINT', 'PREFERENCE'])"
+        description="LLM-predicted intent types relevant to the query (e.g., ['CONSTRAINT', 'PREFERENCE'])"
+    )
+    query_type: Literal["NARROW", "BROAD", "EXPLORATORY", "TASK", "RECALL"] = Field(
+        default="BROAD",
+        description=(
+            "Coarse query classification used by HMBR Pillar 3 to choose fusion weights:\n"
+            " NARROW: one specific topic — weight semantic+lexical heavily\n"
+            " BROAD: multi-faceted — balanced fusion\n"
+            " EXPLORATORY: 'what do I usually do?' — weight recency+credibility+graph\n"
+            " TASK: 'how do I do X?' — weight canonical+intent+graph\n"
+            " RECALL: 'did I say...?' — weight lexical+recency"
+        )
     )
     profile_signals: Optional[dict] = Field(
         default=None,
-        description="Profile signals extracted for Profile Service integration (intents, interests, behavior_level, signals, complexity, consistency)"
+        description="Profile signals extracted for Profile Service integration"
     )
 
 
 class StoredBehavior(BaseModel):
-    """final object to be stored in the DB"""
+    """Final object to be stored in the behaviors table."""
 
     behavior_id: str = Field(
         default_factory=lambda: f"beh_{uuid.uuid4().hex[:8]}",
         description="Unique identifier for the behavior"
     )
-    user_id: str = Field(
-        ...,
-        description="user identifier - behavior are unique per user"
-    )
-    behavior_text: str = Field(
-        ..., 
-        description="extracted behavior"
-    )
-    credibility: float = Field(
-        description="Credibility score of the behavior"
-    )
-    reinforcement_count: int = Field(
-        default=1,
-        ge=1,
-        description="Number of times this behavior has been reinforced"
-    )
-    decay_rate: float = Field(
-        default=0.015,
-        ge=0.0,
-        le=1.0,
-        description="Decay rate for the behavior's credibility over time"
-    )
-    created_at: int = Field(
-        default_factory=lambda: int(time.time()),
-        description="Timestamp when the behavior was created"
-    )
-    last_seen_at: int = Field(
-        default_factory=lambda: int(time.time()),
-        description="Timestamp when the behavior was last reinforced"
-    )
-    last_decay_applied_at: Optional[int] = Field(
-        default=None,
-        description="Timestamp when decay was last applied or when it should start (created_at + grace period)"
-    )
-    last_accessed_at: Optional[int] = Field(
-        default=None,
-        description="Timestamp when behavior was last actively used (context enrichment, reinforcement, conflict resolution)"
-    )
-    prompt_history_ids: List[str] = Field(
-        default_factory=list,
-        description="List of prompt IDs that have triggered this behavior"
-    )
-    clarity_score: float = Field(
-        ge=0.0,
-        le=1.0,
-        description="How clear/unambiguous the behavior was in the prompt"
-    )
-    extraction_confidence: float = Field(
-        ge=0.0,
-        le=1.0,
-        description="GPT's confidence in extracting this behavior"
-    )
-    linguistic_strength: float = Field(
-        ge=0.0,
-        le=1.0,
-        description="Strength of user's language when expressing this behavior"
-    )
-    session_id: str = Field(
-        default="default",
-        description="Session ID or 'default' for general behaviors"
-    )
-    embedding: Optional[List[float]] = Field(
-        None,
-        description="Vector embedding of behavior_text for semantic search (LLM context retrieval)"
-    )
-    canonical_embedding: Optional[List[float]] = Field(
-        None,
-        description="Vector embedding of canonical tuple for duplicate/conflict detection at store-time"
-    )
-    # Canonical behavior fields (added with canonical behavior refactor)
+    user_id: str = Field(..., description="User identifier — behaviors are unique per user")
+    session_id: str = Field(default="default", description="Session ID or 'default'")
+    behavior_text: str = Field(..., description="Extracted behavior text")
+
+    # Canonical structural fields
     intent: Optional[Literal["PREFERENCE", "CONSTRAINT", "HABIT", "SKILL", "COMMUNICATION"]] = Field(
-        None,
-        description="Behavioral intent (PREFERENCE, CONSTRAINT, HABIT, SKILL, COMMUNICATION)"
+        None, description="Behavioral intent"
     )
-    target: Optional[str] = Field(
-        None,
-        description="Concise target noun (dark mode, python, etc.)"
+    target: Optional[str] = Field(None, description="Concise target noun")
+    context: Optional[str] = Field(None, description="Context scope")
+    polarity: Optional[Literal["POSITIVE", "NEGATIVE"]] = Field(None, description="POSITIVE or NEGATIVE")
+
+    # Credibility & lifecycle
+    credibility: float = Field(..., description="Credibility score (0..1)")
+    reinforcement_count: int = Field(default=1, ge=1)
+    decay_rate: float = Field(default=0.015, ge=0.0, le=1.0)
+    usefulness_score: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Personalisation feedback signal — bumped up when retrieval led to reinforcement"
     )
-    context: Optional[str] = Field(
-        None,
-        description="Context scope (general, IDE, frontend, morning, etc.)"
-    )
-    polarity: Optional[Literal["POSITIVE", "NEGATIVE"]] = Field(
-        None,
-        description="Polarity (POSITIVE, NEGATIVE)"
-    )
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    last_seen_at: int = Field(default_factory=lambda: int(time.time()))
+    last_decay_applied_at: Optional[int] = Field(default=None)
+    last_accessed_at: Optional[int] = Field(default=None)
+
+    # Search lanes
+    embedding: Optional[List[float]] = Field(None, description="Prose-text embedding (384-dim)")
+    canonical_embedding: Optional[List[float]] = Field(None, description="Canonical structural embedding (384-dim)")
 
     @field_validator('embedding')
     def validate_embedding_dimension(cls, v):
-        """Ensure embedding has correct dimensions for all-MiniLM-L6-v2."""
         if v is not None and len(v) != 384:
             raise ValueError(f"Embedding must be 384-dimensional, got {len(v)}")
         return v
 
     @field_validator('canonical_embedding')
     def validate_canonical_embedding_dimension(cls, v):
-        """Ensure canonical_embedding has correct dimensions for all-MiniLM-L6-v2."""
         if v is not None and len(v) != 384:
             raise ValueError(f"Canonical embedding must be 384-dimensional, got {len(v)}")
         return v
@@ -227,18 +203,45 @@ class ResolutionStatus(str, Enum):
     EXPIRED = "EXPIRED"
 
 class SimilarityResult(BaseModel):
-    """Result of similarity search between behaviors"""
+    """Result of write-time similarity search (used for duplicate / conflict detection)."""
     behavior_id: str = Field(..., description="ID of the similar behavior found")
     behavior_text: str = Field(..., description="Text of the similar behavior")
     distance: float = Field(..., ge=0.0, description="Cosine distance (lower = more similar)")
-    credibility: float = Field(..., ge=0.0, le=1.0, description="Current credibility of found behavior")
+    credibility: float = Field(..., ge=0.0, le=1.0)
     last_seen_at: int = Field(..., description="Timestamp when behavior was last reinforced")
-    reinforcement_count: int = Field(..., ge=1, description="Number of times behavior reinforced")
-    # Canonical behavior fields (added with canonical behavior refactor)
-    intent: Optional[Literal["PREFERENCE", "CONSTRAINT", "HABIT", "SKILL", "COMMUNICATION"]] = Field(None, description="Behavioral intent (PREFERENCE, CONSTRAINT, HABIT, SKILL, COMMUNICATION)")
-    target: Optional[str] = Field(None, description="Concise target noun")
-    context: Optional[str] = Field(None, description="Context scope (IDE, frontend, etc.)")
-    polarity: Optional[Literal["POSITIVE", "NEGATIVE"]] = Field(None, description="Polarity (POSITIVE, NEGATIVE)")
+    reinforcement_count: int = Field(..., ge=1)
+    intent: Optional[Literal["PREFERENCE", "CONSTRAINT", "HABIT", "SKILL", "COMMUNICATION"]] = Field(None)
+    target: Optional[str] = Field(None)
+    context: Optional[str] = Field(None)
+    polarity: Optional[Literal["POSITIVE", "NEGATIVE"]] = Field(None)
+
+
+class RetrievalRelationship(str, Enum):
+    """Whether a retrieved behavior agrees or disagrees with the implied query polarity."""
+    AGREES = "AGREES"
+    DISAGREES = "DISAGREES"
+    NEUTRAL = "NEUTRAL"
+
+
+class RetrievedBehavior(BaseModel):
+    """A behavior returned by HMBR retrieval, with all per-signal scores attached."""
+    behavior_id: str
+    behavior_text: str
+    intent: Optional[str] = None
+    target: Optional[str] = None
+    context: Optional[str] = None
+    polarity: Optional[str] = None
+    credibility: float
+    s_final: float = Field(..., description="Fused score after Pillar 3 weighting")
+    s_semantic: float = 0.0
+    s_canonical: float = 0.0
+    s_lexical: float = 0.0
+    s_recency: float = 0.0
+    s_credibility: float = 0.0
+    s_usefulness: float = 0.0
+    s_ppr: float = 0.0
+    relationship: RetrievalRelationship = RetrievalRelationship.NEUTRAL
+    source: Literal["seed", "graph"] = "seed"
 
 
 class BehaviorConflict(BaseModel):
@@ -317,7 +320,6 @@ class ReinforcementResult(BaseModel):
     new_credibility: float = Field(..., ge=0.0, le=1.0, description="Updated credibility score")
     new_reinforcement_count: int = Field(..., ge=1, description="Updated reinforcement count")
     credibility_boost: float = Field(..., description="Amount credibility increased")
-    segment_id_added: Optional[str] = Field(None, description="Segment ID added to prompt_history_ids")
     error: Optional[str] = Field(None, description="Error message if failed")
 
 class BehaviorResponse(BaseModel):
@@ -432,39 +434,6 @@ class ExtractRequestWithHistory(BaseModel):
             raise ValueError("Session ID can only contain alphanumeric characters, hyphens, and underscores")
         return sanitized
 
-
-class PromptSegment(BaseModel):
-    """Represents a segment of user prompt to be stored"""
-    user_id: str = Field(..., description="User who provided this segment")
-    segment_text: str = Field(..., description="The actual segment text from prompt")
-    created_at: int = Field(
-        default_factory=lambda: int(time.time()),
-        description="Timestamp when segment was saved"
-    )
-
-class SegmentInsertResult(BaseModel):
-    """Result of inserting a prompt segment"""
-    success: bool
-    segment_id: Optional[str] = None
-    error: Optional[str] = None
-
-class BehaviorQuery(BaseModel):
-    """Input for behavior analysis"""
-    behavior_text: str = Field(
-        ...,
-        min_length=3,
-        description="Behavior text to analyze"
-    )
-    user_id: str = Field(
-        ...,
-        description="User identifier"
-    )
-    limit: int = Field(
-        default=5,
-        ge=1,
-        le=20,
-        description="Maximum number of results to return"
-    )
 
 class CanonicalBehavior(BaseModel):
     """Normalized representation used for reasoning, not storage."""

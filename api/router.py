@@ -13,7 +13,6 @@ from fastapi import APIRouter, BackgroundTasks, Query, status
 from fastapi.responses import JSONResponse
 
 from api.schemas import (
-    BehaviorSimilarityRequest,
     BehaviorsByIdsRequest,
     ConflictResolutionRequest,
 )
@@ -21,10 +20,9 @@ from models.behavior import ExtractRequest, ExtractRequestWithHistory
 from services.behaviorRepository import (
     get_behaviors_by_user,
     get_user_conflicts,
-    get_graph_expanded_behaviors,
     persist_retrieval_updates_batch,
     resolve_conflict,
-    search_similar_behavior_3D,
+    retrieve_behaviors,
 )
 from services.profileSignalRepository import get_profile_signal_repository
 from services.extractor import (
@@ -34,8 +32,6 @@ from services.extractor import (
     dispatch_profile_signals_sync,
     save_profile_signals_per_behavior,
 )
-from utils.embedding_utils import get_behavior_embedding
-from utils.similarity_utils import calculate_behavior_distance
 
 import logging
 
@@ -198,12 +194,9 @@ def extract_behaviors(request: ExtractRequest):
                 "credibility": sb.credibility,
                 "reinforcement_count": sb.reinforcement_count,
                 "decay_rate": sb.decay_rate,
+                "usefulness_score": sb.usefulness_score,
                 "created_at": sb.created_at,
                 "last_seen_at": sb.last_seen_at,
-                "prompt_history_ids": sb.prompt_history_ids,
-                "clarity_score": sb.clarity_score,
-                "extraction_confidence": sb.extraction_confidence,
-                "linguistic_strength": sb.linguistic_strength,
                 "session_id": sb.session_id,
                 "embedding_dimensions": (
                     len(sb.embedding) if sb.embedding else 0
@@ -355,107 +348,6 @@ def get_user_conflicts_endpoint(user_id: str):
 
 
 @router.post(
-    "/similarity",
-    summary="Calculate similarity between two behaviors",
-    description=(
-        "Compare two behavior descriptions using embeddings and return "
-        "their distance/similarity"
-    ),
-    response_description="Similarity analysis with distance metrics",
-)
-def calculate_similarity(request: BehaviorSimilarityRequest):
-    """
-    POC endpoint to understand how embeddings and distance metrics work.
-
-    Takes two behavior descriptions, generates embeddings for each,
-    and calculates the distance between them.
-    """
-    try:
-        logger.info("Received similarity request for behaviors")
-        logger.info(f"Behavior 1: {request.behavior1[:50]}...")
-        logger.info(f"Behavior 2: {request.behavior2[:50]}...")
-        logger.info(f"Metric: {request.metric}")
-
-        try:
-            embedding1 = get_behavior_embedding(request.behavior1)
-            logger.info(f"Generated embedding1: {len(embedding1)} dimensions")
-        except Exception as e:
-            logger.error(
-                f"Failed to generate embedding for behavior1: {str(e)}"
-            )
-            return JSONResponse(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                content={
-                    "success": False,
-                    "data": None,
-                    "error": f"Failed to generate embedding for behavior1: {str(e)}",
-                },
-            )
-
-        try:
-            embedding2 = get_behavior_embedding(request.behavior2)
-            logger.info(f"Generated embedding2: {len(embedding2)} dimensions")
-        except Exception as e:
-            logger.error(
-                f"Failed to generate embedding for behavior2: {str(e)}"
-            )
-            return JSONResponse(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                content={
-                    "success": False,
-                    "data": None,
-                    "error": f"Failed to generate embedding for behavior2: {str(e)}",
-                },
-            )
-
-        try:
-            result = calculate_behavior_distance(
-                behavior1_text=request.behavior1,
-                behavior2_text=request.behavior2,
-                embedding1=embedding1,
-                embedding2=embedding2,
-                metric=request.metric,
-            )
-            logger.info(f"Calculated distance: {result['distance']:.4f}")
-        except Exception as e:
-            logger.error(f"Failed to calculate distance: {str(e)}")
-            return JSONResponse(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                content={
-                    "success": False,
-                    "data": None,
-                    "error": f"Failed to calculate distance: {str(e)}",
-                },
-            )
-
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"success": True, "data": result, "error": None},
-        )
-
-    except ValueError as e:
-        logger.warning(f"Validation error: {str(e)}")
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={
-                "success": False,
-                "data": None,
-                "error": f"Validation error: {str(e)}",
-            },
-        )
-    except Exception as e:
-        logger.exception("Unexpected error during similarity calculation")
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "data": None,
-                "error": f"Internal server error: {str(e)}",
-            },
-        )
-
-
-@router.post(
     "/resolve-conflict",
     summary="Resolve a behavior conflict",
     description=(
@@ -583,77 +475,31 @@ def extract_behaviors_with_history(
 
         logger.info(
             f"Extraction successful: {len(extraction_result.segments)} segment(s), "
-            f"standalone_query='{extraction_result.standalone_query}', "
+            f"probes={len(extraction_result.probes)}, "
+            f"query_type={extraction_result.query_type}, "
             f"intents={extraction_result.required_intents}"
         )
-        logger.debug(f"Full extraction result: {extraction_result.model_dump_json(indent=2)}")
 
-        # STEP 2: Search for related behaviors using 3D hybrid retrieval (FAST)
-        behavior_texts = []  # flat list of behavior_text strings
-        hybrid_response = None
+        # STEP 2: HMBR retrieval — multi-signal + PPR + adaptive fusion
+        behavior_texts = []
+        hmbr_response = None
 
-        # Resolve probe list (multi-probe HyDE).  Falls back to the singular
-        # field for backwards compatibility if the LLM only emitted one.
-        probes = extraction_result.standalone_queries or (
-            [extraction_result.standalone_query] if extraction_result.standalone_query else []
-        )
-
-        if probes:
+        if extraction_result.probes:
             try:
-                from services.openAiClient import embed_text
-
-                # Embed each probe.  Skip failures so one bad probe doesn't
-                # take down the whole retrieval pass.
-                probe_embeddings: list[list[float]] = []
-                for probe in probes:
-                    try:
-                        probe_embeddings.append(embed_text(probe))
-                    except Exception as e:
-                        logger.warning(f"Failed to embed probe '{probe[:60]}...': {e}")
-
-                if not probe_embeddings:
-                    raise RuntimeError("No probes successfully embedded")
-
-                logger.info(
-                    f"Multi-probe retrieval: {len(probes)} probe(s) for query: {probes}"
-                )
-
-                hybrid_response = search_similar_behavior_3D(
-                    user_id=request.user_id,
-                    query_embeddings=probe_embeddings,
-                    query_text=probes[0],
-                    session_id=request.session_id,
+                hmbr_response = retrieve_behaviors(
+                    probes=extraction_result.probes,
+                    query_type=extraction_result.query_type,
                     required_intents=extraction_result.required_intents,
+                    user_id=request.user_id,
+                    session_id=request.session_id,
                 )
-
-                # LRA already applies thresholds internally — include all returned results
-                related_ids = []
-                for b in hybrid_response.results:
-                    behavior_texts.append(b.behavior_text)
-                    related_ids.append(b.behavior_id)
-
-                # Graph expansion — 1-hop co-occurrence walk, gated by query relevance
-                if related_ids:
-                    try:
-                        associated = get_graph_expanded_behaviors(
-                            user_id=request.user_id,
-                            seed_behavior_ids=related_ids,
-                            session_id=request.session_id,
-                            limit=10,
-                            query_embeddings=probe_embeddings,
-                        )
-                        for a in associated:
-                            if a["behavior_text"] not in behavior_texts:
-                                behavior_texts.append(a["behavior_text"])
-                    except Exception as e:
-                        logger.error(f"Graph expansion failed: {str(e)}")
-
+                behavior_texts = [b.behavior_text for b in hmbr_response.results]
                 logger.info(
-                    f"Returning {len(behavior_texts)} behaviors "
-                    f"for query: '{probes[0][:60]}...'"
+                    f"[HMBR] Returned {len(behavior_texts)} behavior(s) "
+                    f"for user={request.user_id}"
                 )
             except Exception as e:
-                logger.error(f"Failed to search related behaviors: {str(e)}")
+                logger.error(f"[HMBR] Retrieval failed: {e}")
 
         # STEP 3: Schedule behavior storage in background (ASYNC - non-blocking)
         background_tasks.add_task(
@@ -664,13 +510,13 @@ def extract_behaviors_with_history(
         )
 
         # STEP 3b: Schedule retrieval updates in background
-        if hybrid_response and (
-            hybrid_response.decay_updates or hybrid_response.accessed_behavior_ids
+        if hmbr_response and (
+            hmbr_response.decay_updates or hmbr_response.accessed_behavior_ids
         ):
             background_tasks.add_task(
                 persist_retrieval_updates_batch,
-                hybrid_response.decay_updates,
-                hybrid_response.accessed_behavior_ids,
+                hmbr_response.decay_updates,
+                hmbr_response.accessed_behavior_ids,
                 request.user_id,
             )
 

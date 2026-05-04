@@ -416,32 +416,32 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     """
     if not prompt or not prompt.strip():
         return {
-            "standalone_query": None,
-            "standalone_queries": None,
+            "probes": [],
+            "query_type": "BROAD",
             "segments": [],
             "profile_signals": None,
             "success": False,
             "error": "Prompt cannot be empty",
             "metadata": {"prompt_length": 0, "extraction_time_ms": 0, "tokens_used": 0}
         }
-    
+
     prompt = prompt.strip()
-    
+
     if len(prompt) < MIN_PROMPT_LENGTH:
         return {
-            "standalone_query": None,
-            "standalone_queries": None,
+            "probes": [],
+            "query_type": "BROAD",
             "segments": [],
             "profile_signals": None,
             "success": False,
             "error": f"Prompt too short (min {MIN_PROMPT_LENGTH} chars)",
             "metadata": {"prompt_length": len(prompt), "extraction_time_ms": 0, "tokens_used": 0}
         }
-    
+
     if len(prompt) > MAX_PROMPT_LENGTH:
         return {
-            "standalone_query": None,
-            "standalone_queries": None,
+            "probes": [],
+            "query_type": "BROAD",
             "segments": [],
             "profile_signals": None,
             "success": False,
@@ -471,9 +471,14 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     - Requests: "tell me about...", "explain..."
     - Temporary states: "I'm hungry right now", "currently working on..."
     
-    TASK 2: SEMANTIC PROBE GENERATION (Multi-Probe HyDE Transformation)
+    TASK 2: RETRIEVAL PROBE GENERATION (Multi-Probe HyDE + Canonical Form)
     ---
-    Look at 'RECENT HISTORY' and 'LATEST PROMPT'. You must convert the user's intent into a SET of 'Semantic Search Probes' to be used as `standalone_queries`.
+    Look at 'RECENT HISTORY' and 'LATEST PROMPT'.  Convert the user's intent
+    into 1..3 probes used by the retrieval engine.  Each probe is an OBJECT
+    with two fields: `text` (conversational form) and `canonical` (structured
+    form).  Both forms describe the SAME hypothesis; they are searched against
+    different embedding columns to recover the same stored behaviors despite
+    vocabulary asymmetry.
 
     ⚠️ MULTI-PROBE REQUIREMENT (CRITICAL — fixes abstract↔concrete asymmetry):
     A single probe cannot cover broad/multi-faceted queries (e.g., "how do I deploy this?"
@@ -481,62 +486,92 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     DIFFERENT FACETS of what the user is asking about.  Each probe should be a separate
     short behavioral statement targeting one concrete sub-topic.
 
-    Rules for EACH probe:
+    Rules for EACH probe.text (conversational form):
     - Must NOT be a question.  Must NOT be a full sentence.
     - Must be a short declarative behavior segment (action verb + concrete noun).
     - Must use CONCRETE domain vocabulary that plausibly describes stored behaviors.
     - Must NOT use filler words: "specific", "certain", "particular", "various", "some".
     - Each probe should target a DIFFERENT facet of the query (don't emit near-duplicates).
 
+    Rules for EACH probe.canonical (structured form):
+    - intent: ONE of CONSTRAINT, PREFERENCE, HABIT, SKILL, COMMUNICATION
+    - target: the concise canonical noun the probe is about (same canonicalisation
+              rules as for extracted behaviors — full, standard names, no abbreviations)
+    - context: scope ("IDE", "backend", "morning", etc.) or "general"
+    - polarity: POSITIVE if asking about preferences/usages, NEGATIVE if asking about
+                avoidances or restrictions
+
     How many probes:
     - Narrow query (1 facet)         → 1 probe
     - Multi-faceted query (2 facets) → 2 probes
     - Broad query (3+ facets)        → 3 probes (hard maximum)
 
+    TASK 2b: QUERY TYPE TAGGING
+    ---
+    Classify the LATEST PROMPT into ONE of these query_type values.  This drives
+    how the retrieval engine weights its scoring lanes.
+
+      NARROW       — One specific topic, often a direct lookup
+                       e.g., "what's my preferred Python version?"
+      BROAD        — Multi-faceted task or open-ended question
+                       e.g., "how should I deploy this microservice?"
+      EXPLORATORY  — Asking about own habits / general patterns
+                       e.g., "what frameworks do I usually pick?"
+      TASK         — A how-to-accomplish-X request
+                       e.g., "help me set up CI/CD for this repo"
+      RECALL       — Asking whether they previously said/decided something
+                       e.g., "did I tell you about my AWS preference?"
+
+    Default to BROAD if uncertain.
+
     Also emit `standalone_query` (singular) — set it equal to the FIRST probe in the list
     for backwards compatibility with logging.
 
-    Examples of Multi-Probe Sets:
+    Examples of Probe Sets (each probe is an object with text + canonical):
     - User: "Which Python web framework should I use for a new API project?"
-        standalone_queries: [
-          "prefers Python for backend development",
-          "uses FastAPI for REST API"
-        ]
-    - User: "How should I configure the appearance settings of my IDE?"
-        standalone_queries: [
-          "prefers dark mode in IDE",
-          "uses high contrast themes for accessibility",
-          "dislikes bright white backgrounds"
-        ]
-    - User: "What quality assurance practices should I follow for this new feature?"
-        standalone_queries: [
-          "writes unit tests for code",
-          "practices test-driven development",
-          "performs code reviews before merging"
-        ]
-    - User: "I need to build a modern web frontend for a new project"
-        standalone_queries: [
-          "uses React for frontend applications",
-          "prefers TypeScript for JavaScript projects",
-          "uses Tailwind CSS for styling"
-        ]
+      query_type: TASK
+      probes: [
+        {text: "prefers Python for backend development",
+         canonical: {intent: "PREFERENCE", target: "Python", context: "backend", polarity: "POSITIVE"}},
+        {text: "uses FastAPI for REST API",
+         canonical: {intent: "SKILL", target: "FastAPI", context: "REST API", polarity: "POSITIVE"}}
+      ]
+
     - User: "How should I set up the deployment pipeline for this new microservice?"
-        standalone_queries: [
-          "uses Docker and Kubernetes for deployment",
-          "uses Terraform for infrastructure as code",
-          "prefers AWS for cloud deployments"
-        ]
+      query_type: TASK
+      probes: [
+        {text: "uses Docker and Kubernetes for deployment",
+         canonical: {intent: "SKILL", target: "Kubernetes", context: "deployment", polarity: "POSITIVE"}},
+        {text: "uses Terraform for infrastructure as code",
+         canonical: {intent: "SKILL", target: "Terraform", context: "infrastructure", polarity: "POSITIVE"}},
+        {text: "prefers AWS for cloud deployments",
+         canonical: {intent: "PREFERENCE", target: "AWS", context: "cloud", polarity: "POSITIVE"}}
+      ]
+
+    - User: "What frameworks do I usually reach for?"
+      query_type: EXPLORATORY
+      probes: [
+        {text: "uses React for frontend applications",
+         canonical: {intent: "HABIT", target: "React", context: "frontend", polarity: "POSITIVE"}},
+        {text: "uses FastAPI for backend services",
+         canonical: {intent: "HABIT", target: "FastAPI", context: "backend", polarity: "POSITIVE"}}
+      ]
+
     - User: "What should I consider when planning my weekly meals?"
-        standalone_queries: [
-          "avoids meat and dairy in diet",
-          "prefers organic and locally sourced food"
-        ]
-    - User: "How do I make my technical knowledge more accessible to teammates?"
-        standalone_queries: [
-          "prefers written documentation over verbal explanations",
-          "adds comments to complex code sections",
-          "maintains personal knowledge base"
-        ]
+      query_type: BROAD
+      probes: [
+        {text: "avoids meat and dairy in diet",
+         canonical: {intent: "CONSTRAINT", target: "meat and dairy", context: "diet", polarity: "NEGATIVE"}},
+        {text: "prefers organic and locally sourced food",
+         canonical: {intent: "PREFERENCE", target: "organic food", context: "diet", polarity: "POSITIVE"}}
+      ]
+
+    - User: "Did I tell you I'm allergic to peanuts?"
+      query_type: RECALL
+      probes: [
+        {text: "cannot eat peanuts due to allergy",
+         canonical: {intent: "CONSTRAINT", target: "peanuts", context: "diet", polarity: "NEGATIVE"}}
+      ]
 
     ❌ BAD probes (abstract filler words — will FAIL vector search):
     - "has specific food preferences" ← "specific" matches nothing
@@ -546,8 +581,8 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     - "shops electronics with specific method" ← "specific method" is empty
 
     ❌ BAD multi-probe sets (probes are near-duplicates — wastes a probe slot):
-    - ["uses Python for backend", "prefers Python for server-side"]  ← same facet, different words
-    - ["writes unit tests", "writes tests for code"]                 ← same facet
+    - both with target="Python" — same facet, wasted slot
+    - both with intent=PREFERENCE and target=React variations — same facet
     ---
     FOR EACH BEHAVIOR, YOU MUST PRODUCE A CANONICAL FORM WITH THESE FIELDS:
     
@@ -638,10 +673,26 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     OUTPUT FORMAT (STRICT JSON - use these EXACT field names):
 
     {
-      "standalone_query": "The first probe — kept as a string for backwards compatibility (e.g., 'prefers Python for backend')",
-      "standalone_queries": [
-        "prefers Python for backend development",
-        "uses FastAPI for REST API"
+      "query_type": "TASK",
+      "probes": [
+        {
+          "text": "prefers Python for backend development",
+          "canonical": {
+            "intent": "PREFERENCE",
+            "target": "Python",
+            "context": "backend",
+            "polarity": "POSITIVE"
+          }
+        },
+        {
+          "text": "uses FastAPI for REST API",
+          "canonical": {
+            "intent": "SKILL",
+            "target": "FastAPI",
+            "context": "REST API",
+            "polarity": "POSITIVE"
+          }
+        }
       ],
       "required_intents": ["CONSTRAINT", "PREFERENCE"],
       "segments": [
@@ -697,12 +748,13 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     ⚠️ CRITICAL RULES:
     - Extract behaviors ONLY from 'LATEST PROMPT' - NEVER from 'RECENT HISTORY'!
     - If LATEST PROMPT is a question or has no behaviors, return empty segments list []
-    - standalone_queries is MANDATORY - 1 to 3 short behavioral probes (action verb + concrete noun), NOT questions.
-    - standalone_query (singular, kept for backwards compatibility) MUST equal standalone_queries[0].
-    - Each probe MUST use concrete domain vocabulary — NEVER use "specific", "certain", "particular" as they fail vector search.
-    - Probes within standalone_queries MUST target DIFFERENT facets of the query (no near-duplicates).
-    - Target must be CONCISE (1-3 words) - the noun, not the whole phrase
-    - Target must use CANONICAL/FULL form - NEVER abbreviations (JavaScript not JS)
+    - probes is MANDATORY - 1 to 3 probe objects (each with `text` and `canonical`).
+    - Each probe.text MUST use concrete domain vocabulary — NEVER use "specific", "certain", "particular".
+    - Probes MUST target DIFFERENT facets of the query (no near-duplicates).
+    - Each probe.canonical.target must be CONCISE (1-3 words) using CANONICAL/FULL form (JavaScript not JS).
+    - Each probe.canonical.intent must be one of CONSTRAINT, PREFERENCE, HABIT, SKILL, COMMUNICATION.
+    - Each probe.canonical.polarity must be POSITIVE or NEGATIVE.
+    - query_type must be one of NARROW, BROAD, EXPLORATORY, TASK, RECALL (default BROAD).
     - Use field name "linguistic_strength" (NOT "strength")
     - If no stable behavior exists in LATEST PROMPT, return empty behaviors list
     - Do NOT invent context if not mentioned
@@ -726,21 +778,24 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
     
     CORRECT Output:
     {
-      "standalone_query": "prefers sweet food",
-      "standalone_queries": ["prefers sweet food", "enjoys oatmeal and fruits as breakfast"],
+      "query_type": "EXPLORATORY",
+      "probes": [
+        {
+          "text": "prefers sweet food",
+          "canonical": {"intent": "PREFERENCE", "target": "sweet food", "context": "diet", "polarity": "POSITIVE"}
+        },
+        {
+          "text": "enjoys oatmeal and fruits as breakfast",
+          "canonical": {"intent": "HABIT", "target": "oatmeal and fruits", "context": "breakfast", "polarity": "POSITIVE"}
+        }
+      ],
+      "required_intents": ["PREFERENCE", "HABIT"],
       "segments": []
     }
 
     ⚠️ WHY segments is empty:
     - Latest prompt is a QUESTION, not a behavior statement
     - "I like healthy breakfast..." is in HISTORY and was ALREADY PROCESSED - DO NOT extract it again!
-
-    WRONG Output (DO NOT DO THIS):
-    {
-      "standalone_query": "Which is the sweetest food among oatmeal and fruits?",
-      "standalone_queries": ["Which is the sweetest food..."],
-      "segments": [{"text": "I like healthy breakfast options...", "behaviors": [...]}]  ❌ WRONG! Question + history extraction!
-    }
     """
 
     # Build conversation context
@@ -777,7 +832,8 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
 
         if not content:
             return {
-                "standalone_query": None,
+                "probes": [],
+                "query_type": "BROAD",
                 "segments": [],
                 "profile_signals": None,
                 "success": False,
@@ -787,57 +843,84 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
                     "extraction_time_ms": extraction_time_ms,
                     "tokens_used": token_used
                 }
-            }   
-           
+            }
+
         result = json.loads(content)
 
         from config.configurations import MAX_STANDALONE_QUERIES
 
-        # ----- standalone_queries (multi-probe) ---------------------------------
-        # Prefer the new list field; fall back to the legacy single-string field;
-        # final fallback is the raw prompt (avoids hard failure on retrieval).
-        raw_queries = result.get("standalone_queries")
-        standalone_queries: list[str] = []
-        if isinstance(raw_queries, list):
-            seen = set()
-            for q in raw_queries:
-                if not isinstance(q, str):
-                    continue
-                q_clean = q.strip()
-                if not q_clean:
-                    continue
-                # Dedupe case-insensitively to filter out near-misses
-                key = q_clean.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                standalone_queries.append(q_clean)
-
-        legacy_query = result.get("standalone_query")
-        if isinstance(legacy_query, str) and legacy_query.strip():
-            legacy_clean = legacy_query.strip()
-            if legacy_clean.lower() not in {q.lower() for q in standalone_queries}:
-                standalone_queries.insert(0, legacy_clean)
-
-        if not standalone_queries:
-            logger.warning("LLM did not provide any standalone probe, falling back to raw prompt")
-            standalone_queries = [prompt]
-
-        # Cap to MAX_STANDALONE_QUERIES
-        standalone_queries = standalone_queries[:MAX_STANDALONE_QUERIES]
-        standalone_query = standalone_queries[0]
-
-        # Extract required_intents with safe default
-        required_intents = result.get("required_intents", ["PREFERENCE", "CONSTRAINT"])
-        # Validate intent values
+        # ---------- probes: list[{text, canonical:{intent,target,context,polarity}}] -------
         valid_intents = {"PREFERENCE", "CONSTRAINT", "HABIT", "SKILL", "COMMUNICATION"}
+        valid_polarities = {"POSITIVE", "NEGATIVE"}
+        valid_query_types = {"NARROW", "BROAD", "EXPLORATORY", "TASK", "RECALL"}
+
+        raw_probes = result.get("probes")
+        probes: list[dict] = []
+        if isinstance(raw_probes, list):
+            seen_text = set()
+            for p in raw_probes:
+                if not isinstance(p, dict):
+                    continue
+                text = p.get("text")
+                canonical = p.get("canonical") if isinstance(p.get("canonical"), dict) else None
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                key = text.strip().lower()
+                if key in seen_text:
+                    continue
+                seen_text.add(key)
+
+                if canonical and canonical.get("intent") in valid_intents and canonical.get("polarity") in valid_polarities:
+                    probes.append({
+                        "text": text.strip(),
+                        "canonical": {
+                            "intent": canonical["intent"],
+                            "target": (canonical.get("target") or "").strip() or "general",
+                            "context": (canonical.get("context") or "general").strip(),
+                            "polarity": canonical["polarity"],
+                        },
+                    })
+                else:
+                    # Conversational text only — synthesise a neutral canonical so
+                    # the canonical-embedding lane still has something to work with.
+                    probes.append({
+                        "text": text.strip(),
+                        "canonical": {
+                            "intent": "PREFERENCE",
+                            "target": text.strip()[:60],
+                            "context": "general",
+                            "polarity": "POSITIVE",
+                        },
+                    })
+
+        if not probes:
+            logger.warning("LLM did not return usable probes; falling back to raw prompt")
+            probes = [{
+                "text": prompt,
+                "canonical": {
+                    "intent": "PREFERENCE",
+                    "target": prompt[:60],
+                    "context": "general",
+                    "polarity": "POSITIVE",
+                },
+            }]
+
+        probes = probes[:MAX_STANDALONE_QUERIES]
+
+        # ---------- query_type ------------------------------------------------
+        query_type = result.get("query_type", "BROAD")
+        if query_type not in valid_query_types:
+            query_type = "BROAD"
+
+        # ---------- required_intents -------------------------------------------
+        required_intents = result.get("required_intents", ["PREFERENCE", "CONSTRAINT"])
         required_intents = [i for i in required_intents if i in valid_intents]
         if not required_intents:
             required_intents = ["PREFERENCE", "CONSTRAINT"]
 
         return {
-            "standalone_query": standalone_query,
-            "standalone_queries": standalone_queries,
+            "probes": probes,
+            "query_type": query_type,
             "required_intents": required_intents,
             "segments": result.get("segments", []),
             "profile_signals": result.get("profile_signals"),
@@ -849,12 +932,12 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
                 "tokens_used": token_used
             }
         }
-    
+
     except json.JSONDecodeError as e:
         extraction_time_ms = (time() - start_time) * 1000
         return {
-            "standalone_query": None,
-            "standalone_queries": None,
+            "probes": [],
+            "query_type": "BROAD",
             "segments": [],
             "profile_signals": None,
             "success": False,
@@ -869,8 +952,8 @@ def extract_behavior_with_history(prompt: str, recent_history: List[dict]) -> Di
         extraction_time_ms = (time() - start_time) * 1000
         error_type = type(e).__name__
         return {
-            "standalone_query": None,
-            "standalone_queries": None,
+            "probes": [],
+            "query_type": "BROAD",
             "segments": [],
             "profile_signals": None,
             "success": False,
